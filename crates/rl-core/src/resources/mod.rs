@@ -15,6 +15,20 @@ pub struct ResourceRow {
     pub controlled_by: String,
     pub cpu: String,
     pub memory: String,
+    /// CronJob: cron schedule expression
+    pub schedule: String,
+    /// CronJob: time zone (e.g. UTC)
+    pub timezone: String,
+    /// CronJob: True when not suspended
+    pub resumed: String,
+    /// CronJob: active child jobs; Deployment: available replicas
+    pub active: String,
+    /// CronJob: time since last schedule
+    pub last_schedule: String,
+    /// Deployment: up-to-date replica count
+    pub up_to_date: String,
+    /// Job: CronJob owner name
+    pub owner: String,
 }
 
 impl ResourceRow {
@@ -36,6 +50,13 @@ impl ResourceRow {
             controlled_by: "-".into(),
             cpu: "N/A".into(),
             memory: "N/A".into(),
+            schedule: "-".into(),
+            timezone: "-".into(),
+            resumed: "-".into(),
+            active: "-".into(),
+            last_schedule: "-".into(),
+            up_to_date: "-".into(),
+            owner: "-".into(),
         }
     }
 }

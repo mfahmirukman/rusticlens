@@ -1,11 +1,12 @@
 use futures::{AsyncBufReadExt, StreamExt};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::{CronJob, Job};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::Ingress;
-use kube::api::{Api, DeleteParams, ListParams, LogParams};
+use kube::api::{Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams};
 use kube::Client;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use crate::containers;
 use crate::crd;
@@ -104,8 +105,16 @@ pub async fn delete_resource(
     kind: ResourceKind,
     name: &str,
     crd_target: Option<&CrdTarget>,
+    force: bool,
 ) -> Result<()> {
-    let params = DeleteParams::default();
+    let params = if force {
+        DeleteParams {
+            grace_period_seconds: Some(0),
+            ..Default::default()
+        }
+    } else {
+        DeleteParams::default()
+    };
     match kind {
         ResourceKind::Pod => {
             Api::<Pod>::namespaced(client.clone(), namespace)
@@ -197,13 +206,53 @@ async fn delete_dynamic(
 }
 
 const MAX_LOG_LINES: usize = 500;
+pub const LOG_CHUNK_LINES: i64 = 500;
+/// Must match `rl-app` log tab line cap (used to bound older-log API requests).
+pub const LOG_BUFFER_MAX_LINES: usize = 2_000;
+
+pub async fn fetch_pod_logs_tail(
+    client: &Client,
+    namespace: &str,
+    pod_name: &str,
+    container: Option<&str>,
+    timestamps: bool,
+    tail_lines: i64,
+) -> Result<Vec<String>> {
+    let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let container =
+        containers::resolve_container(client, namespace, pod_name, container).await?;
+
+    let params = LogParams {
+        container: Some(container),
+        follow: false,
+        tail_lines: Some(tail_lines),
+        timestamps,
+        ..Default::default()
+    };
+
+    let stream = api.log_stream(pod_name, &params).await?;
+    let mut lines = stream.lines();
+    let mut out = Vec::new();
+
+    while let Some(line) = lines
+        .next()
+        .await
+        .transpose()
+        .map_err(|err| crate::error::Error::Message(err.to_string()))?
+    {
+        out.push(line);
+    }
+
+    Ok(out)
+}
 
 pub async fn stream_pod_logs(
     client: &Client,
     namespace: &str,
     pod_name: &str,
     container: Option<&str>,
-    tx: UnboundedSender<String>,
+    timestamps: bool,
+    tx: Sender<String>,
 ) -> Result<()> {
     let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     let container =
@@ -213,12 +262,12 @@ pub async fn stream_pod_logs(
         container: Some(container),
         follow: true,
         tail_lines: Some(MAX_LOG_LINES as i64),
+        timestamps,
         ..Default::default()
     };
 
     let stream = api.log_stream(pod_name, &params).await?;
     let mut lines = stream.lines();
-    let mut line_count = 0usize;
 
     while let Some(line) = lines
         .next()
@@ -226,12 +275,7 @@ pub async fn stream_pod_logs(
         .transpose()
         .map_err(|err| crate::error::Error::Message(err.to_string()))?
     {
-        if tx.send(line).is_err() {
-            break;
-        }
-        line_count += 1;
-        if line_count > MAX_LOG_LINES * 2 {
-            let _ = tx.send("--- log buffer limit reached ---".to_string());
+        if tx.send(line).await.is_err() {
             break;
         }
     }
@@ -244,6 +288,95 @@ pub fn kubectl_exec_command(namespace: &str, pod_name: &str, container: Option<&
         Some(c) => format!("kubectl exec -it -n {namespace} {pod_name} -c {c} -- /bin/sh"),
         None => format!("kubectl exec -it -n {namespace} {pod_name} -- /bin/sh"),
     }
+}
+
+pub fn kubectl_attach_command(namespace: &str, pod_name: &str, container: Option<&str>) -> String {
+    match container {
+        Some(c) => format!("kubectl attach -it -n {namespace} {pod_name} -c {c}"),
+        None => format!("kubectl attach -it -n {namespace} {pod_name}"),
+    }
+}
+
+pub fn kubectl_edit_command(namespace: &str, resource_kind: &str, name: &str) -> String {
+    format!(
+        "kubectl edit -n {namespace} {} {name}",
+        resource_kind.to_lowercase()
+    )
+}
+
+pub fn kubectl_rollout_restart_command(namespace: &str, name: &str) -> String {
+    format!("kubectl rollout restart deployment/{name} -n {namespace}")
+}
+
+pub async fn trigger_cronjob(client: &Client, namespace: &str, name: &str) -> Result<()> {
+    let api: Api<CronJob> = Api::namespaced(client.clone(), namespace);
+    let cj = api.get(name).await?;
+    let template = cj
+        .spec
+        .as_ref()
+        .map(|s| s.job_template.clone())
+        .ok_or_else(|| crate::error::Error::Message("cronjob has no job template".into()))?;
+
+    let suffix = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let job_name = format!("{name}-manual-{suffix}");
+    let owner_refs = cj.metadata.uid.as_ref().map(|uid| {
+        vec![OwnerReference {
+            api_version: "batch/v1".into(),
+            kind: "CronJob".into(),
+            name: name.to_string(),
+            uid: uid.clone(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }]
+    });
+
+    let job = Job {
+        metadata: kube::api::ObjectMeta {
+            name: Some(job_name),
+            namespace: Some(namespace.to_string()),
+            owner_references: owner_refs,
+            ..Default::default()
+        },
+        spec: template.spec,
+        ..Default::default()
+    };
+
+    Api::<Job>::namespaced(client.clone(), namespace)
+        .create(&PostParams::default(), &job)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_cronjob_suspended(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    suspend: bool,
+) -> Result<()> {
+    let api: Api<CronJob> = Api::namespaced(client.clone(), namespace);
+    let patch = serde_json::json!({ "spec": { "suspend": suspend } });
+    api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    Ok(())
+}
+
+pub async fn restart_deployment(client: &Client, namespace: &str, name: &str) -> Result<()> {
+    let api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let now = chrono::Utc::now().to_rfc3339();
+    let patch = serde_json::json!({
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": now
+                    }
+                }
+            }
+        }
+    });
+    api.patch(name, &PatchParams::default(), &Patch::Strategic(&patch))
+        .await?;
+    Ok(())
 }
 
 pub async fn list_crd_targets(client: &Client) -> Result<Vec<CrdTarget>> {

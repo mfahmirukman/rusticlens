@@ -1,13 +1,19 @@
-use egui::Ui;
-use egui_extras::{Column, TableBuilder};
-use rl_core::{ResourceKind, ResourceRow};
+use std::collections::HashSet;
 
+use egui::{Color32, Ui};
+use egui_extras::{Column, TableBuilder};
+use rl_core::{ContainerInfo, ResourceKind, ResourceRow};
+
+use crate::ui::cronjob_menu::show_cronjob_context_menu;
+use crate::ui::deployment_menu::show_deployment_context_menu;
+use crate::ui::pod_menu::show_pod_context_menu;
 use crate::ui::theme::Theme;
 
 const ROW_HEIGHT: f32 = 24.0;
 
 pub struct TableState {
     pub selected: Option<usize>,
+    pub checked: HashSet<usize>,
     pub filter: String,
 }
 
@@ -17,6 +23,20 @@ impl TableState {
             .and_then(|idx| rows.get(idx))
             .map(|row| row.name.as_str())
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum RowContextAction {
+    Logs { container: Option<String> },
+    Shell { container: Option<String> },
+    Attach { container: Option<String> },
+    Edit,
+    Delete,
+    ForceDelete,
+    Trigger,
+    Suspend,
+    Resume,
+    Restart,
 }
 
 pub struct ListHeader<'a> {
@@ -63,6 +83,7 @@ pub fn show_header(ui: &mut Ui, header: ListHeader<'_>) {
     ui.add_space(4.0);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     kind: ResourceKind,
@@ -70,8 +91,11 @@ pub fn show(
     state: &mut TableState,
     namespace: &str,
     namespaces: &[String],
+    pod_containers: &[ContainerInfo],
+    menu_containers_pod: Option<&str>,
     on_namespace: &mut impl FnMut(String),
-) {
+    on_pod_menu_open: &mut impl FnMut(&str),
+) -> Option<(usize, RowContextAction)> {
     let filtered_len = rows
         .iter()
         .filter(|row| row_matches_filter(row, &state.filter))
@@ -102,7 +126,7 @@ pub fn show(
             egui::RichText::new("No resources found.")
                 .color(Theme::TEXT_MUTED),
         );
-        return;
+        return None;
     }
 
     if let Some(selected) = state.selected {
@@ -111,11 +135,354 @@ pub fn show(
         }
     }
 
-    let show_metrics = kind == ResourceKind::Pod;
+    match kind {
+        ResourceKind::Deployment => {
+            show_deployment_table(ui, &filtered, state, &mut None, false)
+        }
+        ResourceKind::CronJob => show_cronjob_table(ui, &filtered, state, &mut None, false),
+        ResourceKind::Pod => show_pod_table(
+            ui,
+            &filtered,
+            state,
+            pod_containers,
+            menu_containers_pod,
+            &mut None,
+            false,
+            on_pod_menu_open,
+        ),
+        _ => show_default_table(ui, kind, &filtered, state, &mut None, false),
+    }
+}
+
+/// Jobs owned by the selected CronJob (Freelens detail strip below the main table).
+pub fn show_cronjob_jobs(ui: &mut Ui, cronjob_name: &str, job_rows: &[ResourceRow]) {
+    let owned: Vec<&ResourceRow> = job_rows
+        .iter()
+        .filter(|row| row.owner == cronjob_name)
+        .collect();
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Jobs")
+                .size(16.0)
+                .strong()
+                .color(Theme::TEXT),
+        );
+        ui.label(
+            egui::RichText::new(format!("{} items", owned.len()))
+                .color(Theme::TEXT_MUTED),
+        );
+    });
+    ui.add_space(4.0);
+
+    if owned.is_empty() {
+        ui.label(
+            egui::RichText::new("No jobs for this CronJob.")
+                .color(Theme::TEXT_MUTED),
+        );
+        return;
+    }
 
     TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::auto().at_least(200.0))
+        .column(Column::auto().at_least(100.0))
+        .column(Column::auto().at_least(70.0))
+        .column(Column::auto().at_least(50.0))
+        .column(Column::auto().at_least(80.0))
+        .header(26.0, |mut header| {
+            header.col(|ui| header_cell(ui, "Name"));
+            header.col(|ui| header_cell(ui, "Namespace"));
+            header.col(|ui| header_cell(ui, "Completions"));
+            header.col(|ui| header_cell(ui, "Age"));
+            header.col(|ui| header_cell(ui, "Status"));
+        })
+        .body(|body| {
+            body.rows(ROW_HEIGHT, owned.len(), |mut row| {
+                let resource = owned[row.index()];
+                row.col(|ui| {
+                    text_cell(ui, &resource.name, false, Some(Theme::LINK));
+                });
+                row.col(|ui| {
+                    text_cell(ui, &resource.namespace, false, Some(Theme::LINK));
+                });
+                row.col(|ui| text_cell(ui, &resource.ready, false, None));
+                row.col(|ui| text_cell(ui, &resource.age, false, None));
+                row.col(|ui| status_cell(ui, &resource.status, false));
+            });
+        });
+}
+
+fn show_deployment_table(
+    ui: &mut Ui,
+    filtered: &[(usize, &ResourceRow)],
+    state: &mut TableState,
+    context_action: &mut Option<(usize, RowContextAction)>,
+    inline_menu: bool,
+) -> Option<(usize, RowContextAction)> {
+    let mut action = context_action.clone();
+    TableBuilder::new(ui)
+        .striped(true)
+        .resizable(true)
+        .sense(egui::Sense::click())
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::auto().at_least(28.0))
+        .column(Column::auto().at_least(180.0))
+        .column(Column::auto().at_least(100.0))
+        .column(Column::auto().at_least(60.0))
+        .column(Column::auto().at_least(80.0))
+        .column(Column::auto().at_least(70.0))
+        .column(Column::auto().at_least(50.0))
+        .column(Column::auto().at_least(36.0))
+        .header(26.0, |mut header| {
+            header.col(|ui| header_cell(ui, ""));
+            header.col(|ui| header_cell(ui, "Name"));
+            header.col(|ui| header_cell(ui, "Namespace"));
+            header.col(|ui| header_cell(ui, "Ready"));
+            header.col(|ui| header_cell(ui, "Up-to-date"));
+            header.col(|ui| header_cell(ui, "Available"));
+            header.col(|ui| header_cell(ui, "Age"));
+            header.col(|ui| header_cell(ui, ""));
+        })
+        .body(|body| {
+            body.rows(ROW_HEIGHT, filtered.len(), |mut row| {
+                let row_index = row.index();
+                let (original_idx, resource) = filtered[row_index];
+                let selected = state.selected == Some(original_idx);
+                row.set_selected(selected);
+
+                row.col(|ui| checkbox_cell(ui, original_idx, state));
+                row.col(|ui| {
+                    name_cell(ui, &resource.name, selected, || {
+                        state.selected = Some(original_idx);
+                    });
+                });
+                row.col(|ui| {
+                    text_cell(ui, &resource.namespace, selected, Some(Theme::LINK));
+                });
+                row.col(|ui| text_cell(ui, &resource.ready, selected, None));
+                row.col(|ui| text_cell(ui, &resource.up_to_date, selected, None));
+                row.col(|ui| text_cell(ui, &resource.active, selected, None));
+                row.col(|ui| text_cell(ui, &resource.age, selected, None));
+                row.col(|ui| {
+                    action_menu_cell(ui, original_idx, selected, &mut action, |ui, idx, act| {
+                        show_deployment_context_menu(ui, idx, act);
+                    });
+                });
+
+                let row_resp = row.response();
+                handle_row_interaction(&row_resp, original_idx, state, &mut action);
+                row_resp.context_menu(|ui| {
+                    show_deployment_context_menu(ui, original_idx, &mut action);
+                });
+            });
+        });
+    if inline_menu {
+        action
+    } else {
+        std::mem::take(&mut action)
+    }
+}
+
+fn show_cronjob_table(
+    ui: &mut Ui,
+    filtered: &[(usize, &ResourceRow)],
+    state: &mut TableState,
+    context_action: &mut Option<(usize, RowContextAction)>,
+    inline_menu: bool,
+) -> Option<(usize, RowContextAction)> {
+    let mut action = context_action.clone();
+    TableBuilder::new(ui)
+        .striped(true)
+        .resizable(true)
+        .sense(egui::Sense::click())
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::auto().at_least(28.0))
+        .column(Column::auto().at_least(200.0))
+        .column(Column::auto().at_least(100.0))
+        .column(Column::auto().at_least(90.0))
+        .column(Column::auto().at_least(70.0))
+        .column(Column::auto().at_least(60.0))
+        .column(Column::auto().at_least(50.0))
+        .column(Column::auto().at_least(90.0))
+        .column(Column::auto().at_least(50.0))
+        .column(Column::auto().at_least(36.0))
+        .header(26.0, |mut header| {
+            header.col(|ui| header_cell(ui, ""));
+            header.col(|ui| header_cell(ui, "Name"));
+            header.col(|ui| header_cell(ui, "Namespace"));
+            header.col(|ui| header_cell(ui, "Schedule"));
+            header.col(|ui| header_cell(ui, "Timezone"));
+            header.col(|ui| header_cell(ui, "Resumed"));
+            header.col(|ui| header_cell(ui, "Active"));
+            header.col(|ui| header_cell(ui, "Last schedule"));
+            header.col(|ui| header_cell(ui, "Age"));
+            header.col(|ui| header_cell(ui, ""));
+        })
+        .body(|body| {
+            body.rows(ROW_HEIGHT, filtered.len(), |mut row| {
+                let row_index = row.index();
+                let (original_idx, resource) = filtered[row_index];
+                let selected = state.selected == Some(original_idx);
+                let resumed = resource.resumed == "True";
+                row.set_selected(selected);
+
+                row.col(|ui| checkbox_cell(ui, original_idx, state));
+                row.col(|ui| {
+                    name_cell(ui, &resource.name, selected, || {
+                        state.selected = Some(original_idx);
+                    });
+                });
+                row.col(|ui| {
+                    text_cell(ui, &resource.namespace, selected, Some(Theme::LINK));
+                });
+                row.col(|ui| text_cell(ui, &resource.schedule, selected, None));
+                row.col(|ui| text_cell(ui, &resource.timezone, selected, None));
+                row.col(|ui| resumed_cell(ui, &resource.resumed, selected));
+                row.col(|ui| text_cell(ui, &resource.active, selected, None));
+                row.col(|ui| text_cell(ui, &resource.last_schedule, selected, None));
+                row.col(|ui| text_cell(ui, &resource.age, selected, None));
+                row.col(|ui| {
+                    action_menu_cell(ui, original_idx, selected, &mut action, |ui, idx, act| {
+                        show_cronjob_context_menu(ui, idx, resumed, act);
+                    });
+                });
+
+                let row_resp = row.response();
+                handle_row_interaction(&row_resp, original_idx, state, &mut action);
+                row_resp.context_menu(|ui| {
+                    show_cronjob_context_menu(ui, original_idx, resumed, &mut action);
+                });
+            });
+        });
+    if inline_menu {
+        action
+    } else {
+        std::mem::take(&mut action)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_pod_table(
+    ui: &mut Ui,
+    filtered: &[(usize, &ResourceRow)],
+    state: &mut TableState,
+    pod_containers: &[ContainerInfo],
+    menu_containers_pod: Option<&str>,
+    context_action: &mut Option<(usize, RowContextAction)>,
+    inline_menu: bool,
+    on_pod_menu_open: &mut impl FnMut(&str),
+) -> Option<(usize, RowContextAction)> {
+    let mut action = context_action.clone();
+    TableBuilder::new(ui)
+        .striped(true)
+        .resizable(true)
+        .sense(egui::Sense::click())
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::auto().at_least(180.0))
+        .column(Column::auto().at_least(100.0))
+        .column(Column::auto().at_least(70.0))
+        .column(Column::auto().at_least(60.0))
+        .column(Column::auto().at_least(60.0))
+        .column(Column::auto().at_least(60.0))
+        .column(Column::auto().at_least(90.0))
+        .column(Column::auto().at_least(50.0))
+        .column(Column::auto().at_least(80.0))
+        .header(26.0, |mut header| {
+            header.col(|ui| header_cell(ui, "Name"));
+            header.col(|ui| header_cell(ui, "Namespace"));
+            header.col(|ui| header_cell(ui, "Containers"));
+            header.col(|ui| header_cell(ui, "CPU"));
+            header.col(|ui| header_cell(ui, "Memory"));
+            header.col(|ui| header_cell(ui, "Restarts"));
+            header.col(|ui| header_cell(ui, "Controlled By"));
+            header.col(|ui| header_cell(ui, "Age"));
+            header.col(|ui| header_cell(ui, "Status"));
+        })
+        .body(|body| {
+            body.rows(ROW_HEIGHT, filtered.len(), |mut row| {
+                let row_index = row.index();
+                let (original_idx, resource) = filtered[row_index];
+                let selected = state.selected == Some(original_idx);
+                row.set_selected(selected);
+
+                row.col(|ui| {
+                    name_cell(ui, &resource.name, selected, || {
+                        state.selected = Some(original_idx);
+                    });
+                });
+                row.col(|ui| {
+                    text_cell(ui, &resource.namespace, selected, Some(Theme::LINK));
+                });
+                row.col(|ui| text_cell(ui, &resource.ready, selected, None));
+                row.col(|ui| {
+                    text_cell(ui, &resource.cpu, selected, Some(Theme::TEXT_MUTED));
+                });
+                row.col(|ui| {
+                    text_cell(ui, &resource.memory, selected, Some(Theme::TEXT_MUTED));
+                });
+                row.col(|ui| text_cell(ui, &resource.restarts, selected, None));
+                row.col(|ui| {
+                    text_cell(ui, &resource.controlled_by, selected, Some(Theme::LINK));
+                });
+                row.col(|ui| text_cell(ui, &resource.age, selected, None));
+                row.col(|ui| status_cell(ui, &resource.status, selected));
+
+                let row_resp = row.response();
+                if row_resp.double_clicked() {
+                    state.selected = Some(original_idx);
+                    action = Some((
+                        original_idx,
+                        RowContextAction::Logs { container: None },
+                    ));
+                } else if row_resp.clicked() {
+                    state.selected = Some(original_idx);
+                }
+
+                let menu_containers =
+                    if menu_containers_pod == Some(resource.name.as_str()) {
+                        pod_containers
+                    } else {
+                        &[] as &[ContainerInfo]
+                    };
+                row_resp.context_menu(|ui| {
+                    show_pod_context_menu(
+                        ui,
+                        original_idx,
+                        &resource.name,
+                        menu_containers,
+                        &mut action,
+                        on_pod_menu_open,
+                    );
+                });
+            });
+        });
+    if inline_menu {
+        action
+    } else {
+        std::mem::take(&mut action)
+    }
+}
+
+fn show_default_table(
+    ui: &mut Ui,
+    kind: ResourceKind,
+    filtered: &[(usize, &ResourceRow)],
+    state: &mut TableState,
+    context_action: &mut Option<(usize, RowContextAction)>,
+    inline_menu: bool,
+) -> Option<(usize, RowContextAction)> {
+    let mut action = context_action.clone();
+    let show_metrics = kind == ResourceKind::Pod;
+    TableBuilder::new(ui)
+        .striped(true)
+        .resizable(true)
+        .sense(egui::Sense::click())
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
         .column(Column::auto().at_least(180.0))
         .column(Column::auto().at_least(100.0))
@@ -147,26 +514,23 @@ pub fn show(
                 let row_index = row.index();
                 let (original_idx, resource) = filtered[row_index];
                 let selected = state.selected == Some(original_idx);
+                row.set_selected(selected);
 
-                row.col(|ui| name_cell(ui, &resource.name, selected, || {
-                    state.selected = Some(original_idx);
-                }));
                 row.col(|ui| {
-                    ui.label(egui::RichText::new(&resource.namespace).color(Theme::LINK));
+                    name_cell(ui, &resource.name, selected, || {
+                        state.selected = Some(original_idx);
+                    });
                 });
                 row.col(|ui| {
-                    ui.label(&resource.ready);
+                    text_cell(ui, &resource.namespace, selected, Some(Theme::LINK));
                 });
+                row.col(|ui| text_cell(ui, &resource.ready, selected, None));
                 if show_metrics {
                     row.col(|ui| {
-                        ui.label(
-                            egui::RichText::new(&resource.cpu).color(Theme::TEXT_MUTED),
-                        );
+                        text_cell(ui, &resource.cpu, selected, Some(Theme::TEXT_MUTED));
                     });
                     row.col(|ui| {
-                        ui.label(
-                            egui::RichText::new(&resource.memory).color(Theme::TEXT_MUTED),
-                        );
+                        text_cell(ui, &resource.memory, selected, Some(Theme::TEXT_MUTED));
                     });
                 } else {
                     row.col(|ui| {
@@ -176,25 +540,59 @@ pub fn show(
                         ui.label("");
                     });
                 }
+                row.col(|ui| text_cell(ui, &resource.restarts, selected, None));
                 row.col(|ui| {
-                    ui.label(&resource.restarts);
+                    text_cell(ui, &resource.controlled_by, selected, Some(Theme::LINK));
                 });
-                row.col(|ui| {
-                    ui.label(
-                        egui::RichText::new(&resource.controlled_by).color(Theme::LINK),
-                    );
-                });
-                row.col(|ui| {
-                    ui.label(&resource.age);
-                });
-                row.col(|ui| {
-                    ui.label(
-                        egui::RichText::new(&resource.status)
-                            .color(Theme::status_color(&resource.status)),
-                    );
-                });
+                row.col(|ui| text_cell(ui, &resource.age, selected, None));
+                row.col(|ui| status_cell(ui, &resource.status, selected));
+
+                if row.response().clicked() {
+                    state.selected = Some(original_idx);
+                }
             });
         });
+    if inline_menu {
+        action
+    } else {
+        std::mem::take(&mut action)
+    }
+}
+
+fn handle_row_interaction(
+    row_resp: &egui::Response,
+    original_idx: usize,
+    state: &mut TableState,
+    _action: &mut Option<(usize, RowContextAction)>,
+) {
+    if row_resp.clicked() {
+        state.selected = Some(original_idx);
+    }
+}
+
+fn checkbox_cell(ui: &mut Ui, idx: usize, state: &mut TableState) {
+    let mut checked = state.checked.contains(&idx);
+    if ui.checkbox(&mut checked, "").changed() {
+        if checked {
+            state.checked.insert(idx);
+        } else {
+            state.checked.remove(&idx);
+        }
+    }
+}
+
+fn action_menu_cell(
+    ui: &mut Ui,
+    row_idx: usize,
+    selected: bool,
+    action: &mut Option<(usize, RowContextAction)>,
+    show_menu: impl FnOnce(&mut Ui, usize, &mut Option<(usize, RowContextAction)>),
+) {
+    let _ = selected;
+    ui.menu_button(
+        egui::RichText::new("⋮").size(16.0),
+        |ui| show_menu(ui, row_idx, action),
+    );
 }
 
 fn row_matches_filter(row: &ResourceRow, filter: &str) -> bool {
@@ -210,13 +608,52 @@ fn header_cell(ui: &mut Ui, text: &str) {
 }
 
 fn name_cell(ui: &mut Ui, name: &str, selected: bool, mut on_click: impl FnMut()) {
-    let label = egui::RichText::new(name).color(Theme::LINK);
-    let resp = ui.add(egui::Label::new(label).sense(egui::Sense::click()));
+    let resp = if selected {
+        ui.add(
+            egui::Label::new(egui::RichText::new(name).strong())
+                .sense(egui::Sense::click()),
+        )
+    } else {
+        ui.add(
+            egui::Label::new(egui::RichText::new(name).color(Theme::LINK))
+                .sense(egui::Sense::click()),
+        )
+    };
     if resp.clicked() {
         on_click();
     }
+}
+
+fn text_cell(ui: &mut Ui, text: &str, selected: bool, color: Option<Color32>) {
     if selected {
-        ui.painter().rect_filled(resp.rect, 0.0, Theme::ROW_SELECTED);
+        ui.label(text);
+    } else if let Some(color) = color {
+        ui.label(egui::RichText::new(text).color(color));
+    } else {
+        ui.label(text);
+    }
+}
+
+fn resumed_cell(ui: &mut Ui, resumed: &str, selected: bool) {
+    let color = if resumed == "True" {
+        Theme::status_color("running")
+    } else {
+        Theme::TEXT_MUTED
+    };
+    if selected {
+        ui.label(resumed);
+    } else {
+        ui.label(egui::RichText::new(resumed).color(color));
+    }
+}
+
+fn status_cell(ui: &mut Ui, status: &str, selected: bool) {
+    if selected {
+        ui.label(status);
+    } else {
+        ui.label(
+            egui::RichText::new(status).color(Theme::status_color(status)),
+        );
     }
 }
 

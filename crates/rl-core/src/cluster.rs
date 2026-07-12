@@ -1,4 +1,5 @@
 use kube::Client;
+use tokio::sync::mpsc::Sender;
 
 use crate::config::{config_for_context, current_context_name, list_contexts};
 use crate::containers::{list_pod_containers, ContainerInfo};
@@ -156,13 +157,44 @@ impl ClusterManager {
         .await
     }
 
-    pub async fn delete_resource(&self, kind: ResourceKind, name: &str) -> Result<()> {
+    pub async fn delete_resource(&self, kind: ResourceKind, name: &str, force: bool) -> Result<()> {
         ops::delete_resource(
             &self.client,
             &self.namespace,
             kind,
             name,
             self.selected_crd.as_ref(),
+            force,
+        )
+        .await
+    }
+
+    pub async fn trigger_cronjob(&self, name: &str) -> Result<()> {
+        ops::trigger_cronjob(&self.client, &self.namespace, name).await
+    }
+
+    pub async fn set_cronjob_suspended(&self, name: &str, suspend: bool) -> Result<()> {
+        ops::set_cronjob_suspended(&self.client, &self.namespace, name, suspend).await
+    }
+
+    pub async fn restart_deployment(&self, name: &str) -> Result<()> {
+        ops::restart_deployment(&self.client, &self.namespace, name).await
+    }
+
+    pub async fn fetch_pod_logs_tail(
+        &self,
+        pod_name: &str,
+        container: Option<&str>,
+        timestamps: bool,
+        tail_lines: i64,
+    ) -> Result<Vec<String>> {
+        ops::fetch_pod_logs_tail(
+            &self.client,
+            &self.namespace,
+            pod_name,
+            container,
+            timestamps,
+            tail_lines,
         )
         .await
     }
@@ -202,8 +234,9 @@ impl ClusterManager {
         &self,
         pod_name: String,
         container: Option<String>,
-        tx: tokio::sync::mpsc::UnboundedSender<String>,
-        err_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        timestamps: bool,
+        tx: Sender<String>,
+        err_tx: Sender<String>,
     ) -> tokio::task::JoinHandle<()> {
         let client = self.client.clone();
         let namespace = self.namespace.clone();
@@ -213,13 +246,14 @@ impl ClusterManager {
                 &namespace,
                 &pod_name,
                 container.as_deref(),
+                timestamps,
                 tx,
             )
             .await
             {
                 let message = format!("Log stream error: {}", err.user_message());
                 tracing::warn!("{message}");
-                let _ = err_tx.send(message);
+                let _ = err_tx.send(message).await;
             }
         })
     }

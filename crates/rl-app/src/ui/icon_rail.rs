@@ -207,8 +207,14 @@ fn show_pinned_context(
 
         if ui
             .add(
-                egui::Button::new(egui::RichText::new("×").size(12.0).color(Theme::TEXT_MUTED))
-                    .frame(false),
+                egui::Button::new(
+                    egui::RichText::new("×")
+                        .size(16.0)
+                        .strong()
+                        .color(Theme::TEXT_MUTED),
+                )
+                .min_size(egui::vec2(22.0, 22.0))
+                .frame(false),
             )
             .on_hover_text("Unpin from rail")
             .clicked()

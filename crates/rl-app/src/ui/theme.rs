@@ -31,7 +31,8 @@ impl Theme {
         visuals.widgets.hovered.bg_fill = Color32::from_rgb(48, 54, 62);
         visuals.widgets.active.bg_fill = Self::ACCENT_DIM;
         visuals.selection.bg_fill = Self::ROW_SELECTED;
-        visuals.selection.stroke = Stroke::new(1.0, Self::ACCENT);
+        // Table cells use selection.stroke.color as selected text (egui_extras).
+        visuals.selection.stroke = Stroke::new(1.0, Self::TEXT);
         visuals.hyperlink_color = Self::LINK;
         visuals.warn_fg_color = Self::WARNING;
         visuals.error_fg_color = Self::ERROR;

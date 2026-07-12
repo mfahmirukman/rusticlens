@@ -1,7 +1,10 @@
+pub mod cronjob_menu;
+pub mod deployment_menu;
 pub mod detail_panel;
 pub mod icon_rail;
 pub mod log_panel;
-pub mod log_viewer;
+pub mod log_tabs;
+pub mod pod_menu;
 pub mod resource_table;
 pub mod sidebar;
 pub mod theme;

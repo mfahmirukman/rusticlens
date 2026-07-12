@@ -45,6 +45,56 @@ pub fn spawn_kubectl_port_forward(
         .map_err(|err| crate::error::Error::Message(err.to_string()))
 }
 
+pub fn spawn_kubectl_attach_terminal(
+    namespace: &str,
+    pod_name: &str,
+    container: Option<&str>,
+) -> Result<std::process::Child> {
+    let mut args = vec![
+        "attach".to_string(),
+        "-it".to_string(),
+        "-n".to_string(),
+        namespace.to_string(),
+        pod_name.to_string(),
+    ];
+    if let Some(container) = container {
+        args.push("-c".to_string());
+        args.push(container.to_string());
+    }
+
+    let terminals = [
+        "x-terminal-emulator",
+        "gnome-terminal",
+        "konsole",
+        "xfce4-terminal",
+        "alacritty",
+        "kitty",
+        "xterm",
+    ];
+
+    for term in terminals {
+        let child = Command::new(term)
+            .arg("-e")
+            .arg("kubectl")
+            .args(&args)
+            .spawn();
+        if let Ok(child) = child {
+            return Ok(child);
+        }
+        let child = Command::new(term)
+            .args(["--", "kubectl"])
+            .args(&args)
+            .spawn();
+        if let Ok(child) = child {
+            return Ok(child);
+        }
+    }
+
+    Err(crate::error::Error::Message(
+        "no terminal emulator found; use Copy attach command instead".into(),
+    ))
+}
+
 pub fn spawn_kubectl_exec_terminal(
     namespace: &str,
     pod_name: &str,

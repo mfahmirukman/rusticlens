@@ -6,7 +6,6 @@ use crate::ui::theme::Theme;
 pub enum DetailTab {
     Describe,
     Events,
-    Logs,
     Metrics,
 }
 
@@ -27,7 +26,24 @@ impl DetailState {
     }
 }
 
-pub fn show_content(ui: &mut Ui, state: &mut DetailState, logs: &[String]) {
+pub fn show_header(ui: &mut Ui, active: &mut DetailTab, resource_name: &str) {
+    ui.horizontal(|ui| {
+        if !resource_name.is_empty() {
+            ui.label(
+                egui::RichText::new(resource_name)
+                    .strong()
+                    .color(Theme::ACCENT),
+            );
+            ui.separator();
+        }
+        tab_btn(ui, active, DetailTab::Describe, "Describe");
+        tab_btn(ui, active, DetailTab::Events, "Events");
+        tab_btn(ui, active, DetailTab::Metrics, "Metrics");
+    });
+    ui.separator();
+}
+
+pub fn show_content(ui: &mut Ui, state: &mut DetailState) {
     let area_height = ui.available_height().max(0.0);
     ui.allocate_ui(egui::vec2(ui.available_width(), area_height), |ui| {
         ui.set_min_height(area_height);
@@ -39,50 +55,75 @@ pub fn show_content(ui: &mut Ui, state: &mut DetailState, logs: &[String]) {
                     .auto_shrink([false, false])
                     .max_height(scroll_height)
                     .show(ui, |ui| {
-                    if state.yaml.is_empty() {
-                        ui.label(
-                            egui::RichText::new("Select a resource to view YAML.")
+                        if state.yaml.is_empty() {
+                            ui.label(
+                                egui::RichText::new("Select a resource to view YAML.")
+                                    .color(Theme::TEXT_MUTED),
+                            );
+                        } else {
+                            ui.add(
+                                TextEdit::multiline(&mut state.yaml)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .interactive(false),
+                            );
+                        }
+                    });
+            }
+            DetailTab::Events => {
+                ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .max_height(scroll_height)
+                    .show(ui, |ui| {
+                        if state.events.is_empty() {
+                            ui.label(
+                                egui::RichText::new("Select a resource to view events.")
+                                    .color(Theme::TEXT_MUTED),
+                            );
+                        } else {
+                            ui.add(
+                                TextEdit::multiline(&mut state.events)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .interactive(false),
+                            );
+                        }
+                    });
+            }
+            DetailTab::Metrics => {
+                ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .max_height(scroll_height)
+                    .show(ui, |ui| {
+                        if state.metrics.is_empty() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Pod metrics (requires metrics-server). Select pods and open Metrics.",
+                                )
                                 .color(Theme::TEXT_MUTED),
-                        );
-                    } else {
-                        ui.add(
-                            TextEdit::multiline(&mut state.yaml)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
-                                .interactive(false),
-                        );
-                    }
-                });
+                            );
+                        } else {
+                            ui.add(
+                                TextEdit::multiline(&mut state.metrics)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .interactive(false),
+                            );
+                        }
+                    });
+            }
         }
-        DetailTab::Events => {
-            ScrollArea::both()
-                .auto_shrink([false, false])
-                .max_height(scroll_height)
-                .show(ui, |ui| {
-                    ui.add(
-                        TextEdit::multiline(&mut state.events)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .interactive(false),
-                    );
-                });
-        }
-        DetailTab::Logs => {
-            crate::ui::log_viewer::show(ui, logs);
-        }
-        DetailTab::Metrics => {
-            ScrollArea::both()
-                .auto_shrink([false, false])
-                .max_height(scroll_height)
-                .show(ui, |ui| {
-                    ui.add(
-                        TextEdit::multiline(&mut state.metrics)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .interactive(false),
-                    );
-                });
-        }
-    }
     });
+}
+
+fn tab_btn(ui: &mut Ui, active: &mut DetailTab, tab: DetailTab, label: &str) {
+    let selected = *active == tab;
+    let text = if selected {
+        egui::RichText::new(label).color(Theme::ACCENT)
+    } else {
+        egui::RichText::new(label).color(Theme::TEXT_MUTED)
+    };
+    if ui.add(egui::Button::new(text).frame(false)).clicked() {
+        *active = tab;
+    }
 }

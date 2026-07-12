@@ -1,5 +1,6 @@
 mod app;
 mod backend;
+mod logging;
 mod ui;
 
 #[cfg(feature = "mimalloc")]
@@ -7,14 +8,11 @@ mod ui;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use eframe::egui;
-use tracing_subscriber::EnvFilter;
 
 use crate::ui::theme::Theme;
 
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    logging::init();
 
     let backend = backend::spawn_backend();
 

@@ -14,6 +14,7 @@ pub struct AppSettings {
     #[serde(default)]
     pub pinned_contexts: Vec<String>,
     pub bottom_panel_height: Option<f32>,
+    pub detail_panel_width: Option<f32>,
 }
 
 impl Default for AppSettings {
@@ -25,6 +26,7 @@ impl Default for AppSettings {
             last_container: None,
             pinned_contexts: Vec::new(),
             bottom_panel_height: None,
+            detail_panel_width: None,
         }
     }
 }

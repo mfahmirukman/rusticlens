@@ -252,7 +252,7 @@ where
 }
 
 enum WatchDelta {
-    Upsert(ResourceRow),
+    Upsert(Box<ResourceRow>),
     Remove(String),
     Noop,
 }
@@ -260,7 +260,7 @@ enum WatchDelta {
 fn apply_delta(map: &mut HashMap<String, ResourceRow>, delta: WatchDelta) {
     match delta {
         WatchDelta::Upsert(row) if !row.name.is_empty() => {
-            map.insert(row.name.clone(), row);
+            map.insert(row.name.clone(), *row);
         }
         WatchDelta::Remove(name) if !name.is_empty() => {
             map.remove(&name);
@@ -275,7 +275,7 @@ fn watch_pods(client: Client, namespace: String) -> impl futures::Stream<Item = 
     watcher(api, WatchConfig::default())
         .map(move |event| match event {
             Ok(Event::Apply(pod)) | Ok(Event::InitApply(pod)) => {
-                WatchDelta::Upsert(pod_to_row(&pod, &ns))
+                WatchDelta::Upsert(Box::new(pod_to_row(&pod, &ns)))
             }
             Ok(Event::Delete(pod)) => {
                 WatchDelta::Remove(pod.metadata.name.unwrap_or_default())
@@ -300,7 +300,7 @@ fn watch_deployments(
     watcher(api, WatchConfig::default())
         .map(move |event| match event {
             Ok(Event::Apply(dep)) | Ok(Event::InitApply(dep)) => {
-                WatchDelta::Upsert(deployment_to_row(&dep, &ns))
+                WatchDelta::Upsert(Box::new(deployment_to_row(&dep, &ns)))
             }
             Ok(Event::Delete(dep)) => WatchDelta::Remove(dep.metadata.name.unwrap_or_default()),
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
@@ -323,7 +323,7 @@ fn watch_statefulsets(
     watcher(api, WatchConfig::default())
         .map(move |event| match event {
             Ok(Event::Apply(sts)) | Ok(Event::InitApply(sts)) => {
-                WatchDelta::Upsert(statefulset_to_row(&sts, &ns))
+                WatchDelta::Upsert(Box::new(statefulset_to_row(&sts, &ns)))
             }
             Ok(Event::Delete(sts)) => WatchDelta::Remove(sts.metadata.name.unwrap_or_default()),
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
@@ -343,7 +343,7 @@ fn watch_jobs(client: Client, namespace: String) -> impl futures::Stream<Item = 
     watcher(api, WatchConfig::default())
         .map(move |event| match event {
             Ok(Event::Apply(job)) | Ok(Event::InitApply(job)) => {
-                WatchDelta::Upsert(job_to_row(&job, &ns))
+                WatchDelta::Upsert(Box::new(job_to_row(&job, &ns)))
             }
             Ok(Event::Delete(job)) => WatchDelta::Remove(job.metadata.name.unwrap_or_default()),
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
@@ -366,7 +366,7 @@ fn watch_cronjobs(
     watcher(api, WatchConfig::default())
         .map(move |event| match event {
             Ok(Event::Apply(cj)) | Ok(Event::InitApply(cj)) => {
-                WatchDelta::Upsert(cronjob_to_row(&cj, &ns))
+                WatchDelta::Upsert(Box::new(cronjob_to_row(&cj, &ns)))
             }
             Ok(Event::Delete(cj)) => WatchDelta::Remove(cj.metadata.name.unwrap_or_default()),
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
@@ -389,7 +389,7 @@ fn watch_services(
     watcher(api, WatchConfig::default())
         .map(move |event| match event {
             Ok(Event::Apply(svc)) | Ok(Event::InitApply(svc)) => {
-                WatchDelta::Upsert(service_to_row(&svc, &ns))
+                WatchDelta::Upsert(Box::new(service_to_row(&svc, &ns)))
             }
             Ok(Event::Delete(svc)) => WatchDelta::Remove(svc.metadata.name.unwrap_or_default()),
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
@@ -412,7 +412,7 @@ fn watch_ingresses(
     watcher(api, WatchConfig::default())
         .map(move |event| match event {
             Ok(Event::Apply(ing)) | Ok(Event::InitApply(ing)) => {
-                WatchDelta::Upsert(ingress_to_row(&ing, &ns))
+                WatchDelta::Upsert(Box::new(ingress_to_row(&ing, &ns)))
             }
             Ok(Event::Delete(ing)) => WatchDelta::Remove(ing.metadata.name.unwrap_or_default()),
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
@@ -435,7 +435,7 @@ fn watch_configmaps(
     watcher(api, WatchConfig::default())
         .map(move |event| match event {
             Ok(Event::Apply(cm)) | Ok(Event::InitApply(cm)) => {
-                WatchDelta::Upsert(configmap_to_row(&cm, &ns))
+                WatchDelta::Upsert(Box::new(configmap_to_row(&cm, &ns)))
             }
             Ok(Event::Delete(cm)) => WatchDelta::Remove(cm.metadata.name.unwrap_or_default()),
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
@@ -458,7 +458,7 @@ fn watch_secrets(
     watcher(api, WatchConfig::default())
         .map(move |event| match event {
             Ok(Event::Apply(secret)) | Ok(Event::InitApply(secret)) => {
-                WatchDelta::Upsert(secret_to_row(&secret, &ns))
+                WatchDelta::Upsert(Box::new(secret_to_row(&secret, &ns)))
             }
             Ok(Event::Delete(secret)) => WatchDelta::Remove(secret.metadata.name.unwrap_or_default()),
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
@@ -477,7 +477,7 @@ fn watch_namespaces(client: Client) -> impl futures::Stream<Item = Vec<ResourceR
     watcher(api, WatchConfig::default())
         .map(|event| match event {
             Ok(Event::Apply(ns)) | Ok(Event::InitApply(ns)) => {
-                WatchDelta::Upsert(namespace_to_row(&ns))
+                WatchDelta::Upsert(Box::new(namespace_to_row(&ns)))
             }
             Ok(Event::Delete(ns)) => WatchDelta::Remove(ns.metadata.name.unwrap_or_default()),
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
@@ -496,7 +496,7 @@ fn watch_nodes(client: Client) -> impl futures::Stream<Item = Vec<ResourceRow>> 
     watcher(api, WatchConfig::default())
         .map(|event| match event {
             Ok(Event::Apply(node)) | Ok(Event::InitApply(node)) => {
-                WatchDelta::Upsert(node_to_row(&node))
+                WatchDelta::Upsert(Box::new(node_to_row(&node)))
             }
             Ok(Event::Delete(node)) => WatchDelta::Remove(node.metadata.name.unwrap_or_default()),
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
@@ -561,20 +561,25 @@ fn deployment_to_row(dep: &Deployment, namespace: &str) -> ResourceRow {
         .and_then(|s| s.replicas)
         .or_else(|| dep.spec.as_ref().and_then(|s| s.replicas))
         .unwrap_or(0);
+    let updated = status.and_then(|s| s.updated_replicas).unwrap_or(0);
+    let available = status.and_then(|s| s.available_replicas).unwrap_or(0);
     let phase = if ready == desired && desired > 0 {
         "Available"
     } else {
         "Progressing"
     };
 
-    ResourceRow::new(
+    let mut row = ResourceRow::new(
         name,
         namespace.to_string(),
         format!("{ready}/{desired}"),
         phase.to_string(),
         "-".to_string(),
         format_age(dep.metadata.creation_timestamp.as_ref()),
-    )
+    );
+    row.up_to_date = updated.to_string();
+    row.active = available.to_string();
+    row
 }
 
 fn statefulset_to_row(sts: &StatefulSet, namespace: &str) -> ResourceRow {
@@ -617,47 +622,73 @@ fn job_to_row(job: &Job, namespace: &str) -> ResourceRow {
         "Pending"
     };
 
-    ResourceRow::new(
+    let mut row = ResourceRow::new(
         name,
         namespace.to_string(),
         format!("{succeeded}/{total}"),
         phase.to_string(),
         "-".to_string(),
         format_age(job.metadata.creation_timestamp.as_ref()),
-    )
+    );
+    row.owner = job
+        .metadata
+        .owner_references
+        .as_ref()
+        .and_then(|refs| {
+            refs.iter()
+                .find(|r| r.kind == "CronJob")
+                .map(|r| r.name.clone())
+        })
+        .unwrap_or_else(|| "-".into());
+    row
 }
 
 fn cronjob_to_row(cj: &CronJob, namespace: &str) -> ResourceRow {
     let name = cj.metadata.name.clone().unwrap_or_default();
     let status = cj.status.as_ref();
-    let last = status
-        .and_then(|s| s.last_schedule_time.as_ref())
-        .map(|_| "Scheduled".to_string())
-        .unwrap_or_else(|| "Idle".to_string());
     let suspend = cj
         .spec
         .as_ref()
         .and_then(|s| s.suspend)
         .unwrap_or(false);
-    let phase = if suspend {
-        "Suspended".to_string()
-    } else {
-        last
-    };
     let schedule = cj
         .spec
         .as_ref()
         .map(|s| s.schedule.clone())
         .unwrap_or_else(|| "-".into());
+    let timezone = cj
+        .spec
+        .as_ref()
+        .and_then(|s| s.time_zone.clone())
+        .unwrap_or_else(|| "UTC".into());
+    let active = status
+        .and_then(|s| s.active.as_ref())
+        .map(|jobs| jobs.len().to_string())
+        .unwrap_or_else(|| "0".into());
+    let last_schedule = status
+        .and_then(|s| s.last_schedule_time.as_ref())
+        .map(|t| format_age(Some(t)))
+        .unwrap_or_else(|| "-".into());
+    let phase = if suspend {
+        "Suspended".to_string()
+    } else {
+        "Active".to_string()
+    };
 
-    ResourceRow::new(
+    let mut row = ResourceRow::new(
         name,
         namespace.to_string(),
-        schedule,
+        schedule.clone(),
         phase,
         "-".to_string(),
         format_age(cj.metadata.creation_timestamp.as_ref()),
-    )
+    );
+    row.schedule = schedule;
+    row.timezone = timezone;
+    row.resumed = if suspend { "False".into() } else { "True".into() };
+    row.active = active;
+    row.last_schedule = last_schedule;
+    row
 }
 
 fn service_to_row(svc: &Service, namespace: &str) -> ResourceRow {

@@ -2,19 +2,20 @@ use std::collections::HashMap;
 
 use eframe::egui;
 use rl_core::{
-    kubectl_exec_command, kubectl_port_forward_command, spawn_kubectl_exec_terminal,
-    spawn_kubectl_port_forward, ContainerInfo, CrdTarget, ResourceKind, ResourceSnapshot,
+    kubectl_edit_command, kubectl_exec_command, kubectl_port_forward_command,
+    spawn_kubectl_attach_terminal, spawn_kubectl_exec_terminal, spawn_kubectl_port_forward,
+    ContainerInfo, CrdTarget, ResourceKind, ResourceSnapshot,
 };
 
 use crate::backend::{BackendCommand, BackendEvent, BackendHandle};
-use crate::ui::detail_panel::{DetailState, DetailTab};
-use crate::ui::log_panel::{LogPanelState, show as show_log_panel};
-use crate::ui::resource_table::TableState;
+use crate::log_info;
+use crate::ui::detail_panel::{show_content as show_detail_content, show_header as show_detail_header, DetailState, DetailTab};
+use crate::ui::log_panel::{LogPanelState, show_tab_bar, show_tab_content};
+use crate::ui::log_tabs::LogTabsState;
+use crate::ui::resource_table::{RowContextAction, TableState};
 use crate::ui::sidebar::SidebarState;
 use crate::ui::icon_rail::{self, IconRailAction, IconRailState};
 use crate::ui::theme::Theme;
-
-const MAX_LOG_LINES: usize = 500;
 
 struct PaletteAction {
     label: String,
@@ -48,6 +49,7 @@ pub struct RusticlensApp {
     crd_targets: Vec<CrdTarget>,
     selected_crd: Option<CrdTarget>,
     containers: Vec<ContainerInfo>,
+    menu_containers_pod: Option<String>,
     selected_container: Option<String>,
     active_context: String,
     active_namespace: String,
@@ -55,16 +57,16 @@ pub struct RusticlensApp {
     error_message: Option<String>,
     connected: bool,
     connecting: bool,
-    logs: Vec<String>,
-    logs_pod: Option<String>,
-    pending_delete: Option<(ResourceKind, String)>,
-    delete_confirm: Option<(ResourceKind, String)>,
+    log_tabs: LogTabsState,
+    pending_delete: Option<(ResourceKind, String, bool)>,
+    delete_confirm: Option<(ResourceKind, String, bool)>,
     bottom_height: f32,
     palette_open: bool,
     palette_query: String,
     row_count: usize,
     log_panel: LogPanelState,
-    bottom_tab: DetailTab,
+    detail_tab: DetailTab,
+    detail_panel_width: f32,
 }
 
 impl RusticlensApp {
@@ -75,6 +77,7 @@ impl RusticlensApp {
             sidebar: SidebarState::default(),
             table: TableState {
                 selected: None,
+                checked: std::collections::HashSet::new(),
                 filter: String::new(),
             },
             detail: DetailState {
@@ -92,6 +95,7 @@ impl RusticlensApp {
             crd_targets: Vec::new(),
             selected_crd: None,
             containers: Vec::new(),
+            menu_containers_pod: None,
             selected_container: None,
             active_context: String::from("connecting..."),
             active_namespace: String::from("default"),
@@ -99,8 +103,7 @@ impl RusticlensApp {
             error_message: None,
             connected: false,
             connecting: true,
-            logs: Vec::new(),
-            logs_pod: None,
+            log_tabs: LogTabsState::default(),
             pending_delete: None,
             delete_confirm: None,
             bottom_height: rl_core::load_settings()
@@ -110,7 +113,10 @@ impl RusticlensApp {
             palette_query: String::new(),
             row_count: 0,
             log_panel: LogPanelState::default(),
-            bottom_tab: DetailTab::Logs,
+            detail_tab: DetailTab::Describe,
+            detail_panel_width: rl_core::load_settings()
+                .detail_panel_width
+                .unwrap_or(420.0),
         }
     }
 
@@ -136,11 +142,18 @@ impl RusticlensApp {
                     self.namespaces = namespaces;
                     self.crd_targets = crd_targets;
                     self.sync_pinned_contexts(&context);
+                    self.log_tabs.drain_all();
+                    self.backend.send(BackendCommand::CloseAllLogs);
                     self.status_message = format!(
                         "Connected to {} / {}",
                         self.active_context, self.active_namespace
                     );
                     self.error_message = None;
+                    log_info!(
+                        context = %self.active_context,
+                        namespace = %self.active_namespace,
+                        "connected to cluster"
+                    );
                 }
                 BackendEvent::Snapshot { kind, snapshot } => {
                     self.snapshots.insert(kind, snapshot);
@@ -151,48 +164,83 @@ impl RusticlensApp {
                 BackendEvent::YamlLoaded { name, yaml } => {
                     self.detail.resource_name = name;
                     self.detail.yaml = yaml;
-                    if self.bottom_tab != DetailTab::Logs {
-                        self.bottom_tab = DetailTab::Describe;
-                    }
                 }
                 BackendEvent::EventsLoaded { text } => {
                     self.detail.events = text;
-                    self.bottom_tab = DetailTab::Events;
                 }
-                BackendEvent::ContainersLoaded(containers) => {
-                    if self.selected_container.is_none() {
-                        self.selected_container = containers
-                            .iter()
-                            .find(|c| c.ready)
-                            .map(|c| c.name.clone())
-                            .or_else(|| containers.first().map(|c| c.name.clone()));
+                BackendEvent::ContainersLoaded {
+                    tab_id,
+                    pod_name,
+                    containers,
+                } => {
+                    if let Some(id) = tab_id {
+                        let had_container = self
+                            .log_tabs
+                            .tab_mut(id)
+                            .and_then(|t| t.container.clone());
+                        self.log_tabs.set_containers(id, containers);
+                        if had_container.is_none() {
+                            if let Some(tab) = self.log_tabs.tab_mut(id) {
+                                let pod_name = tab.pod_name.clone();
+                                let container = tab.container.clone();
+                                self.backend.send(BackendCommand::StartLogs {
+                                    tab_id: id,
+                                    pod_name,
+                                    container,
+                                    timestamps: self.log_panel.show_timestamps,
+                                });
+                            }
+                        }
+                    } else {
+                        self.menu_containers_pod = Some(pod_name);
+                        self.containers = containers;
+                        if self.selected_container.is_none() {
+                            self.selected_container = self
+                                .containers
+                                .iter()
+                                .find(|c| c.ready)
+                                .map(|c| c.name.clone())
+                                .or_else(|| self.containers.first().map(|c| c.name.clone()));
+                        }
                     }
-                    self.containers = containers;
                 }
                 BackendEvent::MetricsLoaded { text } => {
                     self.detail.metrics = text;
-                    self.bottom_tab = DetailTab::Metrics;
                 }
-                BackendEvent::LogLine(line) => {
-                    self.logs.push(line);
-                    if self.logs.len() > MAX_LOG_LINES {
-                        let drain = self.logs.len() - MAX_LOG_LINES;
-                        self.logs.drain(0..drain);
-                    }
+                BackendEvent::LogLine { tab_id, line } => {
+                    self.log_tabs.push_line(tab_id, line);
                 }
-                BackendEvent::LogError(message) => {
-                    self.logs.push(message);
-                    self.bottom_tab = DetailTab::Logs;
+                BackendEvent::LogError { tab_id, message } => {
+                    self.log_tabs.push_line(tab_id, message);
+                    self.log_tabs.set_active(tab_id);
+                    self.log_tabs.set_loading_older(tab_id, false);
                 }
-                BackendEvent::LogsStopped => {
-                    self.logs.clear();
-                    self.logs_pod = None;
+                BackendEvent::OlderLogsLoaded {
+                    tab_id,
+                    prepended,
+                    has_more,
+                } => {
+                    self.log_tabs
+                        .apply_older_logs(tab_id, prepended, has_more);
                 }
                 BackendEvent::ResourceDeleted { kind, name } => {
                     self.status_message = format!("Deleted {} {name}", kind.api_kind());
                     self.table.selected = None;
                     self.detail.clear();
                     self.delete_confirm = None;
+                }
+                BackendEvent::CronJobTriggered { name } => {
+                    self.status_message = format!("Triggered CronJob {name}");
+                    self.backend.send(BackendCommand::RefreshList);
+                }
+                BackendEvent::CronJobSuspendChanged { name, suspended } => {
+                    let action = if suspended { "Suspended" } else { "Resumed" };
+                    self.status_message = format!("{action} CronJob {name}");
+                    self.backend.send(BackendCommand::RefreshList);
+                }
+                BackendEvent::DeploymentRestarted { name } => {
+                    self.status_message = format!("Restarted deployment {name}");
+                    self.backend.send(BackendCommand::RefreshList);
                 }
                 BackendEvent::Error(msg) => {
                     self.error_message = Some(msg);
@@ -232,7 +280,80 @@ impl RusticlensApp {
 
     fn fetch_metrics(&mut self) {
         self.backend.send(BackendCommand::FetchMetrics);
-        self.bottom_tab = DetailTab::Metrics;
+        self.detail_tab = DetailTab::Metrics;
+        self.detail.tab = DetailTab::Metrics;
+    }
+
+    fn restart_active_log_stream(&mut self, clear_lines: bool) {
+        let Some(tab) = self.log_tabs.active_tab() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let pod_name = tab.pod_name.clone();
+        let container = tab.container.clone();
+        let timestamps = self.log_panel.show_timestamps;
+        if clear_lines {
+            self.log_tabs.clear_lines(tab_id);
+        }
+        self.backend.send(BackendCommand::StartLogs {
+            tab_id,
+            pod_name,
+            container,
+            timestamps,
+        });
+    }
+
+    fn open_pod_logs(&mut self, pod_name: String, container: Option<String>) {
+        let namespace = self.active_namespace.clone();
+        let tab_id = self.log_tabs.open_tab(pod_name.clone(), namespace, container.clone());
+        self.backend.send(BackendCommand::FetchContainers {
+            tab_id: Some(tab_id),
+            pod_name: pod_name.clone(),
+        });
+        self.backend.send(BackendCommand::StartLogs {
+            tab_id,
+            pod_name,
+            container,
+            timestamps: self.log_panel.show_timestamps,
+        });
+        self.persist_settings();
+    }
+
+    fn fetch_older_logs(&mut self, tab_id: u64) {
+        let (pod_name, container, tail_loaded, can_load) = {
+            let Some(tab) = self.log_tabs.tab_mut(tab_id) else {
+                return;
+            };
+            (
+                tab.pod_name.clone(),
+                tab.container.clone(),
+                tab.line_count(),
+                !tab.loading_older && tab.has_more_older,
+            )
+        };
+        if !can_load {
+            return;
+        }
+        log_info!(
+            tab_id,
+            pod = %pod_name,
+            tail_loaded_lines = tail_loaded,
+            "requesting older logs from cluster"
+        );
+        self.log_tabs.set_loading_older(tab_id, true);
+        self.backend.send(BackendCommand::FetchOlderLogs {
+            tab_id,
+            pod_name,
+            container,
+            timestamps: self.log_panel.show_timestamps,
+            tail_loaded,
+        });
+    }
+
+    fn close_log_tab(&mut self, tab_id: u64) {
+        if self.log_tabs.close_tab(tab_id).is_some() {
+            self.backend.send(BackendCommand::CloseLog { tab_id });
+        }
     }
 
     fn start_logs_for_selection(&mut self) {
@@ -241,23 +362,7 @@ impl RusticlensApp {
             return;
         }
         if let Some(name) = self.selected_name() {
-            self.logs.clear();
-            self.logs_pod = Some(name.clone());
-            self.bottom_tab = DetailTab::Logs;
-            self.backend.send(BackendCommand::StartLogs {
-                pod_name: name,
-                container: self.selected_container.clone(),
-            });
-            self.persist_settings();
-        }
-    }
-
-    fn fetch_containers_for_selection(&mut self) {
-        if self.sidebar.selected_kind == ResourceKind::Pod {
-            if let Some(name) = self.selected_name() {
-                self.backend
-                    .send(BackendCommand::FetchContainers { pod_name: name });
-            }
+            self.open_pod_logs(name, None);
         }
     }
 
@@ -277,6 +382,12 @@ impl RusticlensApp {
     fn persist_bottom_height(&self) {
         let mut settings = rl_core::load_settings();
         settings.bottom_panel_height = Some(self.bottom_height);
+        let _ = rl_core::save_settings(&settings);
+    }
+
+    fn persist_detail_panel_width(&self) {
+        let mut settings = rl_core::load_settings();
+        settings.detail_panel_width = Some(self.detail_panel_width);
         let _ = rl_core::save_settings(&settings);
     }
 
@@ -344,6 +455,107 @@ impl RusticlensApp {
         }
     }
 
+    fn on_table_selection_changed(&mut self, _kind: ResourceKind) {
+        self.selected_container = None;
+        self.containers.clear();
+        self.fetch_yaml_for_selection();
+        self.detail_tab = DetailTab::Describe;
+        self.detail.tab = DetailTab::Describe;
+    }
+
+    fn handle_row_context(
+        &mut self,
+        ctx: &egui::Context,
+        kind: ResourceKind,
+        row_idx: usize,
+        action: RowContextAction,
+    ) {
+        self.table.selected = Some(row_idx);
+        match action {
+            RowContextAction::Logs { container } => {
+                if let Some(name) = self.selected_name() {
+                    self.open_pod_logs(name, container);
+                }
+            }
+            RowContextAction::Shell { container } => {
+                if let Some(name) = self.selected_name() {
+                    match spawn_kubectl_exec_terminal(
+                        &self.active_namespace,
+                        &name,
+                        container.as_deref(),
+                    ) {
+                        Ok(_) => self.status_message = "Opened shell in external terminal.".into(),
+                        Err(err) => self.error_message = Some(err.user_message()),
+                    }
+                }
+            }
+            RowContextAction::Attach { container } => {
+                if let Some(name) = self.selected_name() {
+                    match spawn_kubectl_attach_terminal(
+                        &self.active_namespace,
+                        &name,
+                        container.as_deref(),
+                    ) {
+                        Ok(_) => self.status_message = "Attached to pod in external terminal.".into(),
+                        Err(err) => self.error_message = Some(err.user_message()),
+                    }
+                }
+            }
+            RowContextAction::Edit => {
+                if let Some(name) = self.selected_name() {
+                    let cmd = kubectl_edit_command(
+                        &self.active_namespace,
+                        kind.api_kind(),
+                        &name,
+                    );
+                    ctx.copy_text(cmd);
+                    self.status_message = "Copied kubectl edit command.".into();
+                }
+            }
+            RowContextAction::Delete => {
+                if let Some(name) = self.selected_name() {
+                    self.pending_delete = Some((kind, name, false));
+                }
+            }
+            RowContextAction::ForceDelete => {
+                if let Some(name) = self.selected_name() {
+                    self.pending_delete = Some((kind, name, true));
+                }
+            }
+            RowContextAction::Trigger => {
+                if let Some(name) = self.selected_name() {
+                    self.backend.send(BackendCommand::TriggerCronJob {
+                        name: name.to_string(),
+                    });
+                }
+            }
+            RowContextAction::Suspend => {
+                if let Some(name) = self.selected_name() {
+                    self.backend.send(BackendCommand::SetCronjobSuspended {
+                        name: name.to_string(),
+                        suspend: true,
+                    });
+                }
+            }
+            RowContextAction::Resume => {
+                if let Some(name) = self.selected_name() {
+                    self.backend.send(BackendCommand::SetCronjobSuspended {
+                        name: name.to_string(),
+                        suspend: false,
+                    });
+                }
+            }
+            RowContextAction::Restart => {
+                if let Some(name) = self.selected_name() {
+                    self.backend.send(BackendCommand::RestartDeployment {
+                        name: name.to_string(),
+                    });
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
     fn palette_actions(&self) -> Vec<PaletteAction> {
         let mut actions = vec![
             PaletteAction {
@@ -403,14 +615,22 @@ impl RusticlensApp {
     fn run_palette_command(&mut self, ctx: &egui::Context, command: PaletteCommand) {
         match command {
             PaletteCommand::Refresh => self.backend.send(BackendCommand::RefreshWatch),
-            PaletteCommand::Describe => self.fetch_yaml_for_selection(),
+            PaletteCommand::Describe => {
+                self.fetch_yaml_for_selection();
+                self.detail_tab = DetailTab::Describe;
+                self.detail.tab = DetailTab::Describe;
+            }
             PaletteCommand::Logs => self.start_logs_for_selection(),
-            PaletteCommand::Events => self.fetch_events_for_selection(),
+            PaletteCommand::Events => {
+                self.fetch_events_for_selection();
+                self.detail_tab = DetailTab::Events;
+                self.detail.tab = DetailTab::Events;
+            }
             PaletteCommand::Metrics => self.fetch_metrics(),
             PaletteCommand::Delete => {
                 let kind = self.sidebar.selected_kind;
                 if let Some(name) = self.selected_name() {
-                    self.pending_delete = Some((kind, name));
+                    self.pending_delete = Some((kind, name, false));
                 }
             }
             PaletteCommand::CopyExec => {
@@ -485,12 +705,16 @@ impl RusticlensApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::D)) {
             self.fetch_yaml_for_selection();
+            self.detail_tab = DetailTab::Describe;
+            self.detail.tab = DetailTab::Describe;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::L)) {
             self.start_logs_for_selection();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::E)) {
             self.fetch_events_for_selection();
+            self.detail_tab = DetailTab::Events;
+            self.detail.tab = DetailTab::Events;
         }
     }
 
@@ -532,29 +756,33 @@ impl eframe::App for RusticlensApp {
         self.handle_keyboard(ctx);
         self.show_palette(ctx);
 
-        if let Some((kind, name)) = self.pending_delete.take() {
-            self.delete_confirm = Some((kind, name));
+        if let Some((kind, name, force)) = self.pending_delete.take() {
+            self.delete_confirm = Some((kind, name, force));
         }
 
-        if let Some((kind, name)) = &self.delete_confirm {
+        if let Some((kind, name, force)) = &self.delete_confirm {
             let kind = *kind;
             let name = name.clone();
+            let force = *force;
             let mut open = true;
-            egui::Window::new("Confirm delete")
+            let title = if force { "Confirm force delete" } else { "Confirm delete" };
+            egui::Window::new(title)
                 .open(&mut open)
                 .collapsible(false)
                 .show(ctx, |ui| {
                     ui.label(format!(
-                        "Delete {} {} in namespace {}?",
+                        "{} {} {} in namespace {}?",
+                        if force { "Force delete" } else { "Delete" },
                         kind.api_kind(),
                         name,
                         self.active_namespace
                     ));
                     ui.horizontal(|ui| {
-                        if ui.button("Delete").clicked() {
+                        if ui.button(if force { "Force delete" } else { "Delete" }).clicked() {
                             self.backend.send(BackendCommand::DeleteResource {
                                 kind,
                                 name: name.clone(),
+                                force,
                             });
                             self.delete_confirm = None;
                         }
@@ -628,7 +856,7 @@ impl eframe::App for RusticlensApp {
             self.persist_settings();
         }
 
-        // Bottom panel: logs + describe/events/metrics
+        // Bottom panel: streaming logs
         const BOTTOM_PANEL_ID: &str = "bottom_panel";
         let max_bottom_h = (ctx.screen_rect().height() * 0.85).max(120.0);
         let panel_id = egui::Id::new(BOTTOM_PANEL_ID);
@@ -636,7 +864,6 @@ impl eframe::App for RusticlensApp {
 
         self.bottom_height = self.bottom_height.clamp(100.0, max_bottom_h);
         self.apply_bottom_panel_resize(ctx, resize_id, max_bottom_h);
-        // egui stores content height in PanelState, not the dragged edge — seed before show.
         set_bottom_panel_persisted_height(ctx, panel_id, self.bottom_height);
 
         egui::TopBottomPanel::bottom(BOTTOM_PANEL_ID)
@@ -651,10 +878,7 @@ impl eframe::App for RusticlensApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    tab_btn(ui, &mut self.bottom_tab, DetailTab::Logs, "Logs");
-                    tab_btn(ui, &mut self.bottom_tab, DetailTab::Describe, "Describe");
-                    tab_btn(ui, &mut self.bottom_tab, DetailTab::Events, "Events");
-                    tab_btn(ui, &mut self.bottom_tab, DetailTab::Metrics, "Metrics");
+                    ui.label(egui::RichText::new("Logs").color(Theme::ACCENT).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Refresh").clicked() {
                             self.backend.send(BackendCommand::RefreshWatch);
@@ -670,33 +894,38 @@ impl eframe::App for RusticlensApp {
                 ui.allocate_ui(egui::vec2(ui.available_width(), body_height), |ui| {
                     ui.set_min_height(body_height);
                     ui.set_max_height(body_height);
-                    match self.bottom_tab {
-                        DetailTab::Logs => {
-                            let containers: Vec<(String, bool)> = self
-                                .containers
-                                .iter()
-                                .map(|c| (c.name.clone(), c.ready))
-                                .collect();
-                            let pod = self.logs_pod.clone();
-                            let ns = self.active_namespace.clone();
-                            let container = self.selected_container.clone();
-                            if let Some(name) = show_log_panel(
-                                ui,
-                                &mut self.log_panel,
-                                pod.as_deref(),
-                                &ns,
-                                container.as_deref(),
-                                &self.logs,
-                                &containers,
-                            ) {
-                                self.selected_container = Some(name);
-                                self.start_logs_for_selection();
-                            }
+
+                    let tabs = self.log_tabs.tabs();
+                    let active_id = self.log_tabs.active_id();
+                    let bar_action = show_tab_bar(ui, tabs, active_id);
+                    if let Some(id) = bar_action.select_tab {
+                        self.log_tabs.set_active(id);
+                    }
+                    if let Some(id) = bar_action.close_tab {
+                        self.close_log_tab(id);
+                    }
+
+                    let active_tab = self.log_tabs.active_tab().cloned();
+                    let content_action =
+                        show_tab_content(ui, &mut self.log_panel, active_tab.as_ref());
+                    if let Some((tab_id, container)) = content_action.container {
+                        if let Some(tab) = self.log_tabs.tab_mut(tab_id) {
+                            tab.container = Some(container.clone());
                         }
-                        _ => {
-                            self.detail.tab = self.bottom_tab;
-                            crate::ui::detail_panel::show_content(ui, &mut self.detail, &self.logs);
+                        self.log_tabs.clear_lines(tab_id);
+                        if let Some(tab) = self.log_tabs.tab_mut(tab_id) {
+                            let pod_name = tab.pod_name.clone();
+                            self.backend.send(BackendCommand::StartLogs {
+                                tab_id,
+                                pod_name,
+                                container: Some(container),
+                                timestamps: self.log_panel.show_timestamps,
+                            });
                         }
+                    } else if content_action.restart_stream {
+                        self.restart_active_log_stream(true);
+                    } else if let Some(tab_id) = content_action.load_older {
+                        self.fetch_older_logs(tab_id);
                     }
 
                     if let Some(err) = &self.error_message {
@@ -707,6 +936,50 @@ impl eframe::App for RusticlensApp {
 
         self.apply_bottom_panel_resize(ctx, resize_id, max_bottom_h);
         set_bottom_panel_persisted_height(ctx, panel_id, self.bottom_height);
+
+        let show_detail = !self.sidebar.show_overview && self.connected;
+
+        if show_detail {
+            const DETAIL_PANEL_ID: &str = "detail_panel";
+            let detail_id = egui::Id::new(DETAIL_PANEL_ID);
+            let max_detail_w = (ctx.screen_rect().width() * 0.65).max(320.0);
+            self.detail_panel_width = self.detail_panel_width.clamp(280.0, max_detail_w);
+
+            let prev_detail_tab = self.detail_tab;
+            egui::SidePanel::right(DETAIL_PANEL_ID)
+                .resizable(true)
+                .default_width(self.detail_panel_width)
+                .width_range(280.0..=max_detail_w)
+                .frame(
+                    egui::Frame::side_top_panel(&ctx.style())
+                        .fill(Theme::PANEL)
+                        .inner_margin(egui::Margin::symmetric(8, 6)),
+                )
+                .show(ctx, |ui| {
+                    let resource_name = self.detail.resource_name.clone();
+                    show_detail_header(ui, &mut self.detail_tab, &resource_name);
+                    self.detail.tab = self.detail_tab;
+                    show_detail_content(ui, &mut self.detail);
+                });
+
+            if let Some(state) =
+                ctx.data_mut(|d| d.get_persisted::<egui::containers::panel::PanelState>(detail_id))
+            {
+                let w = state.rect.width();
+                if (w - self.detail_panel_width).abs() > 1.0 {
+                    self.detail_panel_width = w;
+                    self.persist_detail_panel_width();
+                }
+            }
+
+            if self.detail_tab != prev_detail_tab {
+                match self.detail_tab {
+                    DetailTab::Describe => self.fetch_yaml_for_selection(),
+                    DetailTab::Events => self.fetch_events_for_selection(),
+                    DetailTab::Metrics => self.fetch_metrics(),
+                }
+            }
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(&ctx.style()).fill(Theme::BG))
@@ -779,29 +1052,46 @@ impl eframe::App for RusticlensApp {
                 let namespace = self.active_namespace.clone();
                 let prev_selected = self.table.selected;
 
-                crate::ui::resource_table::show(
+                let containers = self.containers.clone();
+                let menu_containers_pod = self.menu_containers_pod.clone();
+                let cmd_tx = self.backend.cmd_tx.clone();
+                let mut pending_menu_pod = None;
+                let row_context = crate::ui::resource_table::show(
                     ui,
                     kind,
                     &rows,
                     &mut self.table,
                     &namespace,
                     &namespaces,
+                    &containers,
+                    menu_containers_pod.as_deref(),
                     &mut |ns| self.backend.send(BackendCommand::SetNamespace(ns)),
+                    &mut |pod_name| {
+                        pending_menu_pod = Some(pod_name.to_string());
+                        let _ = cmd_tx.send(BackendCommand::FetchContainers {
+                            tab_id: None,
+                            pod_name: pod_name.to_string(),
+                        });
+                    },
                 );
+                if let Some(pod) = pending_menu_pod {
+                    self.menu_containers_pod = Some(pod);
+                }
 
-                if self.table.selected != prev_selected {
-                    self.fetch_yaml_for_selection();
-                    self.fetch_events_for_selection();
-                    if kind == ResourceKind::Pod {
-                        self.fetch_containers_for_selection();
-                        self.start_logs_for_selection();
-                        self.backend.send(BackendCommand::FetchMetrics);
-                    } else {
-                        self.backend.send(BackendCommand::StopLogs);
-                        self.logs.clear();
-                        self.logs_pod = None;
-                        self.containers.clear();
-                        self.selected_container = None;
+                if let Some((idx, action)) = row_context {
+                    self.handle_row_context(ctx, kind, idx, action);
+                } else if self.table.selected != prev_selected {
+                    self.on_table_selection_changed(kind);
+                }
+
+                if kind == ResourceKind::CronJob {
+                    if let Some(name) = self.table.selected_name(&rows) {
+                        let job_rows = self
+                            .snapshots
+                            .get(&ResourceKind::Job)
+                            .map(|s| s.rows.as_slice())
+                            .unwrap_or(&[]);
+                        crate::ui::resource_table::show_cronjob_jobs(ui, name, job_rows);
                     }
                 }
             });
@@ -811,19 +1101,9 @@ impl eframe::App for RusticlensApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist_settings();
+        self.persist_detail_panel_width();
+        self.backend.send(BackendCommand::CloseAllLogs);
         self.backend.send(BackendCommand::Shutdown);
-    }
-}
-
-fn tab_btn(ui: &mut egui::Ui, active: &mut DetailTab, tab: DetailTab, label: &str) {
-    let selected = *active == tab;
-    let text = if selected {
-        egui::RichText::new(label).color(Theme::ACCENT)
-    } else {
-        egui::RichText::new(label).color(Theme::TEXT_MUTED)
-    };
-    if ui.add(egui::Button::new(text).frame(false)).clicked() {
-        *active = tab;
     }
 }
 

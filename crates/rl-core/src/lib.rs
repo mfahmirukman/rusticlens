@@ -20,9 +20,13 @@ pub use resources::CrdTarget;
 pub use error::{Error, Result};
 pub use events::{EventRow, format_events_text};
 pub use metrics::{PodMetricSummary, format_metrics_text};
-pub use ops::kubectl_exec_command;
+pub use ops::{
+    kubectl_attach_command, kubectl_edit_command, kubectl_exec_command,
+    kubectl_rollout_restart_command,
+};
 pub use portforward::{
-    kubectl_port_forward_command, spawn_kubectl_exec_terminal, spawn_kubectl_port_forward,
+    kubectl_port_forward_command, spawn_kubectl_attach_terminal, spawn_kubectl_exec_terminal,
+    spawn_kubectl_port_forward,
 };
 pub use resources::{ResourceCategory, ResourceKind, ResourceRow};
 pub use settings::{AppSettings, load_settings, save_settings};

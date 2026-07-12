@@ -19,6 +19,12 @@ pub struct LogTab {
     lines: Vec<String>,
     pub has_more_older: bool,
     pub loading_older: bool,
+    /// Previous frame scroll offset — used to detect scrolling up into the top edge.
+    pub(crate) last_scroll_offset_y: Option<f32>,
+    /// Re-armed when leaving the top; used when content fits without scrolling (wheel-up).
+    pub(crate) older_fetch_armed: bool,
+    /// After prepending older lines, bump scroll offset by this many rows once.
+    pub scroll_compensate_rows: usize,
     trimmed_lines: u64,
     /// Highest line-count milestone already logged (`1`, `100`, `500`, …).
     logged_milestone: usize,
@@ -154,6 +160,9 @@ impl LogTabsState {
             lines: Vec::new(),
             has_more_older: true,
             loading_older: false,
+            last_scroll_offset_y: None,
+            older_fetch_armed: false,
+            scroll_compensate_rows: 0,
             trimmed_lines: 0,
             logged_milestone: 0,
         });
@@ -302,6 +311,8 @@ impl LogTabsState {
         tab.logged_milestone = 0;
         tab.has_more_older = true;
         tab.loading_older = false;
+        tab.last_scroll_offset_y = None;
+        tab.older_fetch_armed = false;
         log_info!(
             tab_id,
             pod = %tab.pod_name,
@@ -345,6 +356,7 @@ impl LogTabsState {
         tab.prepend_lines(&prepended);
         tab.has_more_older = has_more;
         tab.loading_older = false;
+        tab.scroll_compensate_rows = prepended.len();
 
         log_info!(
             tab_id,

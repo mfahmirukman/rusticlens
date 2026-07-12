@@ -112,7 +112,7 @@ pub fn show_tab_bar(
 pub fn show_tab_content(
     ui: &mut Ui,
     state: &mut LogPanelState,
-    tab: Option<&LogTab>,
+    tab: Option<&mut LogTab>,
 ) -> LogContentAction {
     let mut action = LogContentAction::default();
 
@@ -191,6 +191,8 @@ pub fn show_tab_content(
 
     let log_area_height = ui.available_height().max(0.0);
     let filter = state.log_filter.to_lowercase();
+    let (row_height, spacing_y) = log_row_metrics(ui);
+
     ui.allocate_ui(egui::vec2(ui.available_width(), log_area_height), |ui| {
         ui.set_min_height(log_area_height);
         egui::Frame::new()
@@ -198,76 +200,122 @@ pub fn show_tab_content(
             .inner_margin(6.0)
             .show(ui, |ui| {
                 let scroll_height = ui.available_height().max(0.0);
+                let lines = tab.lines();
+                let filtered = tab.matching_indices(&filter);
+                let total_rows = if filter.is_empty() {
+                    lines.len()
+                } else {
+                    filtered.len()
+                };
+                let content_height =
+                    (row_height * total_rows as f32 - spacing_y).max(0.0);
+
                 let mut scroll = ScrollArea::both()
                     .id_salt(("log_scroll", tab.id))
                     .auto_shrink([false, false])
                     .max_height(scroll_height);
-                if state.follow_tail && !tab.loading_older {
-                    scroll = scroll.stick_to_bottom(true);
-                }
-                let scroll_out = if tab.is_empty() {
-                    scroll
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new("Waiting for log output...")
-                                    .color(Theme::TEXT_MUTED),
-                            );
-                        })
-                } else {
-                    let lines = tab.lines();
-                    let filtered = tab.matching_indices(&filter);
-                    let total_rows = if filter.is_empty() {
-                        lines.len()
-                    } else {
-                        filtered.len()
-                    };
 
-                    if total_rows == 0 {
-                        scroll.show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new("No matching log lines.")
-                                    .color(Theme::TEXT_MUTED),
-                            );
-                        })
-                    } else {
-                        scroll.show_rows(ui, LOG_LINE_HEIGHT, total_rows, |ui, row_range| {
-                            for row in row_range {
-                                let line = if filter.is_empty() {
-                                    lines.get(row).map(String::as_str)
-                                } else {
-                                    filtered
-                                        .get(row)
-                                        .and_then(|&idx| lines.get(idx))
-                                        .map(String::as_str)
-                                };
-                                if let Some(line) = line {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(line)
-                                                .monospace()
-                                                .color(Theme::TEXT),
-                                        )
-                                        .wrap_mode(wrap_mode)
-                                        .selectable(true),
-                                    );
-                                }
+                if state.follow_tail && !tab.loading_older {
+                    let max_offset = (content_height - scroll_height).max(0.0);
+                    scroll = scroll
+                        .vertical_scroll_offset(max_offset)
+                        .stick_to_bottom(true);
+                }
+
+                let scroll_out = if tab.is_empty() {
+                    scroll.show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Waiting for log output...")
+                                .color(Theme::TEXT_MUTED),
+                        );
+                    })
+                } else if total_rows == 0 {
+                    scroll.show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("No matching log lines.")
+                                .color(Theme::TEXT_MUTED),
+                        );
+                    })
+                } else {
+                    scroll.show_rows(ui, LOG_LINE_HEIGHT, total_rows, |ui, row_range| {
+                        for row in row_range {
+                            let line = if filter.is_empty() {
+                                lines.get(row).map(String::as_str)
+                            } else {
+                                filtered
+                                    .get(row)
+                                    .and_then(|&idx| lines.get(idx))
+                                    .map(String::as_str)
+                            };
+                            if let Some(line) = line {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(line)
+                                            .monospace()
+                                            .color(Theme::TEXT),
+                                    )
+                                    .wrap_mode(wrap_mode)
+                                    .selectable(true),
+                                );
                             }
-                        })
-                    }
+                        }
+                    })
                 };
+
+                let mut offset_y = scroll_out.state.offset.y;
+
+                if tab.scroll_compensate_rows > 0 {
+                    let bump = tab.scroll_compensate_rows as f32 * row_height;
+                    tab.scroll_compensate_rows = 0;
+                    let max_offset = (scroll_out.content_size.y - scroll_out.inner_rect.height())
+                        .max(0.0);
+                    let mut scroll_state = scroll_out.state;
+                    offset_y = (scroll_state.offset.y + bump).min(max_offset);
+                    scroll_state.offset.y = offset_y;
+                    scroll_state.store(ui.ctx(), scroll_out.id);
+                }
+
+                let at_top = offset_y <= SCROLL_LOAD_THRESHOLD;
+                let content_overflows =
+                    scroll_out.content_size.y > scroll_height + SCROLL_LOAD_THRESHOLD;
+                let prev_offset = tab
+                    .last_scroll_offset_y
+                    .unwrap_or(offset_y + SCROLL_LOAD_THRESHOLD + 1.0);
+                // User scrolled up from below and hit the top edge.
+                let scrolled_to_top = at_top && prev_offset > SCROLL_LOAD_THRESHOLD;
+
+                if !at_top {
+                    tab.older_fetch_armed = true;
+                }
+
+                // Content fits in the viewport: no scrollbar, but wheel-up at top still requests older lines.
+                let wheel_up = ui.input(|i| i.smooth_scroll_delta.y > 0.0);
+                let wheel_at_top = at_top
+                    && !content_overflows
+                    && wheel_up
+                    && tab.older_fetch_armed;
 
                 if tab.has_more_older
                     && !tab.loading_older
                     && !state.follow_tail
-                    && scroll_out.content_size.y > scroll_height + SCROLL_LOAD_THRESHOLD
-                    && scroll_out.state.offset.y <= SCROLL_LOAD_THRESHOLD
+                    && (scrolled_to_top || wheel_at_top)
                 {
+                    if wheel_at_top {
+                        tab.older_fetch_armed = false;
+                    }
                     action.load_older = Some(tab.id);
                 }
+
+                tab.last_scroll_offset_y = Some(offset_y);
             });
     });
 
     action
+}
+
+fn log_row_metrics(ui: &Ui) -> (f32, f32) {
+    let spacing_y = ui.spacing().item_spacing.y;
+    (LOG_LINE_HEIGHT + spacing_y, spacing_y)
 }
 
 fn truncate_tab_title(name: &str) -> String {

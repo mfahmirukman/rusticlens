@@ -895,9 +895,8 @@ impl eframe::App for RusticlensApp {
                     ui.set_min_height(body_height);
                     ui.set_max_height(body_height);
 
-                    let tabs = self.log_tabs.tabs();
                     let active_id = self.log_tabs.active_id();
-                    let bar_action = show_tab_bar(ui, tabs, active_id);
+                    let bar_action = show_tab_bar(ui, self.log_tabs.tabs(), active_id);
                     if let Some(id) = bar_action.select_tab {
                         self.log_tabs.set_active(id);
                     }
@@ -905,9 +904,15 @@ impl eframe::App for RusticlensApp {
                         self.close_log_tab(id);
                     }
 
-                    let active_tab = self.log_tabs.active_tab().cloned();
-                    let content_action =
-                        show_tab_content(ui, &mut self.log_panel, active_tab.as_ref());
+                    let content_action = if let Some(id) = self.log_tabs.active_id() {
+                        if let Some(tab) = self.log_tabs.tab_mut(id) {
+                            show_tab_content(ui, &mut self.log_panel, Some(tab))
+                        } else {
+                            show_tab_content(ui, &mut self.log_panel, None)
+                        }
+                    } else {
+                        show_tab_content(ui, &mut self.log_panel, None)
+                    };
                     if let Some((tab_id, container)) = content_action.container {
                         if let Some(tab) = self.log_tabs.tab_mut(tab_id) {
                             tab.container = Some(container.clone());

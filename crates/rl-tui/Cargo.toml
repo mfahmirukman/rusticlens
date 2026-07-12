@@ -1,0 +1,20 @@
+[package]
+name = "rl-tui"
+description = "Terminal UI for rusticlens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rusticlens-tui"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.28"
+ratatui = "0.29"
+rl-core = { path = "../rl-core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

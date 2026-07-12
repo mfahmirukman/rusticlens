@@ -1,0 +1,23 @@
+[package]
+name = "rl-core"
+description = "Kubernetes engine for rusticlens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono = "0.4"
+futures = "0.3"
+k8s-openapi = { version = "0.24", features = ["latest", "schemars"] }
+kube = { version = "0.99", features = ["client", "runtime", "ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

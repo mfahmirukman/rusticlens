@@ -1,0 +1,235 @@
+use kube::Client;
+
+use crate::config::{config_for_context, current_context_name, list_contexts};
+use crate::containers::{list_pod_containers, ContainerInfo};
+use crate::crd::{list_crd_instances, list_crds};
+use crate::error::{Error, Result};
+use crate::events::{list_events_for_resource, EventRow};
+use crate::helm::list_helm_releases;
+use crate::metrics::{list_pod_metrics, PodMetricSummary};
+use crate::ops;
+use crate::plugins::{LoggingPlugin, PluginRegistry};
+use crate::resources::{CrdTarget, ResourceKind};
+use crate::settings::{load_settings, save_settings};
+use crate::store::{list_initial_rows, ResourceSnapshot, WatchController};
+
+/// Manages cluster connection, namespace selection, and resource watches.
+pub struct ClusterManager {
+    context: String,
+    client: Client,
+    namespace: String,
+    watch: WatchController,
+    crd_targets: Vec<CrdTarget>,
+    selected_crd: Option<CrdTarget>,
+    plugins: PluginRegistry,
+}
+
+impl ClusterManager {
+    /// Connect using saved settings or current kubeconfig context.
+    pub async fn connect_default() -> Result<Self> {
+        let settings = load_settings();
+        let contexts = list_contexts()?;
+        let context = settings
+            .last_context
+            .filter(|c| contexts.iter().any(|ctx| ctx == c))
+            .or_else(|| current_context_name().ok().flatten())
+            .or_else(|| contexts.first().cloned())
+            .ok_or(Error::NoActiveContext)?;
+
+        let mut manager = Self::connect(&context).await?;
+        if let Some(ns) = settings.last_namespace {
+            if manager.list_namespaces().await?.iter().any(|n| n == &ns) {
+                manager.set_namespace(ns).await?;
+            }
+        }
+        Ok(manager)
+    }
+
+    /// Connect to a specific kubeconfig context.
+    pub async fn connect(context: &str) -> Result<Self> {
+        let config = config_for_context(context).await?;
+        let client = Client::try_from(config)?;
+        let namespace = ops::list_namespaces(&client)
+            .await?
+            .into_iter()
+            .find(|n| n == "default")
+            .unwrap_or_else(|| "default".to_string());
+
+        let mut plugins = PluginRegistry::new();
+        plugins.register(Box::new(LoggingPlugin));
+
+        let crd_targets = list_crds(&client).await.unwrap_or_default();
+
+        let mut manager = Self {
+            context: context.to_string(),
+            client,
+            namespace,
+            watch: WatchController::new(),
+            crd_targets,
+            selected_crd: None,
+            plugins,
+        };
+        manager.plugins.notify_connected(context);
+        manager.restart_watch().await?;
+        Ok(manager)
+    }
+
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    pub fn crd_targets(&self) -> &[CrdTarget] {
+        &self.crd_targets
+    }
+
+    pub fn selected_crd(&self) -> Option<&CrdTarget> {
+        self.selected_crd.as_ref()
+    }
+
+    pub fn set_selected_crd(&mut self, target: Option<CrdTarget>) {
+        self.selected_crd = target;
+    }
+
+    pub async fn switch_context(&mut self, context: &str) -> Result<()> {
+        let config = config_for_context(context).await?;
+        self.client = Client::try_from(config)?;
+        self.context = context.to_string();
+        self.crd_targets = list_crds(&self.client).await.unwrap_or_default();
+        self.selected_crd = None;
+        self.plugins.notify_connected(context);
+        self.restart_watch().await
+    }
+
+    pub async fn set_namespace(&mut self, namespace: String) -> Result<()> {
+        self.namespace = namespace;
+        self.restart_watch().await
+    }
+
+    pub async fn list_contexts() -> Result<Vec<String>> {
+        list_contexts()
+    }
+
+    pub async fn list_namespaces(&self) -> Result<Vec<String>> {
+        ops::list_namespaces(&self.client).await
+    }
+
+    pub fn snapshot(&self, kind: ResourceKind) -> ResourceSnapshot {
+        self.watch.snapshot(kind)
+    }
+
+    pub async fn list_rows(&self, kind: ResourceKind) -> Result<Vec<crate::ResourceRow>> {
+        match kind {
+            ResourceKind::HelmRelease => {
+                list_helm_releases(&self.client, &self.namespace).await
+            }
+            ResourceKind::Crd => {
+                if let Some(target) = &self.selected_crd {
+                    list_crd_instances(&self.client, &self.namespace, target).await
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            _ => Ok(self.watch.snapshot(kind).rows),
+        }
+    }
+
+    pub async fn refresh_watch(&mut self) -> Result<()> {
+        self.restart_watch().await
+    }
+
+    pub async fn resource_yaml(&self, kind: ResourceKind, name: &str) -> Result<String> {
+        ops::get_resource_yaml(
+            &self.client,
+            &self.namespace,
+            kind,
+            name,
+            self.selected_crd.as_ref(),
+        )
+        .await
+    }
+
+    pub async fn delete_resource(&self, kind: ResourceKind, name: &str) -> Result<()> {
+        ops::delete_resource(
+            &self.client,
+            &self.namespace,
+            kind,
+            name,
+            self.selected_crd.as_ref(),
+        )
+        .await
+    }
+
+    pub async fn resource_events(
+        &self,
+        kind: ResourceKind,
+        name: &str,
+    ) -> Result<Vec<EventRow>> {
+        list_events_for_resource(
+            &self.client,
+            &self.namespace,
+            kind.api_kind(),
+            name,
+        )
+        .await
+    }
+
+    pub async fn pod_containers(&self, pod_name: &str) -> Result<Vec<ContainerInfo>> {
+        list_pod_containers(&self.client, &self.namespace, pod_name).await
+    }
+
+    pub async fn pod_metrics(&self) -> Result<Vec<PodMetricSummary>> {
+        list_pod_metrics(&self.client, &self.namespace).await
+    }
+
+    pub fn persist_settings(&self, kind: ResourceKind, container: Option<&str>) {
+        let mut settings = crate::settings::load_settings();
+        settings.last_context = Some(self.context.clone());
+        settings.last_namespace = Some(self.namespace.clone());
+        settings.last_kind = Some(kind.label().to_string());
+        settings.last_container = container.map(str::to_string);
+        let _ = save_settings(&settings);
+    }
+
+    pub fn spawn_log_stream(
+        &self,
+        pod_name: String,
+        container: Option<String>,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+        err_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> tokio::task::JoinHandle<()> {
+        let client = self.client.clone();
+        let namespace = self.namespace.clone();
+        tokio::spawn(async move {
+            if let Err(err) = ops::stream_pod_logs(
+                &client,
+                &namespace,
+                &pod_name,
+                container.as_deref(),
+                tx,
+            )
+            .await
+            {
+                let message = format!("Log stream error: {}", err.user_message());
+                tracing::warn!("{message}");
+                let _ = err_tx.send(message);
+            }
+        })
+    }
+
+    async fn restart_watch(&mut self) -> Result<()> {
+        self.watch
+            .start(self.client.clone(), self.namespace.clone())
+            .await?;
+        // Warm helm listing cache path
+        let _ = list_initial_rows(&self.client, &self.namespace, ResourceKind::HelmRelease).await;
+        Ok(())
+    }
+}

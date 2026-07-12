@@ -1,0 +1,69 @@
+use std::path::PathBuf;
+
+use kube::Config;
+
+use crate::error::{Error, Result};
+
+/// Load kubeconfig from the default path or `KUBECONFIG`.
+pub fn load_kubeconfig() -> Result<kube::config::Kubeconfig> {
+    kube::config::Kubeconfig::read().map_err(Error::from)
+}
+
+/// Resolve the kubeconfig file path.
+pub fn kubeconfig_path() -> PathBuf {
+    if let Ok(path) = std::env::var("KUBECONFIG") {
+        let first = path.split(':').next().unwrap_or(&path);
+        return PathBuf::from(first);
+    }
+    dirs_home().join(".kube").join("config")
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Build a client config for a named context.
+pub async fn config_for_context(context: &str) -> Result<Config> {
+    let mut kubeconfig = load_kubeconfig()?;
+    kubeconfig.current_context = Some(context.to_string());
+    Config::from_custom_kubeconfig(
+        kubeconfig,
+        &kube::config::KubeConfigOptions {
+            context: Some(context.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(Error::from)
+}
+
+/// List all context names from kubeconfig.
+pub fn list_contexts() -> Result<Vec<String>> {
+    let kubeconfig = load_kubeconfig()?;
+    Ok(kubeconfig
+        .contexts
+        .iter()
+        .map(|ctx| ctx.name.clone())
+        .collect())
+}
+
+/// Return the current context from kubeconfig, if set.
+pub fn current_context_name() -> Result<Option<String>> {
+    let kubeconfig = load_kubeconfig()?;
+    Ok(kubeconfig.current_context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kubeconfig_path_has_default() {
+        let path = kubeconfig_path();
+        assert!(
+            path.to_string_lossy().contains("config") || path.to_string_lossy().contains("kube")
+        );
+    }
+}

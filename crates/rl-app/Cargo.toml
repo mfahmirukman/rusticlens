@@ -1,0 +1,29 @@
+[package]
+name = "rl-app"
+description = "Native Rust Kubernetes IDE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rusticlens"
+path = "src/main.rs"
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+eframe = { version = "0.31", default-features = true }
+egui = "0.31"
+egui_extras = "0.31"
+rl-core = { path = "../rl-core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dependencies.mimalloc]
+version = "0.1"
+optional = true

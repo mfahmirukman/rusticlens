@@ -2,7 +2,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table},
+    widgets::{
+        Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
+    },
     Frame,
 };
 
@@ -629,22 +631,14 @@ fn draw_log_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     };
 
     let container = log.container.as_deref().unwrap_or("default");
-    let namespace = app
-        .manager
-        .as_ref()
-        .map(|m| m.namespace())
-        .unwrap_or("?");
+    let namespace = app.manager.as_ref().map(|m| m.namespace()).unwrap_or("?");
     let follow_label = if log.follow { "on" } else { "off" };
     let match_label = if log.search_query.is_empty() {
         String::new()
     } else if log.match_rows.is_empty() {
         " | no matches".to_string()
     } else {
-        format!(
-            " | match {}/{}",
-            log.match_cursor + 1,
-            log.match_rows.len()
-        )
+        format!(" | match {}/{}", log.match_cursor + 1, log.match_rows.len())
     };
 
     let title = format!(
@@ -766,7 +760,12 @@ fn draw_log_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     frame.render_widget(footer, footer_area);
 }
 
-fn highlight_log_line(line: &str, query: &str, is_active_row: bool, is_yanked_row: bool) -> Line<'static> {
+fn highlight_log_line(
+    line: &str,
+    query: &str,
+    is_active_row: bool,
+    is_yanked_row: bool,
+) -> Line<'static> {
     if is_yanked_row {
         return Line::from(Span::styled(
             line.to_string(),

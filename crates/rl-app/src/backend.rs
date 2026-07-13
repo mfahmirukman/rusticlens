@@ -327,8 +327,7 @@ async fn handle_command(
     log_polls: &mut HashMap<u64, ActiveLogPoll>,
     port_forwards: &mut HashMap<u64, PortForwardSession>,
     next_port_forward_id: &mut u64,
-    #[cfg(feature = "embedded-terminal")]
-    embedded_exec: &mut Option<EmbeddedExecSession>,
+    #[cfg(feature = "embedded-terminal")] embedded_exec: &mut Option<EmbeddedExecSession>,
     event_tx: &std::sync::mpsc::Sender<BackendEvent>,
 ) -> bool {
     use rl_core::{format_events_text, format_metrics_text, load_settings, ClusterManager};
@@ -761,14 +760,27 @@ async fn handle_command(
                                 err.user_message()
                             );
                             try_kubectl_port_forward(
-                                mgr, kind, &name, local_port, remote_port, id, port_forwards,
+                                mgr,
+                                kind,
+                                &name,
+                                local_port,
+                                remote_port,
+                                id,
+                                port_forwards,
                                 event_tx,
                             );
                         }
                     }
                 } else {
                     try_kubectl_port_forward(
-                        mgr, kind, &name, local_port, remote_port, id, port_forwards, event_tx,
+                        mgr,
+                        kind,
+                        &name,
+                        local_port,
+                        remote_port,
+                        id,
+                        port_forwards,
+                        event_tx,
                     );
                 }
             }
@@ -780,13 +792,15 @@ async fn handle_command(
             let _ = event_tx.send(BackendEvent::PortForwardStopped { id });
         }
         #[cfg(feature = "embedded-terminal")]
-        BackendCommand::StartEmbeddedExec { pod_name, container } => {
+        BackendCommand::StartEmbeddedExec {
+            pod_name,
+            container,
+        } => {
             if let Some(mgr) = manager.as_ref() {
                 if let Some(session) = embedded_exec.take() {
                     let _ = session.cancel_tx.send(());
                 }
-                let (output_tx, mut output_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<String>();
+                let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                 let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
                 let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
                 let client = mgr.client().clone();
@@ -850,13 +864,8 @@ fn try_kubectl_port_forward(
     port_forwards: &mut HashMap<u64, PortForwardSession>,
     event_tx: &std::sync::mpsc::Sender<BackendEvent>,
 ) {
-    match rl_core::spawn_kubectl_port_forward(
-        mgr.namespace(),
-        kind,
-        name,
-        local_port,
-        remote_port,
-    ) {
+    match rl_core::spawn_kubectl_port_forward(mgr.namespace(), kind, name, local_port, remote_port)
+    {
         Ok(child) => {
             let info = rl_core::PortForwardInfo {
                 id,

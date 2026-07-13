@@ -206,14 +206,14 @@ fn show_search_bar(ui: &mut Ui, text: &str, search: &mut DetailSearchState) -> b
             }
         } else {
             ui.label(
-                egui::RichText::new(format!(
-                    "{} / {}",
-                    search.match_index + 1,
-                    matches.len()
-                ))
-                .color(Theme::TEXT_MUTED),
+                egui::RichText::new(format!("{} / {}", search.match_index + 1, matches.len()))
+                    .color(Theme::TEXT_MUTED),
             );
-            if ui.small_button("^").on_hover_text("Previous (Shift+Enter)").clicked() {
+            if ui
+                .small_button("^")
+                .on_hover_text("Previous (Shift+Enter)")
+                .clicked()
+            {
                 prev_match(search, matches.len());
                 scroll_to_match = true;
             }
@@ -223,7 +223,11 @@ fn show_search_bar(ui: &mut Ui, text: &str, search: &mut DetailSearchState) -> b
             }
         }
 
-        if ui.small_button("Clr").on_hover_text("Clear search").clicked() {
+        if ui
+            .small_button("Clr")
+            .on_hover_text("Clear search")
+            .clicked()
+        {
             search.query.clear();
             search.match_index = 0;
         }
@@ -290,8 +294,7 @@ fn render_line_with_highlights(
         if let Some(rel) = lower_line[byte..].find(&lower_query) {
             if rel > 0 {
                 ui.add(
-                    Label::new(RichText::new(&line[byte..byte + rel]).monospace())
-                        .selectable(true),
+                    Label::new(RichText::new(&line[byte..byte + rel]).monospace()).selectable(true),
                 );
             }
             let match_start = byte + rel;
@@ -313,9 +316,7 @@ fn render_line_with_highlights(
             );
             byte = match_end;
         } else {
-            ui.add(
-                Label::new(RichText::new(&line[byte..]).monospace()).selectable(true),
-            );
+            ui.add(Label::new(RichText::new(&line[byte..]).monospace()).selectable(true));
             break;
         }
     }

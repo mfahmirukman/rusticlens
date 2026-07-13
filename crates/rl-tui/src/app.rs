@@ -501,9 +501,9 @@ impl TuiApp {
         match &self.overlay {
             Some(Overlay::ContextPicker(state)) => self.filtered_context_indices(&state.search),
             Some(Overlay::NamespacePicker(state)) => self.filtered_namespace_indices(&state.search),
-            Some(Overlay::ContainerPicker { state, containers, .. }) => {
-                filter_indices(containers, &state.search)
-            }
+            Some(Overlay::ContainerPicker {
+                state, containers, ..
+            }) => filter_indices(containers, &state.search),
             None => Vec::new(),
         }
     }
@@ -607,7 +607,10 @@ impl TuiApp {
                 pod_name,
                 containers,
                 state,
-            } => self.confirm_container_picker(pod_name, containers, state).await,
+            } => {
+                self.confirm_container_picker(pod_name, containers, state)
+                    .await
+            }
         }
     }
 
@@ -665,11 +668,7 @@ impl TuiApp {
             return;
         }
 
-        self.context_index = self
-            .contexts
-            .iter()
-            .position(|c| c == context)
-            .unwrap_or(0);
+        self.context_index = self.contexts.iter().position(|c| c == context).unwrap_or(0);
         self.namespaces = manager.list_namespaces().await.unwrap_or_default();
         self.namespace_index = self
             .namespaces
@@ -827,13 +826,8 @@ impl TuiApp {
 
         let (line_tx, line_rx) = mpsc::channel(512);
         let (err_tx, err_rx) = mpsc::channel(8);
-        let stream_task = manager.spawn_log_stream(
-            pod_name.clone(),
-            container.clone(),
-            true,
-            line_tx,
-            err_tx,
-        );
+        let stream_task =
+            manager.spawn_log_stream(pod_name.clone(), container.clone(), true, line_tx, err_tx);
 
         self.log_view = Some(LogView {
             pod_name,
@@ -994,8 +988,11 @@ impl TuiApp {
         match arboard::Clipboard::new().and_then(|mut clip| clip.set_text(text)) {
             Ok(()) => {
                 log.highlight_source = Some(source);
-                self.status_message =
-                    format!("Copied full log line to clipboard ({}/{})", source + 1, log.lines.len());
+                self.status_message = format!(
+                    "Copied full log line to clipboard ({}/{})",
+                    source + 1,
+                    log.lines.len()
+                );
                 self.error_message = None;
             }
             Err(err) => {

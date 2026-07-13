@@ -54,7 +54,12 @@ pub fn show(
 ) -> SidebarAction {
     let mut action = SidebarAction::default();
     ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new("K8s").size(14.0).strong().color(Theme::WARNING));
+        ui.label(
+            egui::RichText::new("K8s")
+                .size(14.0)
+                .strong()
+                .color(Theme::WARNING),
+        );
     });
     ui.add_space(4.0);
     ui.label(
@@ -129,7 +134,11 @@ pub fn show(
         .default_open(state.network_open)
         .show_unindented(ui, |ui| {
             state.network_open = true;
-            for kind in [ResourceKind::Service, ResourceKind::Ingress, ResourceKind::NetworkPolicy] {
+            for kind in [
+                ResourceKind::Service,
+                ResourceKind::Ingress,
+                ResourceKind::NetworkPolicy,
+            ] {
                 if nav_item(ui, state.selected_kind == kind, kind.label()) {
                     state.show_overview = false;
                     state.selected_kind = kind;
@@ -146,7 +155,10 @@ pub fn show(
         .default_open(state.storage_open)
         .show_unindented(ui, |ui| {
             state.storage_open = true;
-            for kind in [ResourceKind::PersistentVolumeClaim, ResourceKind::StorageClass] {
+            for kind in [
+                ResourceKind::PersistentVolumeClaim,
+                ResourceKind::StorageClass,
+            ] {
                 if nav_item(ui, state.selected_kind == kind, kind.label()) {
                     state.show_overview = false;
                     state.selected_kind = kind;

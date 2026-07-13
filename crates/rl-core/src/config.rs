@@ -80,13 +80,11 @@ fn kubeconfig_context_is_usable(kubeconfig: &kube::config::Kubeconfig, context: 
     let Some(inner) = &ctx.context else {
         return false;
     };
-    let cluster_ok = kubeconfig
-        .clusters
-        .iter()
-        .any(|c| c.name == inner.cluster);
-    let user_ok = inner.user.as_ref().is_some_and(|user| {
-        kubeconfig.auth_infos.iter().any(|u| u.name == *user)
-    });
+    let cluster_ok = kubeconfig.clusters.iter().any(|c| c.name == inner.cluster);
+    let user_ok = inner
+        .user
+        .as_ref()
+        .is_some_and(|user| kubeconfig.auth_infos.iter().any(|u| u.name == *user));
     cluster_ok && user_ok
 }
 

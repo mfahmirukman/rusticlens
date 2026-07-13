@@ -3,19 +3,19 @@ use std::collections::HashMap;
 use eframe::egui;
 use rl_core::{
     kubectl_edit_command, kubectl_exec_command, kubectl_port_forward_command,
-    spawn_kubectl_attach_terminal, spawn_kubectl_exec_terminal, PortForwardInfo,
-    ClusterDashboard, ContainerInfo, CrdTarget, FavoriteResource, ResourceKind, ResourceSnapshot,
+    spawn_kubectl_attach_terminal, spawn_kubectl_exec_terminal, ClusterDashboard, ContainerInfo,
+    CrdTarget, FavoriteResource, PortForwardInfo, ResourceKind, ResourceSnapshot,
 };
 
 use crate::backend::{BackendCommand, BackendEvent, BackendHandle};
 use crate::log_info;
 use crate::ui::cluster_tabs::{self, ClusterTabAction};
-#[cfg(feature = "embedded-terminal")]
-use crate::ui::embedded_terminal::{self, EmbeddedTerminalAction, EmbeddedTerminalState};
 use crate::ui::detail_panel::{
     show_content as show_detail_content, show_header as show_detail_header, DetailSearchState,
     DetailState, DetailTab,
 };
+#[cfg(feature = "embedded-terminal")]
+use crate::ui::embedded_terminal::{self, EmbeddedTerminalAction, EmbeddedTerminalState};
 use crate::ui::icon_rail::{self, IconRailAction, IconRailState};
 use crate::ui::log_panel::{show_tab_bar, show_tab_content, LogPanelState};
 use crate::ui::log_tabs::LogTabsState;
@@ -158,10 +158,7 @@ impl RusticlensApp {
             dashboard: None,
             pending_favorite_select: None,
             cluster_tabs: if settings.open_cluster_tabs.is_empty() {
-                settings
-                    .last_context
-                    .map(|c| vec![c])
-                    .unwrap_or_default()
+                settings.last_context.map(|c| vec![c]).unwrap_or_default()
             } else {
                 settings.open_cluster_tabs
             },
@@ -300,7 +297,11 @@ impl RusticlensApp {
                     self.status_message = format!("Restarted statefulset {name}");
                     self.backend.send(BackendCommand::RefreshList);
                 }
-                BackendEvent::WorkloadScaled { kind, name, replicas } => {
+                BackendEvent::WorkloadScaled {
+                    kind,
+                    name,
+                    replicas,
+                } => {
                     self.status_message =
                         format!("Scaled {} {name} to {replicas} replicas", kind.api_kind());
                     self.scale_dialog = None;
@@ -1200,7 +1201,11 @@ impl eframe::App for RusticlensApp {
                 if !self.port_forwards.is_empty() {
                     ui.separator();
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("Forwards:").small().color(Theme::TEXT_MUTED));
+                        ui.label(
+                            egui::RichText::new("Forwards:")
+                                .small()
+                                .color(Theme::TEXT_MUTED),
+                        );
                         let mut stop_id = None;
                         for pf in &self.port_forwards {
                             ui.label(
@@ -1347,7 +1352,9 @@ impl eframe::App for RusticlensApp {
                 }
             });
 
-        if self.sidebar.show_overview && self.connected && self.sidebar.show_overview != prev_overview
+        if self.sidebar.show_overview
+            && self.connected
+            && self.sidebar.show_overview != prev_overview
         {
             self.dashboard = None;
             self.backend.send(BackendCommand::FetchDashboard);
@@ -1368,8 +1375,7 @@ impl eframe::App for RusticlensApp {
         const BOTTOM_PANEL_ID: &str = "bottom_panel";
         let max_bottom_h = (ctx.screen_rect().height() * 0.85).max(120.0);
         if !self.bottom_height_user_set {
-            self.bottom_height =
-                (ctx.screen_rect().height() * 0.5).clamp(100.0, max_bottom_h);
+            self.bottom_height = (ctx.screen_rect().height() * 0.5).clamp(100.0, max_bottom_h);
         }
         let panel_id = egui::Id::new(BOTTOM_PANEL_ID);
         let resize_id = panel_id.with("__resize");
@@ -1470,9 +1476,8 @@ impl eframe::App for RusticlensApp {
         self.apply_bottom_panel_resize(ctx, resize_id, max_bottom_h);
         set_bottom_panel_persisted_height(ctx, panel_id, self.bottom_height);
 
-        let show_detail = self.table.selected.is_some()
-            && !self.sidebar.show_overview
-            && self.connected;
+        let show_detail =
+            self.table.selected.is_some() && !self.sidebar.show_overview && self.connected;
 
         if show_detail {
             const DETAIL_PANEL_ID: &str = "detail_panel";
@@ -1492,8 +1497,12 @@ impl eframe::App for RusticlensApp {
                 )
                 .show(ctx, |ui| {
                     let resource_name = self.detail.resource_name.clone();
-                    if show_detail_header(ui, &mut self.detail_tab, &resource_name, &mut self.detail_search)
-                    {
+                    if show_detail_header(
+                        ui,
+                        &mut self.detail_tab,
+                        &resource_name,
+                        &mut self.detail_search,
+                    ) {
                         self.close_detail_panel();
                     } else {
                         self.detail.tab = self.detail_tab;
@@ -1659,7 +1668,8 @@ impl eframe::App for RusticlensApp {
         self.persist_settings();
         self.persist_detail_panel_width();
         for pf in self.port_forwards.drain(..) {
-            self.backend.send(BackendCommand::StopPortForward { id: pf.id });
+            self.backend
+                .send(BackendCommand::StopPortForward { id: pf.id });
         }
         #[cfg(feature = "embedded-terminal")]
         self.backend.send(BackendCommand::StopEmbeddedExec);

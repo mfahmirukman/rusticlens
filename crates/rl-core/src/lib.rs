@@ -19,19 +19,19 @@ pub mod settings;
 pub mod store;
 
 pub use cluster::ClusterManager;
-pub use dashboard::{ClusterDashboard, NodeDashboardRow};
 pub use containers::ContainerInfo;
 pub use crd::{list_crd_instances, list_crds};
+pub use dashboard::{ClusterDashboard, NodeDashboardRow};
 pub use error::{Error, Result};
 pub use events::{format_events_text, EventRow};
+pub use exec_session::run_pod_exec;
 pub use metrics::{format_metrics_text, PodMetricSummary};
+pub use native_portforward::{
+    probe_native_port_forward, start_port_forward, PortForwardHandle, PortForwardInfo,
+};
 pub use ops::{
     kubectl_attach_command, kubectl_edit_command, kubectl_exec_command,
     kubectl_rollout_restart_command, LOG_BUFFER_MAX_LINES,
-};
-pub use exec_session::run_pod_exec;
-pub use native_portforward::{
-    probe_native_port_forward, start_port_forward, PortForwardHandle, PortForwardInfo,
 };
 pub use plugin_loader::{
     ensure_plugins_dir, example_manifest_path, list_installed_plugins, plugins_dir,

@@ -36,8 +36,12 @@ pub fn show(
         ui.set_width(RAIL_WIDTH - 8.0);
 
         let home = ui.add(
-            egui::Button::new(egui::RichText::new("Ov").size(12.0).color(Theme::TEXT_MUTED))
-                .min_size(egui::vec2(36.0, 28.0)),
+            egui::Button::new(
+                egui::RichText::new("Ov")
+                    .size(12.0)
+                    .color(Theme::TEXT_MUTED),
+            )
+            .min_size(egui::vec2(36.0, 28.0)),
         );
         if home.clicked() {
             action.show_overview = true;
@@ -47,8 +51,12 @@ pub fn show(
         ui.add_space(4.0);
 
         let menu = ui.add(
-            egui::Button::new(egui::RichText::new("Ctx").size(11.0).color(Theme::TEXT_MUTED))
-                .min_size(egui::vec2(36.0, 28.0)),
+            egui::Button::new(
+                egui::RichText::new("Ctx")
+                    .size(11.0)
+                    .color(Theme::TEXT_MUTED),
+            )
+            .min_size(egui::vec2(36.0, 28.0)),
         );
         if menu.clicked() {
             state.context_menu_open = !state.context_menu_open;

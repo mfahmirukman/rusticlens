@@ -156,7 +156,9 @@ fn handle_log_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::PageUp => app.log_scroll(-10),
         KeyCode::PageDown => app.log_scroll(10),
         KeyCode::Char('f') => app.log_toggle_follow(),
-        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => app.log_follow_bottom(),
+        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.log_follow_bottom()
+        }
         KeyCode::Char('G') => app.log_follow_bottom(),
         KeyCode::Char('g') => app.log_scroll_top(),
         KeyCode::End => app.log_follow_bottom(),
@@ -175,7 +177,11 @@ fn handle_log_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     false
 }
 
-fn handle_log_mouse(app: &mut TuiApp, mouse: MouseEvent, last_click: &mut Option<(u16, u16, Instant)>) {
+fn handle_log_mouse(
+    app: &mut TuiApp,
+    mouse: MouseEvent,
+    last_click: &mut Option<(u16, u16, Instant)>,
+) {
     match mouse.kind {
         MouseEventKind::ScrollUp => app.log_scroll(-3),
         MouseEventKind::ScrollDown => app.log_scroll(3),
@@ -201,7 +207,11 @@ fn handle_log_mouse(app: &mut TuiApp, mouse: MouseEvent, last_click: &mut Option
 fn handle_log_search_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => {
-            if app.log_view.as_ref().is_some_and(|l| l.search_query.is_empty()) {
+            if app
+                .log_view
+                .as_ref()
+                .is_some_and(|l| l.search_query.is_empty())
+            {
                 app.exit_log_search();
             } else {
                 app.clear_log_search();

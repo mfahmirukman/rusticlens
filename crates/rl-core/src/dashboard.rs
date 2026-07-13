@@ -113,8 +113,6 @@ pub async fn fetch_cluster_dashboard(client: &Client) -> Result<ClusterDashboard
     })
 }
 
-fn quantity_str(
-    q: Option<&k8s_openapi::apimachinery::pkg::api::resource::Quantity>,
-) -> String {
+fn quantity_str(q: Option<&k8s_openapi::apimachinery::pkg::api::resource::Quantity>) -> String {
     q.map(|q| q.0.clone()).unwrap_or_else(|| "-".into())
 }

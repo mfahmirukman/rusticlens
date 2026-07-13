@@ -876,7 +876,9 @@ fn service_to_row(svc: &Service, namespace: &str) -> ResourceRow {
     row
 }
 
-fn format_service_ports(spec: Option<&k8s_openapi::api::core::v1::ServiceSpec>) -> (String, Vec<u16>) {
+fn format_service_ports(
+    spec: Option<&k8s_openapi::api::core::v1::ServiceSpec>,
+) -> (String, Vec<u16>) {
     let Some(ports) = spec.and_then(|s| s.ports.as_ref()) else {
         return ("-".into(), Vec::new());
     };
@@ -904,11 +906,7 @@ fn format_service_external_ips(svc: &Service) -> String {
         }
     }
     if ips.is_empty() {
-        if let Some(lb) = svc
-            .status
-            .as_ref()
-            .and_then(|s| s.load_balancer.as_ref())
-        {
+        if let Some(lb) = svc.status.as_ref().and_then(|s| s.load_balancer.as_ref()) {
             if let Some(ingress) = &lb.ingress {
                 for entry in ingress {
                     if let Some(ip) = &entry.ip {

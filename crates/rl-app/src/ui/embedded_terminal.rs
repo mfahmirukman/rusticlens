@@ -57,9 +57,7 @@ pub fn show(
     let title = format!(
         "Shell: {}{}",
         state.pod_name,
-        container
-            .map(|c| format!(" ({c})"))
-            .unwrap_or_default()
+        container.map(|c| format!(" ({c})")).unwrap_or_default()
     );
     let mut open = true;
 
@@ -87,11 +85,7 @@ pub fn show(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for line in &state.lines {
-                        ui.label(
-                            egui::RichText::new(line)
-                                .monospace()
-                                .color(Theme::TEXT),
-                        );
+                        ui.label(egui::RichText::new(line).monospace().color(Theme::TEXT));
                     }
                 });
 

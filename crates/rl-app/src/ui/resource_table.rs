@@ -4,9 +4,9 @@ use egui::{Color32, Ui};
 use egui_extras::{Column, TableBuilder};
 use rl_core::{ClusterDashboard, ContainerInfo, ResourceKind, ResourceRow};
 
-use crate::ui::generic_menu::show_generic_context_menu;
 use crate::ui::cronjob_menu::show_cronjob_context_menu;
 use crate::ui::deployment_menu::show_deployment_context_menu;
+use crate::ui::generic_menu::show_generic_context_menu;
 use crate::ui::pod_menu::show_pod_context_menu;
 use crate::ui::service_menu::show_service_context_menu;
 use crate::ui::statefulset_menu::show_statefulset_context_menu;
@@ -42,9 +42,7 @@ pub enum RowContextAction {
     Restart,
     Scale,
     PinFavorite,
-    PortForward {
-        remote_port: u16,
-    },
+    PortForward { remote_port: u16 },
 }
 
 pub struct ListHeader<'a> {
@@ -755,7 +753,9 @@ pub fn show_overview(
     );
     ui.add_space(8.0);
     ui.label(format!("Context: {context}"));
-    ui.label(format!("Namespace: {namespace} (workload counts below are namespace-scoped)"));
+    ui.label(format!(
+        "Namespace: {namespace} (workload counts below are namespace-scoped)"
+    ));
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         stat_card(ui, "Pods (ns)", pod_rows.len());
@@ -795,10 +795,7 @@ pub fn show_overview(
         ui.add_space(4.0);
 
         if dash.nodes.is_empty() {
-            ui.label(
-                egui::RichText::new("No nodes found.")
-                    .color(Theme::TEXT_MUTED),
-            );
+            ui.label(egui::RichText::new("No nodes found.").color(Theme::TEXT_MUTED));
         } else {
             TableBuilder::new(ui)
                 .striped(true)
@@ -835,10 +832,7 @@ pub fn show_overview(
         }
     } else {
         ui.add_space(12.0);
-        ui.label(
-            egui::RichText::new("Loading cluster metrics...")
-                .color(Theme::TEXT_MUTED),
-        );
+        ui.label(egui::RichText::new("Loading cluster metrics...").color(Theme::TEXT_MUTED));
     }
 }
 

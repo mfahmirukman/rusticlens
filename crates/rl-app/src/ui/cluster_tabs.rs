@@ -19,7 +19,11 @@ pub fn show(
     let mut action = ClusterTabAction::None;
 
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Clusters").color(Theme::TEXT_MUTED).small());
+        ui.label(
+            egui::RichText::new("Clusters")
+                .color(Theme::TEXT_MUTED)
+                .small(),
+        );
         ui.separator();
 
         for tab in open_tabs {

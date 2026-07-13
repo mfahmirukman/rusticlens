@@ -1,18 +1,20 @@
 use futures::{AsyncBufReadExt, StreamExt};
-use serde::Deserialize;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::{CronJob, Job};
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, PersistentVolumeClaim, Pod, Secret, Service};
-use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
-use k8s_openapi::api::rbac::v1::{
-    ClusterRole, ClusterRoleBinding, Role, RoleBinding,
+use k8s_openapi::api::core::v1::{
+    ConfigMap, Namespace, Node, PersistentVolumeClaim, Pod, Secret, Service,
 };
+use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
+use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding};
 use k8s_openapi::api::storage::v1::StorageClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams, PostParams};
+use kube::api::{
+    Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams, PostParams,
+};
 use kube::discovery::{Discovery, Scope};
 use kube::Client;
 use kube_core::gvk::GroupVersionKind;
+use serde::Deserialize;
 use tokio::sync::mpsc::Sender;
 
 use crate::containers;
@@ -591,7 +593,11 @@ where
 }
 
 /// Apply one or more YAML documents via server-side apply.
-pub async fn apply_yaml(client: &Client, default_namespace: &str, yaml: &str) -> Result<Vec<String>> {
+pub async fn apply_yaml(
+    client: &Client,
+    default_namespace: &str,
+    yaml: &str,
+) -> Result<Vec<String>> {
     let discovery = Discovery::new(client.clone()).run().await?;
     let mut applied = Vec::new();
 

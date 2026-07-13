@@ -123,7 +123,7 @@ async fn kubectl_service_port_forward_reaches_backend() {
     let _ = child.kill();
     let _ = child.wait();
 
-  // Some services may not speak HTTP on /; accept any curl success with a code.
+    // Some services may not speak HTTP on /; accept any curl success with a code.
     if let Some(code) = code {
         eprintln!("service forward http code: {code}");
     } else {

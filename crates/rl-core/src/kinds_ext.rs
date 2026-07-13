@@ -3,9 +3,7 @@ use std::collections::HashMap;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use k8s_openapi::api::rbac::v1::{
-    ClusterRole, ClusterRoleBinding, Role, RoleBinding,
-};
+use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding};
 use k8s_openapi::api::storage::v1::StorageClass;
 use kube::api::{Api, ListParams};
 use kube::runtime::watcher::{watcher, Config as WatchConfig, Event};
@@ -106,10 +104,7 @@ pub fn storageclass_to_row(sc: &StorageClass) -> ResourceRow {
         .volume_binding_mode
         .clone()
         .unwrap_or_else(|| "Immediate".into());
-    let reclaim = sc
-        .reclaim_policy
-        .clone()
-        .unwrap_or_else(|| "Delete".into());
+    let reclaim = sc.reclaim_policy.clone().unwrap_or_else(|| "Delete".into());
 
     let mut row = ResourceRow::new(
         name,
@@ -125,11 +120,7 @@ pub fn storageclass_to_row(sc: &StorageClass) -> ResourceRow {
 
 pub fn role_to_row(role: &Role, namespace: &str) -> ResourceRow {
     let name = role.metadata.name.clone().unwrap_or_default();
-    let rules = role
-        .rules
-        .as_ref()
-        .map(|r| r.len())
-        .unwrap_or(0);
+    let rules = role.rules.as_ref().map(|r| r.len()).unwrap_or(0);
 
     ResourceRow::new(
         name,
@@ -144,10 +135,7 @@ pub fn role_to_row(role: &Role, namespace: &str) -> ResourceRow {
 pub fn rolebinding_to_row(rb: &RoleBinding, namespace: &str) -> ResourceRow {
     let name = rb.metadata.name.clone().unwrap_or_default();
     let subjects = rb.subjects.as_ref().map(|s| s.len()).unwrap_or(0);
-    let role_ref = rb
-        .role_ref
-        .name
-        .clone();
+    let role_ref = rb.role_ref.name.clone();
 
     let mut row = ResourceRow::new(
         name,
@@ -337,7 +325,10 @@ pub fn watch_clusterrolebindings(client: Client) -> impl futures::Stream<Item = 
         })
 }
 
-pub async fn list_networkpolicies(client: &Client, namespace: &str) -> crate::error::Result<Vec<ResourceRow>> {
+pub async fn list_networkpolicies(
+    client: &Client,
+    namespace: &str,
+) -> crate::error::Result<Vec<ResourceRow>> {
     let api: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
     Ok(api
         .list(&ListParams::default())
@@ -370,7 +361,10 @@ pub async fn list_storageclasses(client: &Client) -> crate::error::Result<Vec<Re
         .collect())
 }
 
-pub async fn list_roles(client: &Client, namespace: &str) -> crate::error::Result<Vec<ResourceRow>> {
+pub async fn list_roles(
+    client: &Client,
+    namespace: &str,
+) -> crate::error::Result<Vec<ResourceRow>> {
     let api: Api<Role> = Api::namespaced(client.clone(), namespace);
     Ok(api
         .list(&ListParams::default())
@@ -381,7 +375,10 @@ pub async fn list_roles(client: &Client, namespace: &str) -> crate::error::Resul
         .collect())
 }
 
-pub async fn list_rolebindings(client: &Client, namespace: &str) -> crate::error::Result<Vec<ResourceRow>> {
+pub async fn list_rolebindings(
+    client: &Client,
+    namespace: &str,
+) -> crate::error::Result<Vec<ResourceRow>> {
     let api: Api<RoleBinding> = Api::namespaced(client.clone(), namespace);
     Ok(api
         .list(&ListParams::default())

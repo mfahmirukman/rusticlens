@@ -119,7 +119,8 @@ impl LogTabsState {
     }
 
     pub fn active_tab(&self) -> Option<&LogTab> {
-        self.active_id.and_then(|id| self.tabs.iter().find(|t| t.id == id))
+        self.active_id
+            .and_then(|id| self.tabs.iter().find(|t| t.id == id))
     }
 
     pub fn tab_mut(&mut self, id: u64) -> Option<&mut LogTab> {
@@ -137,9 +138,7 @@ impl LogTabsState {
         if let Some(existing) = self
             .tabs
             .iter()
-            .find(|t| {
-                t.context == context && t.pod_name == pod_name && t.namespace == namespace
-            })
+            .find(|t| t.context == context && t.pod_name == pod_name && t.namespace == namespace)
             .map(|t| t.id)
         {
             self.active_id = Some(existing);
@@ -254,7 +253,12 @@ impl LogTabsState {
             }
             let trimmed_now = tab.trimmed_lines > trimmed_before;
             let sample_line = if tab.line_count().is_multiple_of(LOG_MEMORY_SAMPLE_LINES) {
-                Some((tab.pod_name.clone(), tab.line_count(), tab.byte_len(), line_bytes))
+                Some((
+                    tab.pod_name.clone(),
+                    tab.line_count(),
+                    tab.byte_len(),
+                    line_bytes,
+                ))
             } else {
                 None
             };
@@ -331,12 +335,7 @@ impl LogTabsState {
         }
     }
 
-    pub fn apply_older_logs(
-        &mut self,
-        tab_id: u64,
-        prepended: Vec<String>,
-        has_more: bool,
-    ) {
+    pub fn apply_older_logs(&mut self, tab_id: u64, prepended: Vec<String>, has_more: bool) {
         let Some(tab) = self.tab_mut(tab_id) else {
             return;
         };

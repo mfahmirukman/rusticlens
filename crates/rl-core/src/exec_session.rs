@@ -17,8 +17,7 @@ pub async fn run_pod_exec(
     mut input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
-    let resolved =
-        containers::resolve_container(&client, namespace, pod_name, container).await?;
+    let resolved = containers::resolve_container(&client, namespace, pod_name, container).await?;
     let api: Api<Pod> = Api::namespaced(client, namespace);
     let attach = AttachParams {
         stdin: true,
@@ -47,10 +46,7 @@ pub async fn run_pod_exec(
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(text)) = lines.next_line().await {
-                if err_tx
-                    .send(format!("[stderr] {text}"))
-                    .is_err()
-                {
+                if err_tx.send(format!("[stderr] {text}")).is_err() {
                     break;
                 }
             }

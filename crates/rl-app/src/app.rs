@@ -142,8 +142,13 @@ impl RusticlensApp {
                     self.namespaces = namespaces;
                     self.crd_targets = crd_targets;
                     self.sync_pinned_contexts(&context);
-                    self.log_tabs.drain_all();
+                    // Pause live streams (wrong cluster client) but keep tab buffers.
                     self.backend.send(BackendCommand::CloseAllLogs);
+                    self.table.selected = None;
+                    self.detail.clear();
+                    if let Some(id) = self.log_tabs.active_id() {
+                        self.resume_log_tab_stream(id);
+                    }
                     self.status_message = format!(
                         "Connected to {} / {}",
                         self.active_context, self.active_namespace
@@ -288,6 +293,9 @@ impl RusticlensApp {
         let Some(tab) = self.log_tabs.active_tab() else {
             return;
         };
+        if tab.context != self.active_context {
+            return;
+        }
         let tab_id = tab.id;
         let pod_name = tab.pod_name.clone();
         let container = tab.container.clone();
@@ -303,9 +311,42 @@ impl RusticlensApp {
         });
     }
 
+    /// Resume tailing for a tab that belongs to the active cluster (after context switch or tab focus).
+    fn resume_log_tab_stream(&mut self, tab_id: u64) {
+        let (pod_name, container) = {
+            let Some(tab) = self.log_tabs.tab_mut(tab_id) else {
+                return;
+            };
+            if tab.context != self.active_context {
+                return;
+            }
+            (tab.pod_name.clone(), tab.container.clone())
+        };
+        let timestamps = self.log_panel.show_timestamps;
+        if container.is_some() {
+            self.backend.send(BackendCommand::StartLogs {
+                tab_id,
+                pod_name,
+                container,
+                timestamps,
+            });
+        } else {
+            self.backend.send(BackendCommand::FetchContainers {
+                tab_id: Some(tab_id),
+                pod_name,
+            });
+        }
+    }
+
     fn open_pod_logs(&mut self, pod_name: String, container: Option<String>) {
+        let context = self.active_context.clone();
         let namespace = self.active_namespace.clone();
-        let tab_id = self.log_tabs.open_tab(pod_name.clone(), namespace, container.clone());
+        let tab_id = self.log_tabs.open_tab(
+            context,
+            pod_name.clone(),
+            namespace,
+            container.clone(),
+        );
         self.backend.send(BackendCommand::FetchContainers {
             tab_id: Some(tab_id),
             pod_name: pod_name.clone(),
@@ -320,18 +361,19 @@ impl RusticlensApp {
     }
 
     fn fetch_older_logs(&mut self, tab_id: u64) {
-        let (pod_name, container, tail_loaded, can_load) = {
+        let (context, pod_name, container, tail_loaded, can_load) = {
             let Some(tab) = self.log_tabs.tab_mut(tab_id) else {
                 return;
             };
             (
+                tab.context.clone(),
                 tab.pod_name.clone(),
                 tab.container.clone(),
                 tab.line_count(),
                 !tab.loading_older && tab.has_more_older,
             )
         };
-        if !can_load {
+        if context != self.active_context || !can_load {
             return;
         }
         log_info!(
@@ -438,6 +480,8 @@ impl RusticlensApp {
         }
         if let Some(ctx) = action.switch_to {
             if ctx != self.active_context {
+                self.icon_rail.context_menu_open = false;
+                self.status_message = format!("Switching to {ctx}…");
                 self.backend.send(BackendCommand::SwitchContext(ctx));
             }
         }
@@ -896,9 +940,11 @@ impl eframe::App for RusticlensApp {
                     ui.set_max_height(body_height);
 
                     let active_id = self.log_tabs.active_id();
-                    let bar_action = show_tab_bar(ui, self.log_tabs.tabs(), active_id);
+                    let bar_action =
+                        show_tab_bar(ui, self.log_tabs.tabs(), active_id, &self.active_context);
                     if let Some(id) = bar_action.select_tab {
                         self.log_tabs.set_active(id);
+                        self.resume_log_tab_stream(id);
                     }
                     if let Some(id) = bar_action.close_tab {
                         self.close_log_tab(id);
@@ -914,18 +960,24 @@ impl eframe::App for RusticlensApp {
                         show_tab_content(ui, &mut self.log_panel, None)
                     };
                     if let Some((tab_id, container)) = content_action.container {
-                        if let Some(tab) = self.log_tabs.tab_mut(tab_id) {
-                            tab.container = Some(container.clone());
-                        }
-                        self.log_tabs.clear_lines(tab_id);
-                        if let Some(tab) = self.log_tabs.tab_mut(tab_id) {
-                            let pod_name = tab.pod_name.clone();
-                            self.backend.send(BackendCommand::StartLogs {
-                                tab_id,
-                                pod_name,
-                                container: Some(container),
-                                timestamps: self.log_panel.show_timestamps,
-                            });
+                        let matches_cluster = self
+                            .log_tabs
+                            .tab_mut(tab_id)
+                            .is_some_and(|t| t.context == self.active_context);
+                        if matches_cluster {
+                            if let Some(tab) = self.log_tabs.tab_mut(tab_id) {
+                                tab.container = Some(container.clone());
+                            }
+                            self.log_tabs.clear_lines(tab_id);
+                            if let Some(tab) = self.log_tabs.tab_mut(tab_id) {
+                                let pod_name = tab.pod_name.clone();
+                                self.backend.send(BackendCommand::StartLogs {
+                                    tab_id,
+                                    pod_name,
+                                    container: Some(container),
+                                    timestamps: self.log_panel.show_timestamps,
+                                });
+                            }
                         }
                     } else if content_action.restart_stream {
                         self.restart_active_log_stream(true);
@@ -996,6 +1048,14 @@ impl eframe::App for RusticlensApp {
                         ui.label("For Teleport clusters, run `tsh login` first.");
                     });
                     return;
+                }
+
+                if self.connecting {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(&self.status_message);
+                    });
+                    ui.add_space(4.0);
                 }
 
                 if self.sidebar.selected_kind.category() == rl_core::ResourceCategory::Workloads

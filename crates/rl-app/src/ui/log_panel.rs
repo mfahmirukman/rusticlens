@@ -42,6 +42,7 @@ pub fn show_tab_bar(
     ui: &mut Ui,
     tabs: &[LogTab],
     active_id: Option<u64>,
+    active_context: &str,
 ) -> LogPanelAction {
     let mut action = LogPanelAction::default();
 
@@ -49,7 +50,15 @@ pub fn show_tab_bar(
         ui.spacing_mut().item_spacing.x = 2.0;
         for tab in tabs {
             let selected = active_id == Some(tab.id);
-            let title = truncate_tab_title(&tab.pod_name);
+            let title = if tab.context == active_context {
+                truncate_tab_title(&tab.pod_name)
+            } else {
+                format!(
+                    "{} · {}",
+                    truncate_context_label(&tab.context),
+                    truncate_tab_title(&tab.pod_name)
+                )
+            };
 
             let tab_fill = if selected {
                 Theme::ACCENT_ACTIVE_BG
@@ -323,5 +332,14 @@ fn truncate_tab_title(name: &str) -> String {
         name.to_string()
     } else {
         format!("{}…", &name[..17])
+    }
+}
+
+fn truncate_context_label(context: &str) -> String {
+    let short = context.rsplit('/').next().unwrap_or(context);
+    if short.len() <= 10 {
+        short.to_string()
+    } else {
+        format!("{}…", &short[..9])
     }
 }

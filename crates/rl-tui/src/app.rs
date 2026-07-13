@@ -21,7 +21,7 @@ pub struct TuiApp {
 
 impl TuiApp {
     pub async fn new() -> Self {
-        let manager = ClusterManager::connect_default()
+        let manager = ClusterManager::connect_default(ResourceKind::Pod)
             .await
             .expect("connect to cluster");
         let namespaces = manager.list_namespaces().await.unwrap_or_default();
@@ -115,7 +115,7 @@ impl TuiApp {
         }
         self.namespace_index = (self.namespace_index + 1) % self.namespaces.len();
         let ns = self.namespaces[self.namespace_index].clone();
-        let _ = self.manager.set_namespace(ns).await;
+        let _ = self.manager.set_namespace(ns, self.current_kind()).await;
         self.refresh().await;
     }
 

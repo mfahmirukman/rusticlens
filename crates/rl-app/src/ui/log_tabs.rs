@@ -12,6 +12,7 @@ const LOG_MEMORY_SAMPLE_LINES: usize = 500;
 #[derive(Debug, Clone)]
 pub struct LogTab {
     pub id: u64,
+    pub context: String,
     pub pod_name: String,
     pub namespace: String,
     pub container: Option<String>,
@@ -48,7 +49,8 @@ impl LogTab {
     }
 
     fn metadata_bytes(&self) -> usize {
-        self.pod_name.len()
+        self.context.len()
+            + self.pod_name.len()
             + self.namespace.len()
             + self.container.as_ref().map(|s| s.len()).unwrap_or(0)
     }
@@ -125,6 +127,7 @@ impl LogTabsState {
     /// Open or focus a tab for this pod. Returns tab id.
     pub fn open_tab(
         &mut self,
+        context: String,
         pod_name: String,
         namespace: String,
         container: Option<String>,
@@ -132,7 +135,9 @@ impl LogTabsState {
         if let Some(existing) = self
             .tabs
             .iter()
-            .find(|t| t.pod_name == pod_name && t.namespace == namespace)
+            .find(|t| {
+                t.context == context && t.pod_name == pod_name && t.namespace == namespace
+            })
             .map(|t| t.id)
         {
             self.active_id = Some(existing);
@@ -153,6 +158,7 @@ impl LogTabsState {
         self.next_id += 1;
         self.tabs.push(LogTab {
             id,
+            context: context.clone(),
             pod_name: pod_name.clone(),
             namespace: namespace.clone(),
             container,
@@ -203,23 +209,6 @@ impl LogTabsState {
         );
         self.log_memory_usage("tab_closed");
         Some(id)
-    }
-
-    pub fn drain_all(&mut self) -> Vec<u64> {
-        let ids: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
-        let total_lines: usize = self.tabs.iter().map(|t| t.line_count()).sum();
-        let total_bytes: usize = self.tabs.iter().map(|t| t.memory_bytes()).sum();
-        log_info!(
-            tab_count = self.tabs.len(),
-            total_lines,
-            total_bytes,
-            total_kb = total_bytes / 1024,
-            total_mb = total_bytes / (1024 * 1024),
-            "draining all log tabs"
-        );
-        self.tabs.clear();
-        self.active_id = None;
-        ids
     }
 
     pub fn push_line(&mut self, tab_id: u64, line: String) {

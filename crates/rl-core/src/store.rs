@@ -39,172 +39,96 @@ struct StoreState {
     revision: u64,
 }
 
+struct KindWatch {
+    cancel_tx: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
 /// Namespace-scoped watchers with bounded in-memory stores.
 pub struct WatchController {
     state: Arc<RwLock<StoreState>>,
-    cancel_tx: Option<watch::Sender<bool>>,
-    tasks: Vec<JoinHandle<()>>,
+    watches: HashMap<ResourceKind, KindWatch>,
 }
 
 impl WatchController {
     pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(StoreState::default())),
-            cancel_tx: None,
-            tasks: Vec::new(),
+            watches: HashMap::new(),
         }
     }
 
-    pub async fn start(&mut self, client: Client, namespace: String) -> Result<()> {
-        self.stop().await;
-
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        self.cancel_tx = Some(cancel_tx);
-
-        let state = Arc::clone(&self.state);
-        {
-            let mut guard = state.write().expect("store lock");
-            *guard = StoreState::default();
+    pub async fn ensure_only_kind(
+        &mut self,
+        client: Client,
+        namespace: String,
+        kind: ResourceKind,
+    ) -> Result<()> {
+        let to_stop: Vec<ResourceKind> = self
+            .watches
+            .keys()
+            .copied()
+            .filter(|k| *k != kind)
+            .collect();
+        for k in to_stop {
+            self.stop_kind(k).await;
         }
-
-        self.tasks.push(spawn_watch(
-            watch_pods(client.clone(), namespace.clone()),
-            state.clone(),
-            |guard, rows| {
-                guard.pods = rows;
-                guard.revision += 1;
-            },
-            cancel_rx.clone(),
-        ));
-
-        self.tasks.push(spawn_watch(
-            watch_deployments(client.clone(), namespace.clone()),
-            state.clone(),
-            |guard, rows| {
-                guard.deployments = rows;
-                guard.revision += 1;
-            },
-            cancel_rx.clone(),
-        ));
-
-        self.tasks.push(spawn_watch(
-            watch_statefulsets(client.clone(), namespace.clone()),
-            state.clone(),
-            |guard, rows| {
-                guard.statefulsets = rows;
-                guard.revision += 1;
-            },
-            cancel_rx.clone(),
-        ));
-
-        self.tasks.push(spawn_watch(
-            watch_jobs(client.clone(), namespace.clone()),
-            state.clone(),
-            |guard, rows| {
-                guard.jobs = rows;
-                guard.revision += 1;
-            },
-            cancel_rx.clone(),
-        ));
-
-        self.tasks.push(spawn_watch(
-            watch_cronjobs(client.clone(), namespace.clone()),
-            state.clone(),
-            |guard, rows| {
-                guard.cronjobs = rows;
-                guard.revision += 1;
-            },
-            cancel_rx.clone(),
-        ));
-
-        self.tasks.push(spawn_watch(
-            watch_services(client.clone(), namespace.clone()),
-            state.clone(),
-            |guard, rows| {
-                guard.services = rows;
-                guard.revision += 1;
-            },
-            cancel_rx.clone(),
-        ));
-
-        self.tasks.push(spawn_watch(
-            watch_ingresses(client.clone(), namespace.clone()),
-            state.clone(),
-            |guard, rows| {
-                guard.ingresses = rows;
-                guard.revision += 1;
-            },
-            cancel_rx.clone(),
-        ));
-
-        self.tasks.push(spawn_watch(
-            watch_configmaps(client.clone(), namespace.clone()),
-            state.clone(),
-            |guard, rows| {
-                guard.configmaps = rows;
-                guard.revision += 1;
-            },
-            cancel_rx.clone(),
-        ));
-
-        self.tasks.push(spawn_watch(
-            watch_secrets(client.clone(), namespace.clone()),
-            state.clone(),
-            |guard, rows| {
-                guard.secrets = rows;
-                guard.revision += 1;
-            },
-            cancel_rx.clone(),
-        ));
-
-        self.tasks.push(spawn_watch(
-            watch_namespaces(client.clone()),
-            state.clone(),
-            |guard, rows| {
-                guard.namespaces = rows;
-                guard.revision += 1;
-            },
-            cancel_rx.clone(),
-        ));
-
-        self.tasks.push(spawn_watch(
-            watch_nodes(client.clone()),
-            state.clone(),
-            |guard, rows| {
-                guard.nodes = rows;
-                guard.revision += 1;
-            },
-            cancel_rx,
-        ));
-
+        if kind.uses_watch() {
+            self.start_kind(client, namespace, kind).await?;
+        }
         Ok(())
     }
 
-    pub async fn stop(&mut self) {
-        if let Some(tx) = self.cancel_tx.take() {
-            let _ = tx.send(true);
+    pub async fn start_kind(
+        &mut self,
+        client: Client,
+        namespace: String,
+        kind: ResourceKind,
+    ) -> Result<()> {
+        if !kind.uses_watch() || self.watches.contains_key(&kind) {
+            return Ok(());
         }
-        for task in self.tasks.drain(..) {
-            task.abort();
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let state = Arc::clone(&self.state);
+        let task = spawn_kind_watch(client, namespace, kind, state, cancel_rx);
+        self.watches.insert(kind, KindWatch { cancel_tx, task });
+        Ok(())
+    }
+
+    pub async fn stop_kind(&mut self, kind: ResourceKind) {
+        if let Some(w) = self.watches.remove(&kind) {
+            let _ = w.cancel_tx.send(true);
+            w.task.abort();
         }
+    }
+
+    pub async fn stop_all(&mut self) {
+        let kinds: Vec<ResourceKind> = self.watches.keys().copied().collect();
+        for kind in kinds {
+            self.stop_kind(kind).await;
+        }
+    }
+
+    pub fn all_snapshots(&self) -> HashMap<ResourceKind, ResourceSnapshot> {
+        ResourceKind::ALL
+            .iter()
+            .filter(|k| k.uses_watch())
+            .map(|&kind| (kind, self.snapshot(kind)))
+            .collect()
+    }
+
+    pub fn restore_snapshots(&mut self, snapshots: HashMap<ResourceKind, ResourceSnapshot>) {
+        let mut guard = self.state.write().expect("store lock");
+        for (kind, snap) in snapshots {
+            apply_rows(&mut guard, kind, snap.rows);
+        }
+        guard.revision += 1;
     }
 
     pub fn snapshot(&self, kind: ResourceKind) -> ResourceSnapshot {
         let guard = self.state.read().expect("store lock");
-        let rows = match kind {
-            ResourceKind::Pod => guard.pods.clone(),
-            ResourceKind::Deployment => guard.deployments.clone(),
-            ResourceKind::StatefulSet => guard.statefulsets.clone(),
-            ResourceKind::Job => guard.jobs.clone(),
-            ResourceKind::CronJob => guard.cronjobs.clone(),
-            ResourceKind::Service => guard.services.clone(),
-            ResourceKind::Ingress => guard.ingresses.clone(),
-            ResourceKind::ConfigMap => guard.configmaps.clone(),
-            ResourceKind::Secret => guard.secrets.clone(),
-            ResourceKind::Namespace => guard.namespaces.clone(),
-            ResourceKind::Node => guard.nodes.clone(),
-            ResourceKind::HelmRelease | ResourceKind::Crd => Vec::new(),
-        };
+        let rows = rows_for_kind(&guard, kind);
         ResourceSnapshot {
             rows,
             revision: guard.revision,
@@ -215,6 +139,151 @@ impl WatchController {
 impl Default for WatchController {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn rows_for_kind(guard: &StoreState, kind: ResourceKind) -> Vec<ResourceRow> {
+    match kind {
+        ResourceKind::Pod => guard.pods.clone(),
+        ResourceKind::Deployment => guard.deployments.clone(),
+        ResourceKind::StatefulSet => guard.statefulsets.clone(),
+        ResourceKind::Job => guard.jobs.clone(),
+        ResourceKind::CronJob => guard.cronjobs.clone(),
+        ResourceKind::Service => guard.services.clone(),
+        ResourceKind::Ingress => guard.ingresses.clone(),
+        ResourceKind::ConfigMap => guard.configmaps.clone(),
+        ResourceKind::Secret => guard.secrets.clone(),
+        ResourceKind::Namespace => guard.namespaces.clone(),
+        ResourceKind::Node => guard.nodes.clone(),
+        ResourceKind::HelmRelease | ResourceKind::Crd => Vec::new(),
+    }
+}
+
+fn apply_rows(guard: &mut StoreState, kind: ResourceKind, rows: Vec<ResourceRow>) {
+    match kind {
+        ResourceKind::Pod => guard.pods = rows,
+        ResourceKind::Deployment => guard.deployments = rows,
+        ResourceKind::StatefulSet => guard.statefulsets = rows,
+        ResourceKind::Job => guard.jobs = rows,
+        ResourceKind::CronJob => guard.cronjobs = rows,
+        ResourceKind::Service => guard.services = rows,
+        ResourceKind::Ingress => guard.ingresses = rows,
+        ResourceKind::ConfigMap => guard.configmaps = rows,
+        ResourceKind::Secret => guard.secrets = rows,
+        ResourceKind::Namespace => guard.namespaces = rows,
+        ResourceKind::Node => guard.nodes = rows,
+        ResourceKind::HelmRelease | ResourceKind::Crd => {}
+    }
+}
+
+fn spawn_kind_watch(
+    client: Client,
+    namespace: String,
+    kind: ResourceKind,
+    state: Arc<RwLock<StoreState>>,
+    cancel_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    match kind {
+        ResourceKind::Pod => spawn_watch(
+            watch_pods(client, namespace),
+            state,
+            |guard, rows| {
+                guard.pods = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::Deployment => spawn_watch(
+            watch_deployments(client, namespace),
+            state,
+            |guard, rows| {
+                guard.deployments = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::StatefulSet => spawn_watch(
+            watch_statefulsets(client, namespace),
+            state,
+            |guard, rows| {
+                guard.statefulsets = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::Job => spawn_watch(
+            watch_jobs(client, namespace),
+            state,
+            |guard, rows| {
+                guard.jobs = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::CronJob => spawn_watch(
+            watch_cronjobs(client, namespace),
+            state,
+            |guard, rows| {
+                guard.cronjobs = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::Service => spawn_watch(
+            watch_services(client, namespace),
+            state,
+            |guard, rows| {
+                guard.services = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::Ingress => spawn_watch(
+            watch_ingresses(client, namespace),
+            state,
+            |guard, rows| {
+                guard.ingresses = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::ConfigMap => spawn_watch(
+            watch_configmaps(client, namespace),
+            state,
+            |guard, rows| {
+                guard.configmaps = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::Secret => spawn_watch(
+            watch_secrets(client, namespace),
+            state,
+            |guard, rows| {
+                guard.secrets = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::Namespace => spawn_watch(
+            watch_namespaces(client),
+            state,
+            |guard, rows| {
+                guard.namespaces = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::Node => spawn_watch(
+            watch_nodes(client),
+            state,
+            |guard, rows| {
+                guard.nodes = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::HelmRelease | ResourceKind::Crd => tokio::spawn(async {}),
     }
 }
 

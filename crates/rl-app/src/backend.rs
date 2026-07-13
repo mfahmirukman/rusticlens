@@ -198,7 +198,7 @@ async fn handle_command(
         BackendCommand::Shutdown => return false,
         BackendCommand::ConnectDefault => {
             let _ = event_tx.send(BackendEvent::Connecting);
-            match ClusterManager::connect_default().await {
+            match ClusterManager::connect_default(*active_kind).await {
                 Ok(mgr) => {
                     let contexts = ClusterManager::list_contexts().await.unwrap_or_default();
                     let namespaces = mgr.list_namespaces().await.unwrap_or_default();
@@ -222,7 +222,7 @@ async fn handle_command(
         BackendCommand::SwitchContext(context) => {
             if let Some(mgr) = manager.as_mut() {
                 let _ = event_tx.send(BackendEvent::Connecting);
-                match mgr.switch_context(&context).await {
+                match mgr.switch_context(&context, *active_kind).await {
                     Ok(()) => {
                         let namespaces = mgr.list_namespaces().await.unwrap_or_default();
                         let crd_targets = mgr.crd_targets().to_vec();
@@ -244,7 +244,7 @@ async fn handle_command(
         }
         BackendCommand::SetNamespace(namespace) => {
             if let Some(mgr) = manager.as_mut() {
-                match mgr.set_namespace(namespace).await {
+                match mgr.set_namespace(namespace, *active_kind).await {
                     Ok(()) => {
                         push_all_snapshots(mgr, event_tx);
                         refresh_on_demand_list(mgr, *active_kind, event_tx).await;
@@ -264,8 +264,13 @@ async fn handle_command(
         }
         BackendCommand::SetActiveKind(kind) => {
             *active_kind = kind;
-            if let Some(mgr) = manager.as_ref() {
-                refresh_on_demand_list(mgr, kind, event_tx).await;
+            if let Some(mgr) = manager.as_mut() {
+                if let Err(err) = mgr.set_active_kind(kind).await {
+                    let _ = event_tx.send(BackendEvent::Error(err.user_message()));
+                } else {
+                    push_all_snapshots(mgr, event_tx);
+                    refresh_on_demand_list(mgr, kind, event_tx).await;
+                }
             }
         }
         BackendCommand::SetCrdTarget(target) => {
@@ -276,7 +281,7 @@ async fn handle_command(
         }
         BackendCommand::RefreshWatch => {
             if let Some(mgr) = manager.as_mut() {
-                match mgr.refresh_watch().await {
+                match mgr.refresh_watch(*active_kind).await {
                     Ok(()) => {
                         push_all_snapshots(mgr, event_tx);
                         refresh_on_demand_list(mgr, *active_kind, event_tx).await;

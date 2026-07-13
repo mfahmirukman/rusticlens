@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use kube::Client;
 use tokio::sync::mpsc::Sender;
 
@@ -11,8 +13,14 @@ use crate::metrics::{list_pod_metrics, PodMetricSummary};
 use crate::ops;
 use crate::plugins::{LoggingPlugin, PluginRegistry};
 use crate::resources::{CrdTarget, ResourceKind};
-use crate::settings::{load_settings, save_settings};
+use crate::settings::{load_settings, pick_namespace_for_context, remember_namespace_for_context, save_settings};
 use crate::store::{list_initial_rows, ResourceSnapshot, WatchController};
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct ScopeKey {
+    context: String,
+    namespace: String,
+}
 
 /// Manages cluster connection, namespace selection, and resource watches.
 pub struct ClusterManager {
@@ -23,11 +31,13 @@ pub struct ClusterManager {
     crd_targets: Vec<CrdTarget>,
     selected_crd: Option<CrdTarget>,
     plugins: PluginRegistry,
+    scope_cache: HashMap<ScopeKey, HashMap<ResourceKind, ResourceSnapshot>>,
+    crd_cache: HashMap<String, Vec<CrdTarget>>,
 }
 
 impl ClusterManager {
     /// Connect using saved settings or current kubeconfig context.
-    pub async fn connect_default() -> Result<Self> {
+    pub async fn connect_default(active_kind: ResourceKind) -> Result<Self> {
         let settings = load_settings();
         let contexts = list_contexts()?;
         let context = settings
@@ -37,24 +47,15 @@ impl ClusterManager {
             .or_else(|| contexts.first().cloned())
             .ok_or(Error::NoActiveContext)?;
 
-        let mut manager = Self::connect(&context).await?;
-        if let Some(ns) = settings.last_namespace {
-            if manager.list_namespaces().await?.iter().any(|n| n == &ns) {
-                manager.set_namespace(ns).await?;
-            }
-        }
-        Ok(manager)
+        Self::connect(&context, active_kind).await
     }
 
     /// Connect to a specific kubeconfig context.
-    pub async fn connect(context: &str) -> Result<Self> {
+    pub async fn connect(context: &str, active_kind: ResourceKind) -> Result<Self> {
         let config = config_for_context(context).await?;
         let client = Client::try_from(config)?;
-        let namespace = ops::list_namespaces(&client)
-            .await?
-            .into_iter()
-            .find(|n| n == "default")
-            .unwrap_or_else(|| "default".to_string());
+        let namespaces = Self::list_namespaces_best_effort(&client).await;
+        let namespace = pick_namespace_for_context(context, &namespaces);
 
         let mut plugins = PluginRegistry::new();
         plugins.register(Box::new(LoggingPlugin));
@@ -69,9 +70,14 @@ impl ClusterManager {
             crd_targets,
             selected_crd: None,
             plugins,
+            scope_cache: HashMap::new(),
+            crd_cache: HashMap::new(),
         };
+        manager.crd_cache.insert(context.to_string(), manager.crd_targets.clone());
+        remember_namespace_for_context(context, &manager.namespace);
         manager.plugins.notify_connected(context);
-        manager.restart_watch().await?;
+        manager.restore_scope_cache();
+        manager.set_active_kind(active_kind).await?;
         Ok(manager)
     }
 
@@ -99,19 +105,54 @@ impl ClusterManager {
         self.selected_crd = target;
     }
 
-    pub async fn switch_context(&mut self, context: &str) -> Result<()> {
+    pub async fn switch_context(&mut self, context: &str, active_kind: ResourceKind) -> Result<()> {
+        self.save_scope_cache();
+
         let config = config_for_context(context).await?;
-        self.client = Client::try_from(config)?;
+        let client = Client::try_from(config)?;
+        let namespaces = Self::list_namespaces_best_effort(&client).await;
+        let namespace = pick_namespace_for_context(context, &namespaces);
+
+        self.watch.stop_all().await;
+        self.client = client;
         self.context = context.to_string();
-        self.crd_targets = list_crds(&self.client).await.unwrap_or_default();
+        self.namespace = namespace;
         self.selected_crd = None;
+
+        if let Some(cached) = self.crd_cache.get(context).cloned() {
+            self.crd_targets = cached;
+        } else {
+            self.crd_targets = list_crds(&self.client).await.unwrap_or_default();
+            self.crd_cache
+                .insert(context.to_string(), self.crd_targets.clone());
+        }
+
         self.plugins.notify_connected(context);
-        self.restart_watch().await
+        remember_namespace_for_context(context, &self.namespace);
+        self.restore_scope_cache();
+        self.set_active_kind(active_kind).await
     }
 
-    pub async fn set_namespace(&mut self, namespace: String) -> Result<()> {
-        self.namespace = namespace;
-        self.restart_watch().await
+    pub async fn set_namespace(&mut self, namespace: String, active_kind: ResourceKind) -> Result<()> {
+        if namespace == self.namespace {
+            return Ok(());
+        }
+        self.save_scope_cache();
+        self.watch.stop_all().await;
+        self.namespace = namespace.clone();
+        remember_namespace_for_context(&self.context, &self.namespace);
+        self.restore_scope_cache();
+        self.set_active_kind(active_kind).await
+    }
+
+    pub async fn set_active_kind(&mut self, kind: ResourceKind) -> Result<()> {
+        self.watch
+            .ensure_only_kind(self.client.clone(), self.namespace.clone(), kind)
+            .await?;
+        if kind == ResourceKind::HelmRelease {
+            let _ = list_initial_rows(&self.client, &self.namespace, ResourceKind::HelmRelease).await;
+        }
+        Ok(())
     }
 
     pub async fn list_contexts() -> Result<Vec<String>> {
@@ -142,8 +183,14 @@ impl ClusterManager {
         }
     }
 
-    pub async fn refresh_watch(&mut self) -> Result<()> {
-        self.restart_watch().await
+    pub async fn refresh_watch(&mut self, kind: ResourceKind) -> Result<()> {
+        if kind.uses_watch() {
+            self.watch.stop_kind(kind).await;
+            self.watch
+                .start_kind(self.client.clone(), self.namespace.clone(), kind)
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn resource_yaml(&self, kind: ResourceKind, name: &str) -> Result<String> {
@@ -225,6 +272,9 @@ impl ClusterManager {
         let mut settings = crate::settings::load_settings();
         settings.last_context = Some(self.context.clone());
         settings.last_namespace = Some(self.namespace.clone());
+        settings
+            .context_namespaces
+            .insert(self.context.clone(), self.namespace.clone());
         settings.last_kind = Some(kind.label().to_string());
         settings.last_container = container.map(str::to_string);
         let _ = save_settings(&settings);
@@ -258,12 +308,37 @@ impl ClusterManager {
         })
     }
 
-    async fn restart_watch(&mut self) -> Result<()> {
-        self.watch
-            .start(self.client.clone(), self.namespace.clone())
-            .await?;
-        // Warm helm listing cache path
-        let _ = list_initial_rows(&self.client, &self.namespace, ResourceKind::HelmRelease).await;
-        Ok(())
+    fn scope_key(&self) -> ScopeKey {
+        ScopeKey {
+            context: self.context.clone(),
+            namespace: self.namespace.clone(),
+        }
+    }
+
+    fn save_scope_cache(&mut self) {
+        let key = self.scope_key();
+        self.scope_cache.insert(key, self.watch.all_snapshots());
+        self.crd_cache
+            .insert(self.context.clone(), self.crd_targets.clone());
+    }
+
+    fn restore_scope_cache(&mut self) {
+        let key = self.scope_key();
+        if let Some(snapshots) = self.scope_cache.get(&key).cloned() {
+            self.watch.restore_snapshots(snapshots);
+        }
+    }
+
+    async fn list_namespaces_best_effort(client: &Client) -> Vec<String> {
+        match ops::list_namespaces(client).await {
+            Ok(namespaces) => namespaces,
+            Err(err) => {
+                tracing::warn!(
+                    "namespace list failed during context setup: {}",
+                    err.user_message()
+                );
+                Vec::new()
+            }
+        }
     }
 }

@@ -162,6 +162,11 @@ impl ResourceKind {
         matches!(self, ResourceKind::Namespace | ResourceKind::Node)
     }
 
+    /// True for kinds backed by a live Kubernetes watch (not Helm/CRD polls).
+    pub fn uses_watch(self) -> bool {
+        !matches!(self, ResourceKind::HelmRelease | ResourceKind::Crd)
+    }
+
     pub fn supports_logs(self) -> bool {
         self == ResourceKind::Pod
     }

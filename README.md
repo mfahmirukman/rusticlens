@@ -175,6 +175,19 @@ cargo run -p rl-app --no-default-features --features mimalloc
 cargo build -p rl-app --release --no-default-features --features embedded-terminal
 ```
 
+### Releases
+
+Pre-built binaries are published on [GitHub Releases](https://github.com/mfahmirukman/rusticlens/releases) when a version tag is pushed (`v0.5.0`, etc.). Each archive contains `rusticlens` (GUI) and `rusticlens-tui` (TUI) for Linux x86_64, macOS Apple Silicon, and Windows x86_64.
+
+To trigger a release from source, bump `version` in `Cargo.toml`, commit, then:
+
+```bash
+git tag -a v0.5.0 -m "rusticlens v0.5.0"
+git push origin v0.5.0
+```
+
+See [Development — Releases](docs/DEVELOPMENT.md#releases-github-actions) for details.
+
 ### Packaging (scaffolds)
 
 - Flatpak: `packaging/flatpak/com.rusticlens.Rusticlens.yml`

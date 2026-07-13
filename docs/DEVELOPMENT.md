@@ -63,6 +63,31 @@ RUST_LOG=rl_core=debug,rusticlens=debug cargo run -p rl-app
 
 GitHub Actions runs `fmt`, `clippy`, `test`, and release build on push/PR. See `.github/workflows/ci.yml`.
 
+## Releases (GitHub Actions)
+
+Pushing an annotated semver tag triggers `.github/workflows/release.yml`, which:
+
+1. Builds `rusticlens` (GUI) and `rusticlens-tui` (TUI) on Linux, macOS (Apple Silicon), and Windows
+2. Packages per-platform archives (`rusticlens-<version>-<platform>.tar.gz` or `.zip`)
+3. Publishes a GitHub Release with binaries and `SHA256SUMS.txt`
+
+**Steps to cut a release:**
+
+```bash
+# 1. Bump [workspace.package] version in Cargo.toml (root), commit, push
+git add Cargo.toml Cargo.lock
+git commit -m "chore(release): bump version to 0.5.0"
+git push origin develop
+
+# 2. Tag the release commit (tag must match Cargo.toml version)
+git tag -a v0.5.0 -m "rusticlens v0.5.0"
+git push origin v0.5.0
+```
+
+GitHub Actions will create the release at `https://github.com/mfahmirukman/rusticlens/releases/tag/v0.5.0` with downloadable assets.
+
+The tag version **must** match `version` in the root `Cargo.toml` or the workflow fails.
+
 ## Plugin API (experimental)
 
 `rl-core::plugins` exposes `RusticlensPlugin` and `PluginRegistry`. The built-in `LoggingPlugin` fires on cluster connect. Future versions may load shared libraries or WASM — not implemented in v0.2.

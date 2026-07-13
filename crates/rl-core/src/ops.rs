@@ -1,9 +1,9 @@
 use futures::{AsyncBufReadExt, StreamExt};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::{CronJob, Job};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams};
 use kube::Client;
 use tokio::sync::mpsc::Sender;
@@ -83,17 +83,9 @@ pub async fn get_resource_yaml(
             serde_yaml::to_string(&api.get(name).await?)?
         }
         ResourceKind::Crd => {
-            let target = crd_target.ok_or_else(|| {
-                crate::error::Error::Message("no CRD type selected".into())
-            })?;
-            get_dynamic_yaml(
-                client,
-                namespace,
-                &target.group,
-                &target.display_name,
-                name,
-            )
-            .await?
+            let target = crd_target
+                .ok_or_else(|| crate::error::Error::Message("no CRD type selected".into()))?;
+            get_dynamic_yaml(client, namespace, &target.group, &target.display_name, name).await?
         }
     };
     Ok(yaml)
@@ -172,9 +164,8 @@ pub async fn delete_resource(
                 .await?;
         }
         ResourceKind::Crd => {
-            let target = crd_target.ok_or_else(|| {
-                crate::error::Error::Message("no CRD type selected".into())
-            })?;
+            let target = crd_target
+                .ok_or_else(|| crate::error::Error::Message("no CRD type selected".into()))?;
             delete_dynamic(client, namespace, target, name).await?;
         }
     }
@@ -207,6 +198,10 @@ async fn delete_dynamic(
 
 const MAX_LOG_LINES: usize = 500;
 pub const LOG_CHUNK_LINES: i64 = 500;
+/// Initial tail when opening a log tab (Freelens uses 500).
+pub const LOG_INITIAL_TAIL_LINES: i64 = 500;
+/// Poll interval for incremental log fetches via `sinceTime`.
+pub const LOG_POLL_INTERVAL_SECS: u64 = 10;
 /// Must match `rl-app` log tab line cap (used to bound older-log API requests).
 pub const LOG_BUFFER_MAX_LINES: usize = 2_000;
 
@@ -219,8 +214,7 @@ pub async fn fetch_pod_logs_tail(
     tail_lines: i64,
 ) -> Result<Vec<String>> {
     let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let container =
-        containers::resolve_container(client, namespace, pod_name, container).await?;
+    let container = containers::resolve_container(client, namespace, pod_name, container).await?;
 
     let params = LogParams {
         container: Some(container),
@@ -230,7 +224,103 @@ pub async fn fetch_pod_logs_tail(
         ..Default::default()
     };
 
-    let stream = api.log_stream(pod_name, &params).await?;
+    read_log_lines(api, pod_name, &params).await
+}
+
+/// Fetch log lines newer than `since_time` (Kubernetes `sinceTime` query param).
+pub async fn fetch_pod_logs_since(
+    client: &Client,
+    namespace: &str,
+    pod_name: &str,
+    container: Option<&str>,
+    since_time: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>> {
+    let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let container = containers::resolve_container(client, namespace, pod_name, container).await?;
+
+    let params = LogParams {
+        container: Some(container),
+        follow: false,
+        since_time: Some(since_time),
+        timestamps: true,
+        ..Default::default()
+    };
+
+    read_log_lines(api, pod_name, &params).await
+}
+
+/// Parse an RFC3339 `sinceTime` value stored between polls.
+pub fn parse_log_since_time(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// When no log lines exist yet, poll from "now".
+pub fn fallback_log_since_time() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}
+
+/// RFC3339 timestamp prefix on Kubernetes log lines (when `timestamps=true`).
+pub fn parse_log_line_timestamp(line: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let prefix = line.split_whitespace().next()?;
+    chrono::DateTime::parse_from_rfc3339(prefix)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// `sinceTime` for the next poll: last line timestamp + 1s (avoids duplicates).
+pub fn since_time_after_lines(lines: &[String]) -> Option<chrono::DateTime<chrono::Utc>> {
+    let last = lines.last()?;
+    let mut stamp = parse_log_line_timestamp(last)?;
+    stamp += chrono::Duration::seconds(1);
+    Some(stamp)
+}
+
+/// Strip the leading RFC3339 timestamp for display when the user hides timestamps.
+pub fn strip_log_timestamp(line: &str) -> &str {
+    match line.find(' ') {
+        Some(idx) if parse_log_line_timestamp(line).is_some() => &line[idx + 1..],
+        _ => line,
+    }
+}
+
+/// Remove ANSI SGR/CSI escape sequences (colors, bold, etc.) from terminal output.
+pub fn strip_ansi_codes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\x1b' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            while i < bytes.len() {
+                let b = bytes[i];
+                i += 1;
+                if b.is_ascii_alphabetic() || b == b'@' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod ansi_tests {
+    use super::strip_ansi_codes;
+
+    #[test]
+    fn strips_sgr_codes() {
+        let raw = "\x1b[1;4mhttp://example.com\x1b[0m";
+        assert_eq!(strip_ansi_codes(raw), "http://example.com");
+    }
+}
+
+async fn read_log_lines(api: Api<Pod>, pod_name: &str, params: &LogParams) -> Result<Vec<String>> {
+    let stream = api.log_stream(pod_name, params).await?;
     let mut lines = stream.lines();
     let mut out = Vec::new();
 
@@ -240,7 +330,9 @@ pub async fn fetch_pod_logs_tail(
         .transpose()
         .map_err(|err| crate::error::Error::Message(err.to_string()))?
     {
-        out.push(line);
+        if !line.is_empty() {
+            out.push(line);
+        }
     }
 
     Ok(out)
@@ -255,8 +347,7 @@ pub async fn stream_pod_logs(
     tx: Sender<String>,
 ) -> Result<()> {
     let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let container =
-        containers::resolve_container(client, namespace, pod_name, container).await?;
+    let container = containers::resolve_container(client, namespace, pod_name, container).await?;
 
     let params = LogParams {
         container: Some(container),

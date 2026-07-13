@@ -14,9 +14,7 @@ pub fn kubectl_port_forward_command(
         ResourceKind::Service => format!("service/{name}"),
         _ => format!("pod/{name}"),
     };
-    format!(
-        "kubectl port-forward -n {namespace} {target} {local_port}:{remote_port}"
-    )
+    format!("kubectl port-forward -n {namespace} {target} {local_port}:{remote_port}")
 }
 
 pub fn spawn_kubectl_port_forward(

@@ -22,15 +22,15 @@ pub fn show_pod_context_menu(
 
     ui.separator();
 
-    if menu_item(ui, "Edit", "✎").clicked() {
+    if menu_item(ui, "Edit").clicked() {
         *action = Some((row_idx, RowContextAction::Edit));
         ui.close_menu();
     }
-    if menu_item(ui, "Delete", "🗑").clicked() {
+    if menu_item(ui, "Delete").clicked() {
         *action = Some((row_idx, RowContextAction::Delete));
         ui.close_menu();
     }
-    if menu_item(ui, "Force Delete", "🗑").clicked() {
+    if menu_item(ui, "Force Delete").clicked() {
         *action = Some((row_idx, RowContextAction::ForceDelete));
         ui.close_menu();
     }
@@ -42,7 +42,7 @@ fn attach_submenu(
     containers: &[ContainerInfo],
     action: &mut Option<(usize, RowContextAction)>,
 ) {
-    ui.menu_button(menu_label("⌕", "Attach to Pod"), |ui| {
+    ui.menu_button("Attach to Pod", |ui| {
         pick_container(ui, row_idx, containers, action, |container| {
             RowContextAction::Attach { container }
         });
@@ -55,7 +55,7 @@ fn shell_submenu(
     containers: &[ContainerInfo],
     action: &mut Option<(usize, RowContextAction)>,
 ) {
-    ui.menu_button(menu_label(">_", "Shell"), |ui| {
+    ui.menu_button("Shell", |ui| {
         pick_container(ui, row_idx, containers, action, |container| {
             RowContextAction::Shell { container }
         });
@@ -68,7 +68,7 @@ fn logs_submenu(
     containers: &[ContainerInfo],
     action: &mut Option<(usize, RowContextAction)>,
 ) {
-    ui.menu_button(menu_label("☰", "Logs"), |ui| {
+    ui.menu_button("Logs", |ui| {
         pick_container(ui, row_idx, containers, action, |container| {
             RowContextAction::Logs { container }
         });
@@ -84,10 +84,7 @@ fn pick_container(
 ) {
     ui.set_min_width(180.0);
     if containers.is_empty() {
-        ui.label(
-            egui::RichText::new("Loading containers…")
-                .color(Theme::TEXT_MUTED),
-        );
+        ui.label(egui::RichText::new("Loading containers...").color(Theme::TEXT_MUTED));
         return;
     }
     if ui.button("Default container").clicked() {
@@ -97,7 +94,7 @@ fn pick_container(
     ui.separator();
     for c in containers {
         let label = if c.ready {
-            format!("{}  ✓", c.name)
+            format!("{} (ok)", c.name)
         } else {
             format!("{}  (not ready)", c.name)
         };
@@ -108,15 +105,11 @@ fn pick_container(
     }
 }
 
-fn menu_item(ui: &mut Ui, label: &str, icon: &str) -> egui::Response {
+fn menu_item(ui: &mut Ui, label: &str) -> egui::Response {
     ui.add(
-        egui::Button::new(menu_label(icon, label))
+        egui::Button::new(egui::RichText::new(label).color(Theme::TEXT))
             .fill(Theme::PANEL_ELEVATED)
             .stroke(egui::Stroke::NONE)
             .min_size(egui::vec2(ui.available_width(), 28.0)),
     )
-}
-
-fn menu_label(icon: &str, label: &str) -> egui::RichText {
-    egui::RichText::new(format!("{icon}  {label}")).color(Theme::TEXT)
 }

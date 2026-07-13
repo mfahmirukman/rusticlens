@@ -55,6 +55,31 @@ pub fn current_context_name() -> Result<Option<String>> {
     Ok(kubeconfig.current_context)
 }
 
+/// Whether a context's cluster and user entries exist in kubeconfig.
+pub fn context_is_usable(context: &str) -> bool {
+    let Ok(kubeconfig) = load_kubeconfig() else {
+        return false;
+    };
+    kubeconfig_context_is_usable(&kubeconfig, context)
+}
+
+fn kubeconfig_context_is_usable(kubeconfig: &kube::config::Kubeconfig, context: &str) -> bool {
+    let Some(ctx) = kubeconfig.contexts.iter().find(|c| c.name == context) else {
+        return false;
+    };
+    let Some(inner) = &ctx.context else {
+        return false;
+    };
+    let cluster_ok = kubeconfig
+        .clusters
+        .iter()
+        .any(|c| c.name == inner.cluster);
+    let user_ok = inner.user.as_ref().is_some_and(|user| {
+        kubeconfig.auth_infos.iter().any(|u| u.name == *user)
+    });
+    cluster_ok && user_ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

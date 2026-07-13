@@ -26,11 +26,7 @@ pub fn extract_containers(pod: &Pod) -> Vec<ContainerInfo> {
         .status
         .as_ref()
         .and_then(|s| s.container_statuses.as_ref())
-        .map(|list| {
-            list.iter()
-                .map(|s| (s.name.clone(), s.ready))
-                .collect()
-        })
+        .map(|list| list.iter().map(|s| (s.name.clone(), s.ready)).collect())
         .unwrap_or_default();
 
     pod.spec

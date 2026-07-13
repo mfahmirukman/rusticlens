@@ -13,7 +13,9 @@ use crate::metrics::{list_pod_metrics, PodMetricSummary};
 use crate::ops;
 use crate::plugins::{LoggingPlugin, PluginRegistry};
 use crate::resources::{CrdTarget, ResourceKind};
-use crate::settings::{load_settings, pick_namespace_for_context, remember_namespace_for_context, save_settings};
+use crate::settings::{
+    load_settings, pick_namespace_for_context, remember_namespace_for_context, save_settings,
+};
 use crate::store::{list_initial_rows, ResourceSnapshot, WatchController};
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -73,7 +75,9 @@ impl ClusterManager {
             scope_cache: HashMap::new(),
             crd_cache: HashMap::new(),
         };
-        manager.crd_cache.insert(context.to_string(), manager.crd_targets.clone());
+        manager
+            .crd_cache
+            .insert(context.to_string(), manager.crd_targets.clone());
         remember_namespace_for_context(context, &manager.namespace);
         manager.plugins.notify_connected(context);
         manager.restore_scope_cache();
@@ -133,7 +137,11 @@ impl ClusterManager {
         self.set_active_kind(active_kind).await
     }
 
-    pub async fn set_namespace(&mut self, namespace: String, active_kind: ResourceKind) -> Result<()> {
+    pub async fn set_namespace(
+        &mut self,
+        namespace: String,
+        active_kind: ResourceKind,
+    ) -> Result<()> {
         if namespace == self.namespace {
             return Ok(());
         }
@@ -150,7 +158,8 @@ impl ClusterManager {
             .ensure_only_kind(self.client.clone(), self.namespace.clone(), kind)
             .await?;
         if kind == ResourceKind::HelmRelease {
-            let _ = list_initial_rows(&self.client, &self.namespace, ResourceKind::HelmRelease).await;
+            let _ =
+                list_initial_rows(&self.client, &self.namespace, ResourceKind::HelmRelease).await;
         }
         Ok(())
     }
@@ -169,9 +178,7 @@ impl ClusterManager {
 
     pub async fn list_rows(&self, kind: ResourceKind) -> Result<Vec<crate::ResourceRow>> {
         match kind {
-            ResourceKind::HelmRelease => {
-                list_helm_releases(&self.client, &self.namespace).await
-            }
+            ResourceKind::HelmRelease => list_helm_releases(&self.client, &self.namespace).await,
             ResourceKind::Crd => {
                 if let Some(target) = &self.selected_crd {
                     list_crd_instances(&self.client, &self.namespace, target).await
@@ -246,18 +253,24 @@ impl ClusterManager {
         .await
     }
 
-    pub async fn resource_events(
+    pub async fn fetch_pod_logs_since(
         &self,
-        kind: ResourceKind,
-        name: &str,
-    ) -> Result<Vec<EventRow>> {
-        list_events_for_resource(
+        pod_name: &str,
+        container: Option<&str>,
+        since_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<String>> {
+        ops::fetch_pod_logs_since(
             &self.client,
             &self.namespace,
-            kind.api_kind(),
-            name,
+            pod_name,
+            container,
+            since_time,
         )
         .await
+    }
+
+    pub async fn resource_events(&self, kind: ResourceKind, name: &str) -> Result<Vec<EventRow>> {
+        list_events_for_resource(&self.client, &self.namespace, kind.api_kind(), name).await
     }
 
     pub async fn pod_containers(&self, pod_name: &str) -> Result<Vec<ContainerInfo>> {

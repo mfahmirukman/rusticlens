@@ -76,7 +76,7 @@ pub async fn get_dynamic_yaml(
     };
 
     let obj = api.get(name).await?;
-    let value: Value = serde_json::to_value(&obj)
-        .map_err(|err| crate::error::Error::Message(err.to_string()))?;
+    let value: Value =
+        serde_json::to_value(&obj).map_err(|err| crate::error::Error::Message(err.to_string()))?;
     Ok(serde_yaml::to_string(&value)?)
 }

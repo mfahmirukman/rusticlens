@@ -35,7 +35,7 @@ pub fn show(
         ui.set_width(RAIL_WIDTH - 8.0);
 
         let home = ui.add(
-            egui::Button::new(egui::RichText::new("⌂").size(16.0).color(Theme::TEXT_MUTED))
+            egui::Button::new(egui::RichText::new("Ov").size(12.0).color(Theme::TEXT_MUTED))
                 .min_size(egui::vec2(36.0, 28.0)),
         );
         if home.clicked() {
@@ -46,13 +46,13 @@ pub fn show(
         ui.add_space(4.0);
 
         let menu = ui.add(
-            egui::Button::new(egui::RichText::new("☰").size(16.0).color(Theme::TEXT_MUTED))
+            egui::Button::new(egui::RichText::new("Ctx").size(11.0).color(Theme::TEXT_MUTED))
                 .min_size(egui::vec2(36.0, 28.0)),
         );
         if menu.clicked() {
             state.context_menu_open = !state.context_menu_open;
         }
-        menu.on_hover_text("All clusters — browse every kubeconfig context");
+        menu.on_hover_text("All clusters - browse every kubeconfig context");
 
         ui.add_space(8.0);
         ui.separator();
@@ -174,11 +174,7 @@ fn show_pinned_context(
     } else {
         Theme::TEXT_MUTED
     };
-    let border = if active {
-        Theme::ACCENT
-    } else {
-        Theme::BORDER
-    };
+    let border = if active { Theme::ACCENT } else { Theme::BORDER };
 
     ui.horizontal(|ui| {
         let switch = ui.add(
@@ -208,8 +204,8 @@ fn show_pinned_context(
         if ui
             .add(
                 egui::Button::new(
-                    egui::RichText::new("×")
-                        .size(16.0)
+                    egui::RichText::new("x")
+                        .size(14.0)
                         .strong()
                         .color(Theme::TEXT_MUTED),
                 )
@@ -306,7 +302,7 @@ fn wrap_lines(text: &str, max_line: usize, max_lines: usize) -> Vec<String> {
     if lines.len() == max_lines && !rest.is_empty() {
         if let Some(last) = lines.last_mut() {
             if last.len() < max_line {
-                last.push('…');
+                last.push_str("...");
             }
         }
     }

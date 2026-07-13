@@ -9,12 +9,15 @@ use rl_core::{
 
 use crate::backend::{BackendCommand, BackendEvent, BackendHandle};
 use crate::log_info;
-use crate::ui::detail_panel::{show_content as show_detail_content, show_header as show_detail_header, DetailState, DetailTab};
-use crate::ui::log_panel::{LogPanelState, show_tab_bar, show_tab_content};
+use crate::ui::detail_panel::{
+    show_content as show_detail_content, show_header as show_detail_header, DetailSearchState,
+    DetailState, DetailTab,
+};
+use crate::ui::icon_rail::{self, IconRailAction, IconRailState};
+use crate::ui::log_panel::{show_tab_bar, show_tab_content, LogPanelState};
 use crate::ui::log_tabs::LogTabsState;
 use crate::ui::resource_table::{RowContextAction, TableState};
 use crate::ui::sidebar::SidebarState;
-use crate::ui::icon_rail::{self, IconRailAction, IconRailState};
 use crate::ui::theme::Theme;
 
 struct PaletteAction {
@@ -41,6 +44,7 @@ pub struct RusticlensApp {
     sidebar: SidebarState,
     table: TableState,
     detail: DetailState,
+    detail_search: DetailSearchState,
     snapshots: HashMap<ResourceKind, ResourceSnapshot>,
     contexts: Vec<String>,
     pinned_contexts: Vec<String>,
@@ -61,6 +65,8 @@ pub struct RusticlensApp {
     pending_delete: Option<(ResourceKind, String, bool)>,
     delete_confirm: Option<(ResourceKind, String, bool)>,
     bottom_height: f32,
+    /// When false, bottom panel uses half the window height until the user drags the divider.
+    bottom_height_user_set: bool,
     palette_open: bool,
     palette_query: String,
     row_count: usize,
@@ -72,6 +78,7 @@ pub struct RusticlensApp {
 impl RusticlensApp {
     pub fn new(backend: BackendHandle) -> Self {
         backend.send(BackendCommand::ConnectDefault);
+        let settings = rl_core::load_settings();
         Self {
             backend,
             sidebar: SidebarState::default(),
@@ -87,9 +94,10 @@ impl RusticlensApp {
                 metrics: String::new(),
                 resource_name: String::new(),
             },
+            detail_search: DetailSearchState::default(),
             snapshots: HashMap::new(),
             contexts: Vec::new(),
-            pinned_contexts: rl_core::load_settings().pinned_contexts,
+            pinned_contexts: settings.pinned_contexts,
             icon_rail: IconRailState::default(),
             namespaces: Vec::new(),
             crd_targets: Vec::new(),
@@ -106,17 +114,14 @@ impl RusticlensApp {
             log_tabs: LogTabsState::default(),
             pending_delete: None,
             delete_confirm: None,
-            bottom_height: rl_core::load_settings()
-                .bottom_panel_height
-                .unwrap_or(220.0),
+            bottom_height: settings.bottom_panel_height.unwrap_or(0.0),
+            bottom_height_user_set: settings.bottom_panel_height.is_some(),
             palette_open: false,
             palette_query: String::new(),
             row_count: 0,
             log_panel: LogPanelState::default(),
             detail_tab: DetailTab::Describe,
-            detail_panel_width: rl_core::load_settings()
-                .detail_panel_width
-                .unwrap_or(420.0),
+            detail_panel_width: settings.detail_panel_width.unwrap_or(420.0),
         }
     }
 
@@ -179,10 +184,8 @@ impl RusticlensApp {
                     containers,
                 } => {
                     if let Some(id) = tab_id {
-                        let had_container = self
-                            .log_tabs
-                            .tab_mut(id)
-                            .and_then(|t| t.container.clone());
+                        let had_container =
+                            self.log_tabs.tab_mut(id).and_then(|t| t.container.clone());
                         self.log_tabs.set_containers(id, containers);
                         if had_container.is_none() {
                             if let Some(tab) = self.log_tabs.tab_mut(id) {
@@ -192,7 +195,6 @@ impl RusticlensApp {
                                     tab_id: id,
                                     pod_name,
                                     container,
-                                    timestamps: self.log_panel.show_timestamps,
                                 });
                             }
                         }
@@ -225,8 +227,7 @@ impl RusticlensApp {
                     prepended,
                     has_more,
                 } => {
-                    self.log_tabs
-                        .apply_older_logs(tab_id, prepended, has_more);
+                    self.log_tabs.apply_older_logs(tab_id, prepended, has_more);
                 }
                 BackendEvent::ResourceDeleted { kind, name } => {
                     self.status_message = format!("Deleted {} {name}", kind.api_kind());
@@ -299,7 +300,6 @@ impl RusticlensApp {
         let tab_id = tab.id;
         let pod_name = tab.pod_name.clone();
         let container = tab.container.clone();
-        let timestamps = self.log_panel.show_timestamps;
         if clear_lines {
             self.log_tabs.clear_lines(tab_id);
         }
@@ -307,7 +307,6 @@ impl RusticlensApp {
             tab_id,
             pod_name,
             container,
-            timestamps,
         });
     }
 
@@ -322,13 +321,11 @@ impl RusticlensApp {
             }
             (tab.pod_name.clone(), tab.container.clone())
         };
-        let timestamps = self.log_panel.show_timestamps;
         if container.is_some() {
             self.backend.send(BackendCommand::StartLogs {
                 tab_id,
                 pod_name,
                 container,
-                timestamps,
             });
         } else {
             self.backend.send(BackendCommand::FetchContainers {
@@ -341,12 +338,9 @@ impl RusticlensApp {
     fn open_pod_logs(&mut self, pod_name: String, container: Option<String>) {
         let context = self.active_context.clone();
         let namespace = self.active_namespace.clone();
-        let tab_id = self.log_tabs.open_tab(
-            context,
-            pod_name.clone(),
-            namespace,
-            container.clone(),
-        );
+        let tab_id =
+            self.log_tabs
+                .open_tab(context, pod_name.clone(), namespace, container.clone());
         self.backend.send(BackendCommand::FetchContainers {
             tab_id: Some(tab_id),
             pod_name: pod_name.clone(),
@@ -355,7 +349,6 @@ impl RusticlensApp {
             tab_id,
             pod_name,
             container,
-            timestamps: self.log_panel.show_timestamps,
         });
         self.persist_settings();
     }
@@ -452,11 +445,13 @@ impl RusticlensApp {
         if (new_h - self.bottom_height).abs() > 0.5 {
             self.bottom_height = new_h;
             if resp.drag_stopped() {
+                self.bottom_height_user_set = true;
                 self.persist_bottom_height();
             }
             return true;
         }
         if resp.drag_stopped() {
+            self.bottom_height_user_set = true;
             self.persist_bottom_height();
         }
         false
@@ -481,7 +476,7 @@ impl RusticlensApp {
         if let Some(ctx) = action.switch_to {
             if ctx != self.active_context {
                 self.icon_rail.context_menu_open = false;
-                self.status_message = format!("Switching to {ctx}…");
+                self.status_message = format!("Switching to {ctx}...");
                 self.backend.send(BackendCommand::SwitchContext(ctx));
             }
         }
@@ -497,6 +492,12 @@ impl RusticlensApp {
                 self.persist_pinned_contexts();
             }
         }
+    }
+
+    fn close_detail_panel(&mut self) {
+        self.table.selected = None;
+        self.detail.clear();
+        self.detail_search.reset();
     }
 
     fn on_table_selection_changed(&mut self, _kind: ResourceKind) {
@@ -540,18 +541,16 @@ impl RusticlensApp {
                         &name,
                         container.as_deref(),
                     ) {
-                        Ok(_) => self.status_message = "Attached to pod in external terminal.".into(),
+                        Ok(_) => {
+                            self.status_message = "Attached to pod in external terminal.".into()
+                        }
                         Err(err) => self.error_message = Some(err.user_message()),
                     }
                 }
             }
             RowContextAction::Edit => {
                 if let Some(name) = self.selected_name() {
-                    let cmd = kubectl_edit_command(
-                        &self.active_namespace,
-                        kind.api_kind(),
-                        &name,
-                    );
+                    let cmd = kubectl_edit_command(&self.active_namespace, kind.api_kind(), &name);
                     ctx.copy_text(cmd);
                     self.status_message = "Copied kubectl edit command.".into();
                 }
@@ -740,7 +739,25 @@ impl RusticlensApp {
             self.palette_open = true;
         }
 
-        if self.palette_open || ctx.wants_keyboard_input() {
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F))
+            && self.table.selected.is_some()
+        {
+            self.detail_search.open();
+        }
+
+        if self.palette_open {
+            return;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            && self.table.selected.is_some()
+            && !ctx.wants_keyboard_input()
+        {
+            self.close_detail_panel();
+            return;
+        }
+
+        if ctx.wants_keyboard_input() {
             return;
         }
 
@@ -809,7 +826,11 @@ impl eframe::App for RusticlensApp {
             let name = name.clone();
             let force = *force;
             let mut open = true;
-            let title = if force { "Confirm force delete" } else { "Confirm delete" };
+            let title = if force {
+                "Confirm force delete"
+            } else {
+                "Confirm delete"
+            };
             egui::Window::new(title)
                 .open(&mut open)
                 .collapsible(false)
@@ -822,7 +843,10 @@ impl eframe::App for RusticlensApp {
                         self.active_namespace
                     ));
                     ui.horizontal(|ui| {
-                        if ui.button(if force { "Force delete" } else { "Delete" }).clicked() {
+                        if ui
+                            .button(if force { "Force delete" } else { "Delete" })
+                            .clicked()
+                        {
                             self.backend.send(BackendCommand::DeleteResource {
                                 kind,
                                 name: name.clone(),
@@ -903,6 +927,10 @@ impl eframe::App for RusticlensApp {
         // Bottom panel: streaming logs
         const BOTTOM_PANEL_ID: &str = "bottom_panel";
         let max_bottom_h = (ctx.screen_rect().height() * 0.85).max(120.0);
+        if !self.bottom_height_user_set {
+            self.bottom_height =
+                (ctx.screen_rect().height() * 0.5).clamp(100.0, max_bottom_h);
+        }
         let panel_id = egui::Id::new(BOTTOM_PANEL_ID);
         let resize_id = panel_id.with("__resize");
 
@@ -927,7 +955,7 @@ impl eframe::App for RusticlensApp {
                         if ui.small_button("Refresh").clicked() {
                             self.backend.send(BackendCommand::RefreshWatch);
                         }
-                        if ui.small_button("⌘K").clicked() {
+                        if ui.small_button("Ctrl+K").clicked() {
                             self.palette_open = true;
                         }
                     });
@@ -975,7 +1003,6 @@ impl eframe::App for RusticlensApp {
                                     tab_id,
                                     pod_name,
                                     container: Some(container),
-                                    timestamps: self.log_panel.show_timestamps,
                                 });
                             }
                         }
@@ -994,7 +1021,9 @@ impl eframe::App for RusticlensApp {
         self.apply_bottom_panel_resize(ctx, resize_id, max_bottom_h);
         set_bottom_panel_persisted_height(ctx, panel_id, self.bottom_height);
 
-        let show_detail = !self.sidebar.show_overview && self.connected;
+        let show_detail = self.table.selected.is_some()
+            && !self.sidebar.show_overview
+            && self.connected;
 
         if show_detail {
             const DETAIL_PANEL_ID: &str = "detail_panel";
@@ -1014,9 +1043,13 @@ impl eframe::App for RusticlensApp {
                 )
                 .show(ctx, |ui| {
                     let resource_name = self.detail.resource_name.clone();
-                    show_detail_header(ui, &mut self.detail_tab, &resource_name);
-                    self.detail.tab = self.detail_tab;
-                    show_detail_content(ui, &mut self.detail);
+                    if show_detail_header(ui, &mut self.detail_tab, &resource_name, &mut self.detail_search)
+                    {
+                        self.close_detail_panel();
+                    } else {
+                        self.detail.tab = self.detail_tab;
+                        show_detail_content(ui, &mut self.detail, &mut self.detail_search);
+                    }
                 });
 
             if let Some(state) =
@@ -1030,6 +1063,7 @@ impl eframe::App for RusticlensApp {
             }
 
             if self.detail_tab != prev_detail_tab {
+                self.detail_search.match_index = 0;
                 match self.detail_tab {
                     DetailTab::Describe => self.fetch_yaml_for_selection(),
                     DetailTab::Events => self.fetch_events_for_selection(),
@@ -1177,9 +1211,6 @@ impl eframe::App for RusticlensApp {
 fn set_bottom_panel_persisted_height(ctx: &egui::Context, panel_id: egui::Id, height: f32) {
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, height));
     ctx.data_mut(|d| {
-        d.insert_persisted(
-            panel_id,
-            egui::containers::panel::PanelState { rect },
-        );
+        d.insert_persisted(panel_id, egui::containers::panel::PanelState { rect });
     });
 }

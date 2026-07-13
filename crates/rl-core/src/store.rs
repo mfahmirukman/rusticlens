@@ -346,9 +346,7 @@ fn watch_pods(client: Client, namespace: String) -> impl futures::Stream<Item = 
             Ok(Event::Apply(pod)) | Ok(Event::InitApply(pod)) => {
                 WatchDelta::Upsert(Box::new(pod_to_row(&pod, &ns)))
             }
-            Ok(Event::Delete(pod)) => {
-                WatchDelta::Remove(pod.metadata.name.unwrap_or_default())
-            }
+            Ok(Event::Delete(pod)) => WatchDelta::Remove(pod.metadata.name.unwrap_or_default()),
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
             Err(_) => WatchDelta::Noop,
         })
@@ -529,7 +527,9 @@ fn watch_secrets(
             Ok(Event::Apply(secret)) | Ok(Event::InitApply(secret)) => {
                 WatchDelta::Upsert(Box::new(secret_to_row(&secret, &ns)))
             }
-            Ok(Event::Delete(secret)) => WatchDelta::Remove(secret.metadata.name.unwrap_or_default()),
+            Ok(Event::Delete(secret)) => {
+                WatchDelta::Remove(secret.metadata.name.unwrap_or_default())
+            }
             Ok(Event::Init) | Ok(Event::InitDone) => WatchDelta::Noop,
             Err(_) => WatchDelta::Noop,
         })
@@ -715,11 +715,7 @@ fn job_to_row(job: &Job, namespace: &str) -> ResourceRow {
 fn cronjob_to_row(cj: &CronJob, namespace: &str) -> ResourceRow {
     let name = cj.metadata.name.clone().unwrap_or_default();
     let status = cj.status.as_ref();
-    let suspend = cj
-        .spec
-        .as_ref()
-        .and_then(|s| s.suspend)
-        .unwrap_or(false);
+    let suspend = cj.spec.as_ref().and_then(|s| s.suspend).unwrap_or(false);
     let schedule = cj
         .spec
         .as_ref()
@@ -754,7 +750,11 @@ fn cronjob_to_row(cj: &CronJob, namespace: &str) -> ResourceRow {
     );
     row.schedule = schedule;
     row.timezone = timezone;
-    row.resumed = if suspend { "False".into() } else { "True".into() };
+    row.resumed = if suspend {
+        "False".into()
+    } else {
+        "True".into()
+    };
     row.active = active;
     row.last_schedule = last_schedule;
     row
@@ -819,10 +819,7 @@ fn secret_to_row(secret: &Secret, namespace: &str) -> ResourceRow {
         .map(|d| d.len())
         .or_else(|| secret.string_data.as_ref().map(|d| d.len()))
         .unwrap_or(0);
-    let secret_type = secret
-        .type_
-        .clone()
-        .unwrap_or_else(|| "Opaque".into());
+    let secret_type = secret.type_.clone().unwrap_or_else(|| "Opaque".into());
 
     ResourceRow::new(
         name,

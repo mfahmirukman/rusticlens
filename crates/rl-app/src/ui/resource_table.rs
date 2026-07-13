@@ -57,11 +57,9 @@ pub fn show_header(ui: &mut Ui, header: ListHeader<'_>) {
                 .color(Theme::TEXT),
         );
         ui.label(
-            egui::RichText::new(format!("{} items", header.row_count))
-                .color(Theme::TEXT_MUTED),
+            egui::RichText::new(format!("{} items", header.row_count)).color(Theme::TEXT_MUTED),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new("🔍").color(Theme::TEXT_MUTED));
             ui.add(
                 egui::TextEdit::singleline(header.filter)
                     .hint_text(format!("Search {}...", header.kind.label()))
@@ -122,10 +120,7 @@ pub fn show(
 
     if filtered.is_empty() {
         ui.add_space(20.0);
-        ui.label(
-            egui::RichText::new("No resources found.")
-                .color(Theme::TEXT_MUTED),
-        );
+        ui.label(egui::RichText::new("No resources found.").color(Theme::TEXT_MUTED));
         return None;
     }
 
@@ -136,9 +131,7 @@ pub fn show(
     }
 
     match kind {
-        ResourceKind::Deployment => {
-            show_deployment_table(ui, &filtered, state, &mut None, false)
-        }
+        ResourceKind::Deployment => show_deployment_table(ui, &filtered, state, &mut None, false),
         ResourceKind::CronJob => show_cronjob_table(ui, &filtered, state, &mut None, false),
         ResourceKind::Pod => show_pod_table(
             ui,
@@ -171,18 +164,12 @@ pub fn show_cronjob_jobs(ui: &mut Ui, cronjob_name: &str, job_rows: &[ResourceRo
                 .strong()
                 .color(Theme::TEXT),
         );
-        ui.label(
-            egui::RichText::new(format!("{} items", owned.len()))
-                .color(Theme::TEXT_MUTED),
-        );
+        ui.label(egui::RichText::new(format!("{} items", owned.len())).color(Theme::TEXT_MUTED));
     });
     ui.add_space(4.0);
 
     if owned.is_empty() {
-        ui.label(
-            egui::RichText::new("No jobs for this CronJob.")
-                .color(Theme::TEXT_MUTED),
-        );
+        ui.label(egui::RichText::new("No jobs for this CronJob.").color(Theme::TEXT_MUTED));
         return;
     }
 
@@ -436,20 +423,16 @@ fn show_pod_table(
                 let row_resp = row.response();
                 if row_resp.double_clicked() {
                     state.selected = Some(original_idx);
-                    action = Some((
-                        original_idx,
-                        RowContextAction::Logs { container: None },
-                    ));
+                    action = Some((original_idx, RowContextAction::Logs { container: None }));
                 } else if row_resp.clicked() {
                     state.selected = Some(original_idx);
                 }
 
-                let menu_containers =
-                    if menu_containers_pod == Some(resource.name.as_str()) {
-                        pod_containers
-                    } else {
-                        &[] as &[ContainerInfo]
-                    };
+                let menu_containers = if menu_containers_pod == Some(resource.name.as_str()) {
+                    pod_containers
+                } else {
+                    &[] as &[ContainerInfo]
+                };
                 row_resp.context_menu(|ui| {
                     show_pod_context_menu(
                         ui,
@@ -589,10 +572,9 @@ fn action_menu_cell(
     show_menu: impl FnOnce(&mut Ui, usize, &mut Option<(usize, RowContextAction)>),
 ) {
     let _ = selected;
-    ui.menu_button(
-        egui::RichText::new("⋮").size(16.0),
-        |ui| show_menu(ui, row_idx, action),
-    );
+    ui.menu_button(egui::RichText::new("...").size(16.0), |ui| {
+        show_menu(ui, row_idx, action)
+    });
 }
 
 fn row_matches_filter(row: &ResourceRow, filter: &str) -> bool {
@@ -609,10 +591,7 @@ fn header_cell(ui: &mut Ui, text: &str) {
 
 fn name_cell(ui: &mut Ui, name: &str, selected: bool, mut on_click: impl FnMut()) {
     let resp = if selected {
-        ui.add(
-            egui::Label::new(egui::RichText::new(name).strong())
-                .sense(egui::Sense::click()),
-        )
+        ui.add(egui::Label::new(egui::RichText::new(name).strong()).sense(egui::Sense::click()))
     } else {
         ui.add(
             egui::Label::new(egui::RichText::new(name).color(Theme::LINK))
@@ -651,9 +630,7 @@ fn status_cell(ui: &mut Ui, status: &str, selected: bool) {
     if selected {
         ui.label(status);
     } else {
-        ui.label(
-            egui::RichText::new(status).color(Theme::status_color(status)),
-        );
+        ui.label(egui::RichText::new(status).color(Theme::status_color(status)));
     }
 }
 

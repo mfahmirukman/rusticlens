@@ -38,11 +38,7 @@ fn section_header(ui: &mut Ui, title: &str) {
 
 pub fn show(ui: &mut Ui, state: &mut SidebarState, context: &str) {
     ui.vertical_centered(|ui| {
-        ui.label(
-            egui::RichText::new("⬢")
-                .size(22.0)
-                .color(Theme::WARNING),
-        );
+        ui.label(egui::RichText::new("K8s").size(14.0).strong().color(Theme::WARNING));
     });
     ui.add_space(4.0);
     ui.label(
@@ -148,7 +144,11 @@ pub fn show(ui: &mut Ui, state: &mut SidebarState, context: &str) {
             }
         });
 
-    if nav_item(ui, state.selected_kind == ResourceKind::Crd, "Custom Resources") {
+    if nav_item(
+        ui,
+        state.selected_kind == ResourceKind::Crd,
+        "Custom Resources",
+    ) {
         state.show_overview = false;
         state.selected_kind = ResourceKind::Crd;
     }
@@ -178,7 +178,7 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
+        format!("{}...", &s[..max.saturating_sub(3)])
     }
 }
 

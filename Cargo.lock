@@ -3485,6 +3485,7 @@ dependencies = [
 name = "rl-tui"
 version = "0.2.0"
 dependencies = [
+ "arboard",
  "crossterm",
  "ratatui",
  "rl-core",

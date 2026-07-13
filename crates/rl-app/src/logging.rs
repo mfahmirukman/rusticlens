@@ -28,9 +28,8 @@ pub fn init() {
     use tracing_subscriber::EnvFilter;
 
     // `rusticlens=info` matches our explicit target; `rl_app=info` matches default module paths.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("rusticlens=info,rl_app=info,rl_core=warn")
-    });
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("rusticlens=info,rl_app=info,rl_core=warn"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

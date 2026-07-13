@@ -40,7 +40,10 @@ pub fn settings_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
         return PathBuf::from(dir).join("rusticlens").join("settings.json");
     }
-    dirs_home().join(".config").join("rusticlens").join("settings.json")
+    dirs_home()
+        .join(".config")
+        .join("rusticlens")
+        .join("settings.json")
 }
 
 fn dirs_home() -> PathBuf {

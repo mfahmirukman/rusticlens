@@ -4,7 +4,7 @@ use rl_core::ops::LOG_BUFFER_MAX_LINES;
 use rl_core::{CrdTarget, ResourceKind, ResourceSnapshot};
 
 use crate::log_debug;
-use crate::{log_info, log_warn};
+use crate::log_info;
 
 /// Commands sent from the UI thread to the background Tokio runtime.
 #[derive(Debug)]
@@ -16,8 +16,14 @@ pub enum BackendCommand {
     SetCrdTarget(Option<CrdTarget>),
     RefreshWatch,
     RefreshList,
-    FetchYaml { kind: ResourceKind, name: String },
-    FetchEvents { kind: ResourceKind, name: String },
+    FetchYaml {
+        kind: ResourceKind,
+        name: String,
+    },
+    FetchEvents {
+        kind: ResourceKind,
+        name: String,
+    },
     FetchContainers {
         tab_id: Option<u64>,
         pod_name: String,
@@ -35,16 +41,24 @@ pub enum BackendCommand {
         name: String,
         force: bool,
     },
-    TriggerCronJob { name: String },
-    SetCronjobSuspended { name: String, suspend: bool },
-    RestartDeployment { name: String },
+    TriggerCronJob {
+        name: String,
+    },
+    SetCronjobSuspended {
+        name: String,
+        suspend: bool,
+    },
+    RestartDeployment {
+        name: String,
+    },
     StartLogs {
         tab_id: u64,
         pod_name: String,
         container: Option<String>,
-        timestamps: bool,
     },
-    CloseLog { tab_id: u64 },
+    CloseLog {
+        tab_id: u64,
+    },
     CloseAllLogs,
     PersistSettings {
         kind: ResourceKind,
@@ -68,25 +82,48 @@ pub enum BackendEvent {
         kind: ResourceKind,
         snapshot: ResourceSnapshot,
     },
-    YamlLoaded { name: String, yaml: String },
-    EventsLoaded { text: String },
+    YamlLoaded {
+        name: String,
+        yaml: String,
+    },
+    EventsLoaded {
+        text: String,
+    },
     ContainersLoaded {
         tab_id: Option<u64>,
         pod_name: String,
         containers: Vec<rl_core::ContainerInfo>,
     },
-    MetricsLoaded { text: String },
-    LogLine { tab_id: u64, line: String },
-    LogError { tab_id: u64, message: String },
+    MetricsLoaded {
+        text: String,
+    },
+    LogLine {
+        tab_id: u64,
+        line: String,
+    },
+    LogError {
+        tab_id: u64,
+        message: String,
+    },
     OlderLogsLoaded {
         tab_id: u64,
         prepended: Vec<String>,
         has_more: bool,
     },
-    ResourceDeleted { kind: ResourceKind, name: String },
-    CronJobTriggered { name: String },
-    CronJobSuspendChanged { name: String, suspended: bool },
-    DeploymentRestarted { name: String },
+    ResourceDeleted {
+        kind: ResourceKind,
+        name: String,
+    },
+    CronJobTriggered {
+        name: String,
+    },
+    CronJobSuspendChanged {
+        name: String,
+        suspended: bool,
+    },
+    DeploymentRestarted {
+        name: String,
+    },
     Error(String),
 }
 
@@ -132,13 +169,13 @@ pub fn spawn_backend() -> BackendHandle {
     BackendHandle { cmd_tx, event_rx }
 }
 
-struct ActiveLogStream {
-    task: tokio::task::JoinHandle<()>,
-    line_rx: tokio::sync::mpsc::Receiver<String>,
-    err_rx: tokio::sync::mpsc::Receiver<String>,
+struct ActiveLogPoll {
+    pod_name: String,
+    container: Option<String>,
+    /// RFC3339 `sinceTime` cursor for the next incremental fetch.
+    last_since: Option<String>,
+    last_poll: std::time::Instant,
 }
-
-const LOG_LINE_CHANNEL_CAPACITY: usize = 512;
 
 async fn run_backend_loop(
     cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<BackendCommand>,
@@ -148,9 +185,10 @@ async fn run_backend_loop(
 
     let mut manager: Option<ClusterManager> = None;
     let mut active_kind = ResourceKind::Pod;
-    let mut log_streams: HashMap<u64, ActiveLogStream> = HashMap::new();
+    let mut log_polls: HashMap<u64, ActiveLogPoll> = HashMap::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
     let mut list_tick = tokio::time::interval(std::time::Duration::from_secs(3));
+    let log_poll_interval = std::time::Duration::from_secs(rl_core::ops::LOG_POLL_INTERVAL_SECS);
 
     loop {
         tokio::select! {
@@ -160,15 +198,15 @@ async fn run_backend_loop(
                     cmd,
                     &mut manager,
                     &mut active_kind,
-                    &mut log_streams,
+                    &mut log_polls,
                     event_tx,
                 ).await {
                     break;
                 }
             }
             _ = tick.tick() => {
-                forward_log_streams(&mut log_streams, event_tx);
                 if let Some(mgr) = manager.as_ref() {
+                    poll_log_tabs(mgr, &mut log_polls, log_poll_interval, event_tx).await;
                     push_all_snapshots(mgr, event_tx);
                 }
             }
@@ -180,16 +218,14 @@ async fn run_backend_loop(
         }
     }
 
-    for (_, stream) in log_streams.drain() {
-        stream.task.abort();
-    }
+    for (_, _) in log_polls.drain() {}
 }
 
 async fn handle_command(
     cmd: BackendCommand,
     manager: &mut Option<rl_core::ClusterManager>,
     active_kind: &mut ResourceKind,
-    log_streams: &mut HashMap<u64, ActiveLogStream>,
+    log_polls: &mut HashMap<u64, ActiveLogPoll>,
     event_tx: &std::sync::mpsc::Sender<BackendEvent>,
 ) -> bool {
     use rl_core::{format_events_text, format_metrics_text, ClusterManager};
@@ -372,12 +408,7 @@ async fn handle_command(
                     "fetching older log chunk from API"
                 );
                 match mgr
-                    .fetch_pod_logs_tail(
-                        &pod_name,
-                        container.as_deref(),
-                        timestamps,
-                        request_tail,
-                    )
+                    .fetch_pod_logs_tail(&pod_name, container.as_deref(), timestamps, request_tail)
                     .await
                 {
                     Ok(fetched) => {
@@ -397,8 +428,7 @@ async fn handle_command(
                             prepended_kb = prepended_bytes / 1024,
                             "older log API response"
                         );
-                        let has_more =
-                            !fetched.is_empty() && fetched.len() as i64 >= request_tail;
+                        let has_more = !fetched.is_empty() && fetched.len() as i64 >= request_tail;
                         let _ = event_tx.send(BackendEvent::OlderLogsLoaded {
                             tab_id,
                             prepended,
@@ -469,34 +499,17 @@ async fn handle_command(
             tab_id,
             pod_name,
             container,
-            timestamps,
         } => {
             if let Some(mgr) = manager.as_ref() {
-                if let Some(existing) = log_streams.remove(&tab_id) {
-                    existing.task.abort();
-                }
-                let (tx, rx) = tokio::sync::mpsc::channel(LOG_LINE_CHANNEL_CAPACITY);
-                let (err_tx, err_rx) = tokio::sync::mpsc::channel(8);
-                let task = mgr.spawn_log_stream(pod_name, container, timestamps, tx, err_tx);
-                log_streams.insert(
-                    tab_id,
-                    ActiveLogStream {
-                        task,
-                        line_rx: rx,
-                        err_rx,
-                    },
-                );
+                log_polls.remove(&tab_id);
+                start_log_poll(mgr, tab_id, pod_name, container, log_polls, event_tx).await;
             }
         }
         BackendCommand::CloseLog { tab_id } => {
-            if let Some(stream) = log_streams.remove(&tab_id) {
-                stream.task.abort();
-            }
+            log_polls.remove(&tab_id);
         }
         BackendCommand::CloseAllLogs => {
-            for (_, stream) in log_streams.drain() {
-                stream.task.abort();
-            }
+            log_polls.clear();
         }
         BackendCommand::PersistSettings { kind, container } => {
             if let Some(mgr) = manager.as_ref() {
@@ -505,35 +518,114 @@ async fn handle_command(
         }
     }
 
-    forward_log_streams(log_streams, event_tx);
     true
 }
 
-fn forward_log_streams(
-    log_streams: &mut HashMap<u64, ActiveLogStream>,
+async fn start_log_poll(
+    mgr: &rl_core::ClusterManager,
+    tab_id: u64,
+    pod_name: String,
+    container: Option<String>,
+    log_polls: &mut HashMap<u64, ActiveLogPoll>,
     event_tx: &std::sync::mpsc::Sender<BackendEvent>,
 ) {
-    for (tab_id, stream) in log_streams.iter_mut() {
-        let pending = stream.line_rx.len();
-        if pending > LOG_LINE_CHANNEL_CAPACITY / 2 {
-            log_warn!(
+    use rl_core::ops::{since_time_after_lines, LOG_INITIAL_TAIL_LINES};
+
+    // Always request API timestamps so incremental `sinceTime` polls work (Freelens model).
+    match mgr
+        .fetch_pod_logs_tail(
+            &pod_name,
+            container.as_deref(),
+            true,
+            LOG_INITIAL_TAIL_LINES,
+        )
+        .await
+    {
+        Ok(lines) => {
+            let last_since = since_time_after_lines(&lines)
+                .map(|t| t.to_rfc3339())
+                .or_else(|| Some(rl_core::ops::fallback_log_since_time().to_rfc3339()));
+            for line in lines {
+                let _ = event_tx.send(BackendEvent::LogLine { tab_id, line });
+            }
+            log_info!(
                 tab_id,
-                pending,
-                capacity = LOG_LINE_CHANNEL_CAPACITY,
-                "log line channel backlog — UI may be falling behind"
+                pod = %pod_name,
+                poll_secs = rl_core::ops::LOG_POLL_INTERVAL_SECS,
+                "started log polling (initial tail + sinceTime)"
+            );
+            log_polls.insert(
+                tab_id,
+                ActiveLogPoll {
+                    pod_name,
+                    container,
+                    last_since,
+                    last_poll: std::time::Instant::now(),
+                },
             );
         }
-        while let Ok(line) = stream.line_rx.try_recv() {
-            let _ = event_tx.send(BackendEvent::LogLine {
-                tab_id: *tab_id,
-                line,
+        Err(err) => {
+            let _ = event_tx.send(BackendEvent::LogError {
+                tab_id,
+                message: format!("Failed to load logs: {}", err.user_message()),
             });
         }
-        while let Ok(message) = stream.err_rx.try_recv() {
-            let _ = event_tx.send(BackendEvent::LogError {
-                tab_id: *tab_id,
-                message,
-            });
+    }
+}
+
+async fn poll_log_tabs(
+    mgr: &rl_core::ClusterManager,
+    log_polls: &mut HashMap<u64, ActiveLogPoll>,
+    interval: std::time::Duration,
+    event_tx: &std::sync::mpsc::Sender<BackendEvent>,
+) {
+    use rl_core::ops::since_time_after_lines;
+
+    let now = std::time::Instant::now();
+    let tab_ids: Vec<u64> = log_polls.keys().copied().collect();
+    for tab_id in tab_ids {
+        let Some(poll) = log_polls.get_mut(&tab_id) else {
+            continue;
+        };
+        if now.duration_since(poll.last_poll) < interval {
+            continue;
+        }
+        poll.last_poll = now;
+        let Some(since_raw) = poll.last_since.as_deref() else {
+            continue;
+        };
+        let since = match rl_core::ops::parse_log_since_time(since_raw) {
+            Some(t) => t,
+            None => {
+                let _ = event_tx.send(BackendEvent::LogError {
+                    tab_id,
+                    message: format!("Invalid log sinceTime cursor: {since_raw}"),
+                });
+                poll.last_since = Some(rl_core::ops::fallback_log_since_time().to_rfc3339());
+                continue;
+            }
+        };
+        let pod_name = poll.pod_name.clone();
+        let container = poll.container.clone();
+        match mgr
+            .fetch_pod_logs_since(&pod_name, container.as_deref(), since)
+            .await
+        {
+            Ok(new_lines) if new_lines.is_empty() => {}
+            Ok(new_lines) => {
+                if let Some(next) = since_time_after_lines(&new_lines) {
+                    poll.last_since = Some(next.to_rfc3339());
+                }
+                for line in new_lines {
+                    let _ = event_tx.send(BackendEvent::LogLine { tab_id, line });
+                }
+            }
+            Err(err) => {
+                let _ = event_tx.send(BackendEvent::LogError {
+                    tab_id,
+                    message: format!("Failed to poll logs: {}", err.user_message()),
+                });
+            }
         }
     }
 }

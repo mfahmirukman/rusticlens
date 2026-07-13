@@ -54,7 +54,7 @@ pub fn show_tab_bar(
                 truncate_tab_title(&tab.pod_name)
             } else {
                 format!(
-                    "{} · {}",
+                    "{} - {}",
                     truncate_context_label(&tab.context),
                     truncate_tab_title(&tab.pod_name)
                 )
@@ -90,7 +90,7 @@ pub fn show_tab_bar(
                 if ui
                     .add(
                         egui::Button::new(
-                            egui::RichText::new("×")
+                            egui::RichText::new("x")
                                 .size(16.0)
                                 .strong()
                                 .color(Theme::TEXT_MUTED),
@@ -133,8 +133,6 @@ pub fn show_tab_content(
         return action;
     };
 
-    let prev_timestamps = state.show_timestamps;
-
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(format!("Pod: {}", tab.pod_name))
@@ -149,7 +147,7 @@ pub fn show_tab_content(
         );
         if tab.loading_older {
             ui.label(
-                egui::RichText::new("Loading older logs…")
+                egui::RichText::new("Loading older logs...")
                     .small()
                     .color(Theme::TEXT_MUTED),
             );
@@ -186,10 +184,6 @@ pub fn show_tab_content(
         });
     });
 
-    if state.show_timestamps != prev_timestamps {
-        action.restart_stream = true;
-    }
-
     ui.add_space(2.0);
 
     let wrap_mode = if state.word_wrap {
@@ -200,7 +194,7 @@ pub fn show_tab_content(
 
     let log_area_height = ui.available_height().max(0.0);
     let filter = state.log_filter.to_lowercase();
-    let (row_height, spacing_y) = log_row_metrics(ui);
+    let row_pitch = log_row_pitch(ui);
 
     ui.allocate_ui(egui::vec2(ui.available_width(), log_area_height), |ui| {
         ui.set_min_height(log_area_height);
@@ -216,19 +210,23 @@ pub fn show_tab_content(
                 } else {
                     filtered.len()
                 };
-                let content_height =
-                    (row_height * total_rows as f32 - spacing_y).max(0.0);
+
+                let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+                let dragging = ui.input(|i| i.pointer.is_decidedly_dragging());
+                // Only leave follow mode when the user scrolls up or drags the view.
+                if state.follow_tail && (wheel > 0.0 || dragging) {
+                    state.follow_tail = false;
+                }
 
                 let mut scroll = ScrollArea::both()
                     .id_salt(("log_scroll", tab.id))
                     .auto_shrink([false, false])
+                    .animated(false)
                     .max_height(scroll_height);
 
-                if state.follow_tail && !tab.loading_older {
-                    let max_offset = (content_height - scroll_height).max(0.0);
-                    scroll = scroll
-                        .vertical_scroll_offset(max_offset)
-                        .stick_to_bottom(true);
+                let follow = state.follow_tail && !tab.loading_older;
+                if follow {
+                    scroll = scroll.stick_to_bottom(true);
                 }
 
                 let scroll_out = if tab.is_empty() {
@@ -246,6 +244,7 @@ pub fn show_tab_content(
                         );
                     })
                 } else {
+                    // `show_rows` takes row height *without* item spacing; it adds spacing internally.
                     scroll.show_rows(ui, LOG_LINE_HEIGHT, total_rows, |ui, row_range| {
                         for row in row_range {
                             let line = if filter.is_empty() {
@@ -257,9 +256,15 @@ pub fn show_tab_content(
                                     .map(String::as_str)
                             };
                             if let Some(line) = line {
+                                let shown = if state.show_timestamps {
+                                    line
+                                } else {
+                                    rl_core::ops::strip_log_timestamp(line)
+                                };
+                                let shown = rl_core::ops::strip_ansi_codes(shown);
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(line)
+                                        egui::RichText::new(shown)
                                             .monospace()
                                             .color(Theme::TEXT),
                                     )
@@ -274,7 +279,7 @@ pub fn show_tab_content(
                 let mut offset_y = scroll_out.state.offset.y;
 
                 if tab.scroll_compensate_rows > 0 {
-                    let bump = tab.scroll_compensate_rows as f32 * row_height;
+                    let bump = tab.scroll_compensate_rows as f32 * row_pitch;
                     tab.scroll_compensate_rows = 0;
                     let max_offset = (scroll_out.content_size.y - scroll_out.inner_rect.height())
                         .max(0.0);
@@ -322,16 +327,15 @@ pub fn show_tab_content(
     action
 }
 
-fn log_row_metrics(ui: &Ui) -> (f32, f32) {
-    let spacing_y = ui.spacing().item_spacing.y;
-    (LOG_LINE_HEIGHT + spacing_y, spacing_y)
+fn log_row_pitch(ui: &Ui) -> f32 {
+    LOG_LINE_HEIGHT + ui.spacing().item_spacing.y
 }
 
 fn truncate_tab_title(name: &str) -> String {
     if name.len() <= 18 {
         name.to_string()
     } else {
-        format!("{}…", &name[..17])
+        format!("{}...", &name[..17])
     }
 }
 
@@ -340,6 +344,6 @@ fn truncate_context_label(context: &str) -> String {
     if short.len() <= 10 {
         short.to_string()
     } else {
-        format!("{}…", &short[..9])
+        format!("{}...", &short[..9])
     }
 }

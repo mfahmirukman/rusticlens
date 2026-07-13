@@ -12,10 +12,7 @@ pub struct PodMetricSummary {
     pub memory: String,
 }
 
-pub async fn list_pod_metrics(
-    client: &Client,
-    namespace: &str,
-) -> Result<Vec<PodMetricSummary>> {
+pub async fn list_pod_metrics(client: &Client, namespace: &str) -> Result<Vec<PodMetricSummary>> {
     let discovery = Discovery::new(client.clone()).run().await?;
     let Some((ar, _)) = discovery
         .get("metrics.k8s.io")

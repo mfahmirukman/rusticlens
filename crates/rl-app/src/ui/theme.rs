@@ -19,6 +19,8 @@ impl Theme {
     /// Dark teal tint for active rail items — keeps white text readable.
     pub const ACCENT_ACTIVE_BG: Color32 = Color32::from_rgb(28, 52, 58);
     pub const LOG_BG: Color32 = Color32::from_rgb(12, 14, 16);
+    pub const SEARCH_HIGHLIGHT: Color32 = Color32::from_rgb(80, 70, 20);
+    pub const SEARCH_CURRENT: Color32 = Color32::from_rgb(120, 90, 20);
 
     pub fn apply(ctx: &Context) {
         let mut visuals = Visuals::dark();

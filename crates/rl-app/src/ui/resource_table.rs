@@ -734,16 +734,23 @@ fn status_cell(ui: &mut Ui, status: &str, selected: bool) {
     }
 }
 
+pub struct OverviewWorkloadCounts {
+    pub deployments: usize,
+    pub jobs: usize,
+    pub cronjobs: usize,
+}
+
 pub fn show_overview(
     ui: &mut Ui,
     context: &str,
     namespace: &str,
     dashboard: Option<&ClusterDashboard>,
     pod_rows: &[ResourceRow],
-    deployment_count: usize,
-    job_count: usize,
-    cronjob_count: usize,
+    workload_counts: OverviewWorkloadCounts,
 ) {
+    let deployment_count = workload_counts.deployments;
+    let job_count = workload_counts.jobs;
+    let cronjob_count = workload_counts.cronjobs;
     ui.add_space(12.0);
     ui.label(
         egui::RichText::new("Cluster Overview")

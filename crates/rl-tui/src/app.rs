@@ -36,9 +36,9 @@ pub struct ListPickerState {
 
 #[derive(Debug, Clone)]
 pub enum Overlay {
-    ContextPicker(ListPickerState),
-    NamespacePicker(ListPickerState),
-    ContainerPicker {
+    Context(ListPickerState),
+    Namespace(ListPickerState),
+    Container {
         pod_name: String,
         containers: Vec<String>,
         state: ListPickerState,
@@ -471,7 +471,7 @@ impl TuiApp {
             .iter()
             .position(|idx| *idx == self.context_index)
             .unwrap_or(0);
-        self.overlay = Some(Overlay::ContextPicker(ListPickerState {
+        self.overlay = Some(Overlay::Context(ListPickerState {
             search: String::new(),
             selected,
         }));
@@ -491,7 +491,7 @@ impl TuiApp {
             .iter()
             .position(|idx| *idx == self.namespace_index)
             .unwrap_or(0);
-        self.overlay = Some(Overlay::NamespacePicker(ListPickerState {
+        self.overlay = Some(Overlay::Namespace(ListPickerState {
             search: String::new(),
             selected,
         }));
@@ -499,9 +499,9 @@ impl TuiApp {
 
     pub fn picker_indices(&self) -> Vec<usize> {
         match &self.overlay {
-            Some(Overlay::ContextPicker(state)) => self.filtered_context_indices(&state.search),
-            Some(Overlay::NamespacePicker(state)) => self.filtered_namespace_indices(&state.search),
-            Some(Overlay::ContainerPicker {
+            Some(Overlay::Context(state)) => self.filtered_context_indices(&state.search),
+            Some(Overlay::Namespace(state)) => self.filtered_namespace_indices(&state.search),
+            Some(Overlay::Container {
                 state, containers, ..
             }) => filter_indices(containers, &state.search),
             None => Vec::new(),
@@ -518,27 +518,27 @@ impl TuiApp {
 
     fn picker_filtered_indices(&self, search: &str) -> Vec<usize> {
         match &self.overlay {
-            Some(Overlay::ContextPicker(_)) => self.filtered_context_indices(search),
-            Some(Overlay::NamespacePicker(_)) => self.filtered_namespace_indices(search),
-            Some(Overlay::ContainerPicker { containers, .. }) => filter_indices(containers, search),
+            Some(Overlay::Context(_)) => self.filtered_context_indices(search),
+            Some(Overlay::Namespace(_)) => self.filtered_namespace_indices(search),
+            Some(Overlay::Container { containers, .. }) => filter_indices(containers, search),
             None => Vec::new(),
         }
     }
 
     fn overlay_list_state_mut(&mut self) -> Option<&mut ListPickerState> {
         match &mut self.overlay {
-            Some(Overlay::ContextPicker(state) | Overlay::NamespacePicker(state)) => Some(state),
-            Some(Overlay::ContainerPicker { state, .. }) => Some(state),
+            Some(Overlay::Context(state) | Overlay::Namespace(state)) => Some(state),
+            Some(Overlay::Container { state, .. }) => Some(state),
             None => None,
         }
     }
 
     fn overlay_search(&self) -> Option<String> {
         match &self.overlay {
-            Some(Overlay::ContextPicker(state) | Overlay::NamespacePicker(state)) => {
+            Some(Overlay::Context(state) | Overlay::Namespace(state)) => {
                 Some(state.search.clone())
             }
-            Some(Overlay::ContainerPicker { state, .. }) => Some(state.search.clone()),
+            Some(Overlay::Container { state, .. }) => Some(state.search.clone()),
             None => None,
         }
     }
@@ -601,9 +601,9 @@ impl TuiApp {
             return;
         };
         match overlay {
-            Overlay::ContextPicker(state) => self.confirm_context_picker(state).await,
-            Overlay::NamespacePicker(state) => self.confirm_namespace_picker(state).await,
-            Overlay::ContainerPicker {
+            Overlay::Context(state) => self.confirm_context_picker(state).await,
+            Overlay::Namespace(state) => self.confirm_namespace_picker(state).await,
+            Overlay::Container {
                 pod_name,
                 containers,
                 state,
@@ -801,7 +801,7 @@ impl TuiApp {
 
         match manager.pod_containers(&pod_name).await {
             Ok(containers) if containers.len() > 1 => {
-                self.overlay = Some(Overlay::ContainerPicker {
+                self.overlay = Some(Overlay::Container {
                     pod_name,
                     containers: containers.into_iter().map(|c| c.name).collect(),
                     state: ListPickerState {
@@ -1110,7 +1110,7 @@ fn wrapped_segment_count(line: &str, width: usize) -> usize {
     if line.is_empty() {
         1
     } else {
-        (line.chars().count() + width - 1) / width
+        line.chars().count().div_ceil(width)
     }
 }
 

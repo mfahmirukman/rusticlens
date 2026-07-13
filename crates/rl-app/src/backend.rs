@@ -320,6 +320,7 @@ async fn run_backend_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     cmd: BackendCommand,
     manager: &mut Option<rl_core::ClusterManager>,
@@ -854,6 +855,7 @@ async fn handle_command(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_kubectl_port_forward(
     mgr: &rl_core::ClusterManager,
     kind: ResourceKind,

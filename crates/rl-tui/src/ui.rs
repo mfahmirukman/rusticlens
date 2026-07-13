@@ -457,9 +457,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &TuiApp) {
 
 fn draw_overlay(frame: &mut Frame, area: Rect, app: &TuiApp, overlay: &Overlay) {
     match overlay {
-        Overlay::ContextPicker(state) => draw_context_picker(frame, area, app, state),
-        Overlay::NamespacePicker(state) => draw_namespace_picker(frame, area, app, state),
-        Overlay::ContainerPicker {
+        Overlay::Context(state) => draw_context_picker(frame, area, app, state),
+        Overlay::Namespace(state) => draw_namespace_picker(frame, area, app, state),
+        Overlay::Container {
             pod_name,
             containers,
             state,

@@ -1584,9 +1584,11 @@ impl eframe::App for RusticlensApp {
                         &self.active_namespace,
                         self.dashboard.as_ref(),
                         pods,
-                        dep_count,
-                        job_count,
-                        cronjob_count,
+                        crate::ui::resource_table::OverviewWorkloadCounts {
+                            deployments: dep_count,
+                            jobs: job_count,
+                            cronjobs: cronjob_count,
+                        },
                     );
                     return;
                 }

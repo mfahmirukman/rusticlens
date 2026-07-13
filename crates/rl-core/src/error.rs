@@ -11,6 +11,9 @@ pub enum Error {
     #[error("serialization: {0}")]
     Serialization(#[from] serde_yaml::Error),
 
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("no active cluster context")]
     NoActiveContext,
 

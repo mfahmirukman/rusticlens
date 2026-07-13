@@ -981,6 +981,8 @@ fn category_title(category: ResourceCategory) -> &'static str {
     match category {
         ResourceCategory::Workloads => "Workloads",
         ResourceCategory::Network => "Network",
+        ResourceCategory::Storage => "Storage",
+        ResourceCategory::Access => "Access",
         ResourceCategory::Config => "Config",
         ResourceCategory::Cluster => "Cluster",
         ResourceCategory::Custom => "Custom",

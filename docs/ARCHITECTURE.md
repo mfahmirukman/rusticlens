@@ -30,12 +30,15 @@ The cluster engine. Responsibilities:
 | `ops` | List, get YAML, delete, log streaming |
 | `events` | Fetch events for a resource |
 | `containers` | Resolve pod containers for logs/exec |
-| `portforward` | `kubectl port-forward` / exec helpers |
+| `portforward` | kubectl exec/attach helpers; native port-forward in `native_portforward` |
+| `native_portforward` | kube-rs WebSocket port-forward (pods and services) |
+| `exec_session` | Bidirectional pod exec attach for embedded terminal |
+| `plugin_loader` | Load TOML plugin manifests from config dir |
 | `crd` | Discover CRDs, list custom resource instances |
 | `helm` | List Helm releases from `owner=helm` secrets |
 | `metrics` | Pod metrics via metrics-server API |
 | `settings` | Persist last context/namespace/kind/container |
-| `plugins` | Plugin registry skeleton for future extensions |
+| `plugins` | Plugin registry + built-in hooks |
 
 ### rl-app
 
@@ -47,11 +50,11 @@ Native desktop UI using **eframe/egui**.
 
 UI panels:
 
-1. Top bar — context, namespace, container picker, actions
+1. Cluster tabs — multi-context switcher with persisted open tabs
 2. Sidebar — resource kinds by category; CRD type selector
 3. Central — virtual-scrolled resource table with filter
 4. Bottom — describe / events / logs / metrics tabs
-5. Status bar — connection summary and row count
+5. Status bar — connection summary, port-forwards, row count
 
 ### rl-tui
 
@@ -69,8 +72,9 @@ Watchers run continuously per namespace. Helm releases and CRD instances are pol
 
 ## Design choices
 
-- **No embedded terminal** — spawns the system terminal + `kubectl exec` to avoid bundling a PTY stack
-- **Port-forward via kubectl** — reliable local TCP binding without reimplementing kube's portforward protocol in the UI thread
+- **Embedded terminal (optional)** — `embedded-terminal` feature uses kube attach API in a simple in-app window; external `kubectl exec` terminal remains available
+- **Native port-forward** — kube-rs `Portforward` by default; kubectl subprocess fallback via settings
+- **Plugins** — TOML manifests with shell `on_connect` hooks (WASM deferred)
 - **CRD support via discovery** — dynamic `Api<DynamicObject>` instead of codegen for every CRD
 - **mimalloc** — optional global allocator to reduce allocator overhead in long-running GUI sessions
 

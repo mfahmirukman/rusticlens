@@ -3,7 +3,7 @@ use egui::Ui;
 use crate::ui::resource_table::RowContextAction;
 use crate::ui::theme::Theme;
 
-pub fn show_deployment_context_menu(
+pub fn show_statefulset_context_menu(
     ui: &mut Ui,
     row_idx: usize,
     action: &mut Option<(usize, RowContextAction)>,

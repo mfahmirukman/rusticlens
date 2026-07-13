@@ -1,11 +1,18 @@
 use futures::{AsyncBufReadExt, StreamExt};
+use serde::Deserialize;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::{CronJob, Job};
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Secret, Service};
-use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, PersistentVolumeClaim, Pod, Secret, Service};
+use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
+use k8s_openapi::api::rbac::v1::{
+    ClusterRole, ClusterRoleBinding, Role, RoleBinding,
+};
+use k8s_openapi::api::storage::v1::StorageClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams, PostParams};
+use kube::discovery::{Discovery, Scope};
 use kube::Client;
+use kube_core::gvk::GroupVersionKind;
 use tokio::sync::mpsc::Sender;
 
 use crate::containers;
@@ -60,6 +67,34 @@ pub async fn get_resource_yaml(
         }
         ResourceKind::Ingress => {
             let api: Api<Ingress> = Api::namespaced(client.clone(), namespace);
+            serde_yaml::to_string(&api.get(name).await?)?
+        }
+        ResourceKind::NetworkPolicy => {
+            let api: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
+            serde_yaml::to_string(&api.get(name).await?)?
+        }
+        ResourceKind::PersistentVolumeClaim => {
+            let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+            serde_yaml::to_string(&api.get(name).await?)?
+        }
+        ResourceKind::StorageClass => {
+            let api: Api<StorageClass> = Api::all(client.clone());
+            serde_yaml::to_string(&api.get(name).await?)?
+        }
+        ResourceKind::Role => {
+            let api: Api<Role> = Api::namespaced(client.clone(), namespace);
+            serde_yaml::to_string(&api.get(name).await?)?
+        }
+        ResourceKind::RoleBinding => {
+            let api: Api<RoleBinding> = Api::namespaced(client.clone(), namespace);
+            serde_yaml::to_string(&api.get(name).await?)?
+        }
+        ResourceKind::ClusterRole => {
+            let api: Api<ClusterRole> = Api::all(client.clone());
+            serde_yaml::to_string(&api.get(name).await?)?
+        }
+        ResourceKind::ClusterRoleBinding => {
+            let api: Api<ClusterRoleBinding> = Api::all(client.clone());
             serde_yaml::to_string(&api.get(name).await?)?
         }
         ResourceKind::ConfigMap => {
@@ -140,6 +175,41 @@ pub async fn delete_resource(
         }
         ResourceKind::Ingress => {
             Api::<Ingress>::namespaced(client.clone(), namespace)
+                .delete(name, &params)
+                .await?;
+        }
+        ResourceKind::NetworkPolicy => {
+            Api::<NetworkPolicy>::namespaced(client.clone(), namespace)
+                .delete(name, &params)
+                .await?;
+        }
+        ResourceKind::PersistentVolumeClaim => {
+            Api::<PersistentVolumeClaim>::namespaced(client.clone(), namespace)
+                .delete(name, &params)
+                .await?;
+        }
+        ResourceKind::StorageClass => {
+            Api::<StorageClass>::all(client.clone())
+                .delete(name, &params)
+                .await?;
+        }
+        ResourceKind::Role => {
+            Api::<Role>::namespaced(client.clone(), namespace)
+                .delete(name, &params)
+                .await?;
+        }
+        ResourceKind::RoleBinding => {
+            Api::<RoleBinding>::namespaced(client.clone(), namespace)
+                .delete(name, &params)
+                .await?;
+        }
+        ResourceKind::ClusterRole => {
+            Api::<ClusterRole>::all(client.clone())
+                .delete(name, &params)
+                .await?;
+        }
+        ResourceKind::ClusterRoleBinding => {
+            Api::<ClusterRoleBinding>::all(client.clone())
                 .delete(name, &params)
                 .await?;
         }
@@ -453,6 +523,22 @@ pub async fn set_cronjob_suspended(
 
 pub async fn restart_deployment(client: &Client, namespace: &str, name: &str) -> Result<()> {
     let api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    rollout_restart_patch(&api, name).await
+}
+
+pub async fn restart_statefulset(client: &Client, namespace: &str, name: &str) -> Result<()> {
+    let api: Api<StatefulSet> = Api::namespaced(client.clone(), namespace);
+    rollout_restart_patch(&api, name).await
+}
+
+async fn rollout_restart_patch<K>(api: &Api<K>, name: &str) -> Result<()>
+where
+    K: kube::Resource<DynamicType = ()>
+        + Clone
+        + std::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned,
+{
     let now = chrono::Utc::now().to_rfc3339();
     let patch = serde_json::json!({
         "spec": {
@@ -468,6 +554,104 @@ pub async fn restart_deployment(client: &Client, namespace: &str, name: &str) ->
     api.patch(name, &PatchParams::default(), &Patch::Strategic(&patch))
         .await?;
     Ok(())
+}
+
+pub async fn scale_deployment(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    replicas: i32,
+) -> Result<()> {
+    let api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    scale_replicas_patch(&api, name, replicas).await
+}
+
+pub async fn scale_statefulset(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    replicas: i32,
+) -> Result<()> {
+    let api: Api<StatefulSet> = Api::namespaced(client.clone(), namespace);
+    scale_replicas_patch(&api, name, replicas).await
+}
+
+async fn scale_replicas_patch<K>(api: &Api<K>, name: &str, replicas: i32) -> Result<()>
+where
+    K: kube::Resource<DynamicType = ()>
+        + Clone
+        + std::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned,
+{
+    let patch = serde_json::json!({ "spec": { "replicas": replicas } });
+    api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    Ok(())
+}
+
+/// Apply one or more YAML documents via server-side apply.
+pub async fn apply_yaml(client: &Client, default_namespace: &str, yaml: &str) -> Result<Vec<String>> {
+    let discovery = Discovery::new(client.clone()).run().await?;
+    let mut applied = Vec::new();
+
+    for doc in serde_yaml::Deserializer::from_str(yaml) {
+        let yaml_value: serde_yaml::Value = Deserialize::deserialize(doc)?;
+        let json: serde_json::Value = serde_json::to_value(yaml_value)?;
+        let api_version = json
+            .get("apiVersion")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::error::Error::Message("missing apiVersion".into()))?;
+        let kind_str = json
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::error::Error::Message("missing kind".into()))?
+            .to_string();
+        let metadata = json
+            .get("metadata")
+            .and_then(|m| m.as_object())
+            .ok_or_else(|| crate::error::Error::Message("missing metadata".into()))?;
+        let name = metadata
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::error::Error::Message("missing metadata.name".into()))?
+            .to_string();
+        let namespace = metadata
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .unwrap_or(default_namespace)
+            .to_string();
+
+        let (group, version) = parse_api_version(api_version)?;
+        let gvk = GroupVersionKind::gvk(&group, &version, &kind_str);
+        let (ar, caps) = discovery.resolve_gvk(&gvk).ok_or_else(|| {
+            crate::error::Error::Message(format!(
+                "unknown apiVersion/kind: {api_version} {kind_str}"
+            ))
+        })?;
+
+        let api = if caps.scope == Scope::Cluster {
+            Api::<DynamicObject>::all_with(client.clone(), &ar)
+        } else {
+            Api::<DynamicObject>::namespaced_with(client.clone(), &namespace, &ar)
+        };
+
+        let pp = PatchParams::apply("rusticlens").force();
+        api.patch(&name, &pp, &Patch::Apply(json))
+            .await
+            .map_err(crate::error::Error::from)?;
+        applied.push(format!("{kind_str}/{name}"));
+    }
+
+    Ok(applied)
+}
+
+fn parse_api_version(api_version: &str) -> Result<(String, String)> {
+    if let Some((group, version)) = api_version.split_once('/') {
+        Ok((group.to_string(), version.to_string()))
+    } else {
+        Ok((String::new(), api_version.to_string()))
+    }
 }
 
 pub async fn list_crd_targets(client: &Client) -> Result<Vec<CrdTarget>> {

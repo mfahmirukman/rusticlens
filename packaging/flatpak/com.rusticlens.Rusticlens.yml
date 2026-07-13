@@ -1,0 +1,22 @@
+app-id: com.rusticlens.Rusticlens
+runtime: org.freedesktop.Platform
+runtime-version: '23.08'
+sdk: org.freedesktop.Sdk
+command: rusticlens
+finish-args:
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=home
+  - --filesystem=xdg-config/kube:ro
+  - --filesystem=xdg-config/rusticlens:create
+modules:
+  - name: rusticlens
+    buildsystem: simple
+    build-commands:
+      - cargo build --release -p rl-app
+      - install -Dm755 target/release/rusticlens /app/bin/rusticlens
+    sources:
+      - type: dir
+        path: ../..

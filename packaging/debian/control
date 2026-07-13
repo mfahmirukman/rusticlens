@@ -1,0 +1,14 @@
+Source: rusticlens
+Section: utils
+Priority: optional
+Maintainer: rusticlens contributors <https://github.com/mfahmirukman/rusticlens>
+Build-Depends: debhelper (>= 13), cargo, rustc, libssl-dev, pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/mfahmirukman/rusticlens
+Rules-Requires-Root: no
+
+Package: rusticlens
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, kubectl
+Description: Native Rust Kubernetes IDE
+ rusticlens is a lightweight Kubernetes desktop client built with Rust and egui.

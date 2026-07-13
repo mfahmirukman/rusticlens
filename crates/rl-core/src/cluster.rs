@@ -11,6 +11,7 @@ use crate::events::{list_events_for_resource, EventRow};
 use crate::helm::list_helm_releases;
 use crate::metrics::{list_pod_metrics, PodMetricSummary};
 use crate::ops;
+use crate::plugin_loader::{load_manifest_plugins, write_example_manifest_if_missing};
 use crate::plugins::{LoggingPlugin, PluginRegistry};
 use crate::resources::{CrdTarget, ResourceKind};
 use crate::settings::{
@@ -37,6 +38,14 @@ pub struct ClusterManager {
     crd_cache: HashMap<String, Vec<CrdTarget>>,
 }
 
+fn build_plugin_registry() -> PluginRegistry {
+    let mut plugins = PluginRegistry::new();
+    plugins.register(Box::new(LoggingPlugin));
+    write_example_manifest_if_missing();
+    load_manifest_plugins(&mut plugins);
+    plugins
+}
+
 impl ClusterManager {
     /// Connect using saved settings or current kubeconfig context.
     pub async fn connect_default(active_kind: ResourceKind) -> Result<Self> {
@@ -59,8 +68,7 @@ impl ClusterManager {
         let namespaces = Self::list_namespaces_best_effort(&client).await;
         let namespace = pick_namespace_for_context(context, &namespaces);
 
-        let mut plugins = PluginRegistry::new();
-        plugins.register(Box::new(LoggingPlugin));
+        let plugins = build_plugin_registry();
 
         let crd_targets = list_crds(&client).await.unwrap_or_default();
 
@@ -233,6 +241,26 @@ impl ClusterManager {
 
     pub async fn restart_deployment(&self, name: &str) -> Result<()> {
         ops::restart_deployment(&self.client, &self.namespace, name).await
+    }
+
+    pub async fn restart_statefulset(&self, name: &str) -> Result<()> {
+        ops::restart_statefulset(&self.client, &self.namespace, name).await
+    }
+
+    pub async fn scale_deployment(&self, name: &str, replicas: i32) -> Result<()> {
+        ops::scale_deployment(&self.client, &self.namespace, name, replicas).await
+    }
+
+    pub async fn scale_statefulset(&self, name: &str, replicas: i32) -> Result<()> {
+        ops::scale_statefulset(&self.client, &self.namespace, name, replicas).await
+    }
+
+    pub async fn apply_yaml(&self, yaml: &str) -> Result<Vec<String>> {
+        ops::apply_yaml(&self.client, &self.namespace, yaml).await
+    }
+
+    pub async fn fetch_dashboard(&self) -> Result<crate::ClusterDashboard> {
+        crate::dashboard::fetch_cluster_dashboard(&self.client).await
     }
 
     pub async fn fetch_pod_logs_tail(

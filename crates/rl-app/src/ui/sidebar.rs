@@ -1,7 +1,13 @@
 use egui::{Ui, WidgetText};
-use rl_core::ResourceKind;
+use rl_core::{FavoriteResource, ResourceKind};
 
 use crate::ui::theme::Theme;
+
+#[derive(Debug, Default)]
+pub struct SidebarAction {
+    pub selected_favorite: Option<FavoriteResource>,
+    pub unpin_favorite: Option<FavoriteResource>,
+}
 
 pub struct SidebarState {
     pub show_overview: bool,
@@ -9,6 +15,8 @@ pub struct SidebarState {
     pub workloads_open: bool,
     pub config_open: bool,
     pub network_open: bool,
+    pub storage_open: bool,
+    pub access_open: bool,
     pub cluster_open: bool,
     pub helm_open: bool,
 }
@@ -21,6 +29,8 @@ impl Default for SidebarState {
             workloads_open: true,
             config_open: false,
             network_open: false,
+            storage_open: false,
+            access_open: false,
             cluster_open: false,
             helm_open: false,
         }
@@ -36,7 +46,13 @@ fn section_header(ui: &mut Ui, title: &str) {
     );
 }
 
-pub fn show(ui: &mut Ui, state: &mut SidebarState, context: &str) {
+pub fn show(
+    ui: &mut Ui,
+    state: &mut SidebarState,
+    context: &str,
+    favorites: &[FavoriteResource],
+) -> SidebarAction {
+    let mut action = SidebarAction::default();
     ui.vertical_centered(|ui| {
         ui.label(egui::RichText::new("K8s").size(14.0).strong().color(Theme::WARNING));
     });
@@ -49,11 +65,30 @@ pub fn show(ui: &mut Ui, state: &mut SidebarState, context: &str) {
     ui.separator();
 
     section_header(ui, "Favorites");
-    ui.label(
-        egui::RichText::new("  (none)")
-            .small()
-            .color(Theme::TEXT_MUTED),
-    );
+    if favorites.is_empty() {
+        ui.label(
+            egui::RichText::new("  (none)")
+                .small()
+                .color(Theme::TEXT_MUTED),
+        );
+    } else {
+        for fav in favorites {
+            let label = format!("  {} / {}", fav.kind, fav.name);
+            let resp = ui.add(
+                egui::Label::new(egui::RichText::new(&label).small().color(Theme::TEXT))
+                    .sense(egui::Sense::click()),
+            );
+            if resp.clicked() {
+                action.selected_favorite = Some(fav.clone());
+            }
+            resp.context_menu(|ui| {
+                if ui.button("Unpin").clicked() {
+                    action.unpin_favorite = Some(fav.clone());
+                    ui.close_menu();
+                }
+            });
+        }
+    }
     ui.add_space(6.0);
 
     egui::CollapsingHeader::new("Workloads")
@@ -94,7 +129,7 @@ pub fn show(ui: &mut Ui, state: &mut SidebarState, context: &str) {
         .default_open(state.network_open)
         .show_unindented(ui, |ui| {
             state.network_open = true;
-            for kind in [ResourceKind::Service, ResourceKind::Ingress] {
+            for kind in [ResourceKind::Service, ResourceKind::Ingress, ResourceKind::NetworkPolicy] {
                 if nav_item(ui, state.selected_kind == kind, kind.label()) {
                     state.show_overview = false;
                     state.selected_kind = kind;
@@ -105,6 +140,35 @@ pub fn show(ui: &mut Ui, state: &mut SidebarState, context: &str) {
                     .small()
                     .color(Theme::TEXT_MUTED),
             );
+        });
+
+    egui::CollapsingHeader::new("Storage")
+        .default_open(state.storage_open)
+        .show_unindented(ui, |ui| {
+            state.storage_open = true;
+            for kind in [ResourceKind::PersistentVolumeClaim, ResourceKind::StorageClass] {
+                if nav_item(ui, state.selected_kind == kind, kind.label()) {
+                    state.show_overview = false;
+                    state.selected_kind = kind;
+                }
+            }
+        });
+
+    egui::CollapsingHeader::new("Access")
+        .default_open(state.access_open)
+        .show_unindented(ui, |ui| {
+            state.access_open = true;
+            for kind in [
+                ResourceKind::Role,
+                ResourceKind::RoleBinding,
+                ResourceKind::ClusterRole,
+                ResourceKind::ClusterRoleBinding,
+            ] {
+                if nav_item(ui, state.selected_kind == kind, kind.label()) {
+                    state.show_overview = false;
+                    state.selected_kind = kind;
+                }
+            }
         });
 
     egui::CollapsingHeader::new("Cluster")
@@ -152,6 +216,7 @@ pub fn show(ui: &mut Ui, state: &mut SidebarState, context: &str) {
         state.show_overview = false;
         state.selected_kind = ResourceKind::Crd;
     }
+    action
 }
 
 fn nav_item(ui: &mut Ui, selected: bool, label: &str) -> bool {

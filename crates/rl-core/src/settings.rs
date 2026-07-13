@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::resources::ResourceKind;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct FavoriteResource {
+    /// `ResourceKind::api_kind()` value (e.g. `Pod`, `Deployment`).
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub last_context: Option<String>,
@@ -19,6 +27,24 @@ pub struct AppSettings {
     pub context_namespaces: HashMap<String, String>,
     pub bottom_panel_height: Option<f32>,
     pub detail_panel_width: Option<f32>,
+    /// `dark` (default) or `light`.
+    #[serde(default)]
+    pub theme: Option<String>,
+    /// Additional kubeconfig files merged after the primary config.
+    #[serde(default)]
+    pub extra_kubeconfig_paths: Vec<String>,
+    #[serde(default)]
+    pub favorites: Vec<FavoriteResource>,
+    /// Context names shown as multi-cluster tabs in the GUI.
+    #[serde(default)]
+    pub open_cluster_tabs: Vec<String>,
+    /// Prefer kube-rs port-forward over spawning kubectl (default true).
+    #[serde(default = "default_true")]
+    pub use_native_port_forward: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -32,6 +58,11 @@ impl Default for AppSettings {
             context_namespaces: HashMap::new(),
             bottom_panel_height: None,
             detail_panel_width: None,
+            theme: None,
+            extra_kubeconfig_paths: Vec::new(),
+            favorites: Vec::new(),
+            open_cluster_tabs: Vec::new(),
+            use_native_port_forward: true,
         }
     }
 }

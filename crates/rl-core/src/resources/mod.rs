@@ -29,6 +29,16 @@ pub struct ResourceRow {
     pub up_to_date: String,
     /// Job: CronJob owner name
     pub owner: String,
+    /// Service: ClusterIP, NodePort, LoadBalancer, etc.
+    pub service_type: String,
+    /// Service: cluster IP (or `None` for headless)
+    pub cluster_ip: String,
+    /// Service: external / load-balancer addresses
+    pub external_ip: String,
+    /// Service: display e.g. `8080/TCP, 8180/TCP`
+    pub ports: String,
+    /// Service: numeric ports from spec (for port-forward)
+    pub service_ports: Vec<u16>,
 }
 
 impl ResourceRow {
@@ -57,6 +67,11 @@ impl ResourceRow {
             last_schedule: "-".into(),
             up_to_date: "-".into(),
             owner: "-".into(),
+            service_type: "-".into(),
+            cluster_ip: "-".into(),
+            external_ip: "-".into(),
+            ports: "-".into(),
+            service_ports: Vec::new(),
         }
     }
 }
@@ -66,6 +81,8 @@ impl ResourceRow {
 pub enum ResourceCategory {
     Workloads,
     Network,
+    Storage,
+    Access,
     Config,
     Cluster,
     Custom,
@@ -85,12 +102,19 @@ pub enum ResourceKind {
     Secret,
     Namespace,
     Node,
+    NetworkPolicy,
+    PersistentVolumeClaim,
+    StorageClass,
+    Role,
+    RoleBinding,
+    ClusterRole,
+    ClusterRoleBinding,
     HelmRelease,
     Crd,
 }
 
 impl ResourceKind {
-    pub const ALL: [ResourceKind; 13] = [
+    pub const ALL: [ResourceKind; 20] = [
         ResourceKind::Pod,
         ResourceKind::Deployment,
         ResourceKind::StatefulSet,
@@ -98,6 +122,13 @@ impl ResourceKind {
         ResourceKind::CronJob,
         ResourceKind::Service,
         ResourceKind::Ingress,
+        ResourceKind::NetworkPolicy,
+        ResourceKind::PersistentVolumeClaim,
+        ResourceKind::StorageClass,
+        ResourceKind::Role,
+        ResourceKind::RoleBinding,
+        ResourceKind::ClusterRole,
+        ResourceKind::ClusterRoleBinding,
         ResourceKind::ConfigMap,
         ResourceKind::Secret,
         ResourceKind::Namespace,
@@ -113,7 +144,16 @@ impl ResourceKind {
             | ResourceKind::StatefulSet
             | ResourceKind::Job
             | ResourceKind::CronJob => ResourceCategory::Workloads,
-            ResourceKind::Service | ResourceKind::Ingress => ResourceCategory::Network,
+            ResourceKind::Service | ResourceKind::Ingress | ResourceKind::NetworkPolicy => {
+                ResourceCategory::Network
+            }
+            ResourceKind::PersistentVolumeClaim | ResourceKind::StorageClass => {
+                ResourceCategory::Storage
+            }
+            ResourceKind::Role
+            | ResourceKind::RoleBinding
+            | ResourceKind::ClusterRole
+            | ResourceKind::ClusterRoleBinding => ResourceCategory::Access,
             ResourceKind::ConfigMap | ResourceKind::Secret => ResourceCategory::Config,
             ResourceKind::Namespace | ResourceKind::Node | ResourceKind::HelmRelease => {
                 ResourceCategory::Cluster
@@ -131,6 +171,13 @@ impl ResourceKind {
             ResourceKind::CronJob => "Cron Jobs",
             ResourceKind::Service => "Services",
             ResourceKind::Ingress => "Ingresses",
+            ResourceKind::NetworkPolicy => "Network Policies",
+            ResourceKind::PersistentVolumeClaim => "PVCs",
+            ResourceKind::StorageClass => "Storage Classes",
+            ResourceKind::Role => "Roles",
+            ResourceKind::RoleBinding => "Role Bindings",
+            ResourceKind::ClusterRole => "Cluster Roles",
+            ResourceKind::ClusterRoleBinding => "Cluster Role Bindings",
             ResourceKind::ConfigMap => "ConfigMaps",
             ResourceKind::Secret => "Secrets",
             ResourceKind::Namespace => "Namespaces",
@@ -149,6 +196,13 @@ impl ResourceKind {
             ResourceKind::CronJob => "CronJob",
             ResourceKind::Service => "Service",
             ResourceKind::Ingress => "Ingress",
+            ResourceKind::NetworkPolicy => "NetworkPolicy",
+            ResourceKind::PersistentVolumeClaim => "PersistentVolumeClaim",
+            ResourceKind::StorageClass => "StorageClass",
+            ResourceKind::Role => "Role",
+            ResourceKind::RoleBinding => "RoleBinding",
+            ResourceKind::ClusterRole => "ClusterRole",
+            ResourceKind::ClusterRoleBinding => "ClusterRoleBinding",
             ResourceKind::ConfigMap => "ConfigMap",
             ResourceKind::Secret => "Secret",
             ResourceKind::Namespace => "Namespace",
@@ -159,7 +213,14 @@ impl ResourceKind {
     }
 
     pub fn is_cluster_scoped(self) -> bool {
-        matches!(self, ResourceKind::Namespace | ResourceKind::Node)
+        matches!(
+            self,
+            ResourceKind::Namespace
+                | ResourceKind::Node
+                | ResourceKind::StorageClass
+                | ResourceKind::ClusterRole
+                | ResourceKind::ClusterRoleBinding
+        )
     }
 
     /// True for kinds backed by a live Kubernetes watch (not Helm/CRD polls).
@@ -185,6 +246,14 @@ impl ResourceKind {
 
     pub fn supports_port_forward(self) -> bool {
         self == ResourceKind::Pod || self == ResourceKind::Service
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|k| k.label() == label)
+    }
+
+    pub fn from_api_kind(api_kind: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|k| k.api_kind() == api_kind)
     }
 }
 

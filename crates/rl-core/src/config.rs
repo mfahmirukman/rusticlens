@@ -1,12 +1,22 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use kube::config::Kubeconfig;
 use kube::Config;
 
 use crate::error::{Error, Result};
+use crate::settings::load_settings;
 
-/// Load kubeconfig from the default path or `KUBECONFIG`.
-pub fn load_kubeconfig() -> Result<kube::config::Kubeconfig> {
-    kube::config::Kubeconfig::read().map_err(Error::from)
+/// Load kubeconfig from the default path or `KUBECONFIG`, merged with saved extra paths.
+pub fn load_kubeconfig() -> Result<Kubeconfig> {
+    let mut config = kube::config::Kubeconfig::read().map_err(Error::from)?;
+    for path in &load_settings().extra_kubeconfig_paths {
+        let path = Path::new(path);
+        if path.exists() {
+            let extra = Kubeconfig::read_from(path).map_err(Error::from)?;
+            config = Kubeconfig::merge(config, extra).map_err(Error::from)?;
+        }
+    }
+    Ok(config)
 }
 
 /// Resolve the kubeconfig file path.

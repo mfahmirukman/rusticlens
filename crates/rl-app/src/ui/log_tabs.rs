@@ -26,6 +26,8 @@ pub struct LogTab {
     pub(crate) older_fetch_armed: bool,
     /// After prepending older lines, bump scroll offset by this many rows once.
     pub scroll_compensate_rows: usize,
+    /// Virtual row index to scroll into view (log search navigation).
+    pub scroll_to_match_row: Option<usize>,
     trimmed_lines: u64,
     /// Highest line-count milestone already logged (`1`, `100`, `500`, …).
     logged_milestone: usize,
@@ -169,6 +171,7 @@ impl LogTabsState {
             last_scroll_offset_y: None,
             older_fetch_armed: false,
             scroll_compensate_rows: 0,
+            scroll_to_match_row: None,
             trimmed_lines: 0,
             logged_milestone: 0,
         });

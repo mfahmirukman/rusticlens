@@ -3,12 +3,15 @@ use std::collections::HashMap;
 use eframe::egui;
 use rl_core::{
     kubectl_edit_command, kubectl_exec_command, kubectl_port_forward_command,
-    spawn_kubectl_attach_terminal, spawn_kubectl_exec_terminal, spawn_kubectl_port_forward,
-    ContainerInfo, CrdTarget, ResourceKind, ResourceSnapshot,
+    spawn_kubectl_attach_terminal, spawn_kubectl_exec_terminal, PortForwardInfo,
+    ClusterDashboard, ContainerInfo, CrdTarget, FavoriteResource, ResourceKind, ResourceSnapshot,
 };
 
 use crate::backend::{BackendCommand, BackendEvent, BackendHandle};
 use crate::log_info;
+use crate::ui::cluster_tabs::{self, ClusterTabAction};
+#[cfg(feature = "embedded-terminal")]
+use crate::ui::embedded_terminal::{self, EmbeddedTerminalAction, EmbeddedTerminalState};
 use crate::ui::detail_panel::{
     show_content as show_detail_content, show_header as show_detail_header, DetailSearchState,
     DetailState, DetailTab,
@@ -17,8 +20,15 @@ use crate::ui::icon_rail::{self, IconRailAction, IconRailState};
 use crate::ui::log_panel::{show_tab_bar, show_tab_content, LogPanelState};
 use crate::ui::log_tabs::LogTabsState;
 use crate::ui::resource_table::{RowContextAction, TableState};
+use crate::ui::settings_dialog::{self, SettingsDialogState};
 use crate::ui::sidebar::SidebarState;
-use crate::ui::theme::Theme;
+use crate::ui::theme::{Theme, ThemeMode};
+
+struct ScaleDialog {
+    kind: ResourceKind,
+    name: String,
+    replicas: u32,
+}
 
 struct PaletteAction {
     label: String,
@@ -35,8 +45,12 @@ enum PaletteCommand {
     Delete,
     CopyExec,
     OpenTerminal,
+    OpenEmbeddedShell,
     CopyPortForward,
     StartPortForward,
+    ToggleTheme,
+    ApplyYaml,
+    ClusterSettings,
 }
 
 pub struct RusticlensApp {
@@ -73,6 +87,19 @@ pub struct RusticlensApp {
     log_panel: LogPanelState,
     detail_tab: DetailTab,
     detail_panel_width: f32,
+    theme_mode: ThemeMode,
+    scale_dialog: Option<ScaleDialog>,
+    apply_yaml_open: bool,
+    apply_yaml_text: String,
+    settings_dialog: SettingsDialogState,
+    favorites: Vec<FavoriteResource>,
+    dashboard: Option<ClusterDashboard>,
+    pending_favorite_select: Option<String>,
+    cluster_tabs: Vec<String>,
+    cluster_tab_picker_open: bool,
+    port_forwards: Vec<PortForwardInfo>,
+    #[cfg(feature = "embedded-terminal")]
+    embedded_terminal: EmbeddedTerminalState,
 }
 
 impl RusticlensApp {
@@ -122,6 +149,26 @@ impl RusticlensApp {
             log_panel: LogPanelState::default(),
             detail_tab: DetailTab::Describe,
             detail_panel_width: settings.detail_panel_width.unwrap_or(420.0),
+            theme_mode: ThemeMode::from_settings(),
+            scale_dialog: None,
+            apply_yaml_open: false,
+            apply_yaml_text: String::new(),
+            settings_dialog: SettingsDialogState::default(),
+            favorites: settings.favorites,
+            dashboard: None,
+            pending_favorite_select: None,
+            cluster_tabs: if settings.open_cluster_tabs.is_empty() {
+                settings
+                    .last_context
+                    .map(|c| vec![c])
+                    .unwrap_or_default()
+            } else {
+                settings.open_cluster_tabs
+            },
+            cluster_tab_picker_open: false,
+            port_forwards: Vec::new(),
+            #[cfg(feature = "embedded-terminal")]
+            embedded_terminal: EmbeddedTerminalState::new(),
         }
     }
 
@@ -147,6 +194,7 @@ impl RusticlensApp {
                     self.namespaces = namespaces;
                     self.crd_targets = crd_targets;
                     self.sync_pinned_contexts(&context);
+                    self.ensure_cluster_tab(&context);
                     // Pause live streams (wrong cluster client) but keep tab buffers.
                     self.backend.send(BackendCommand::CloseAllLogs);
                     self.table.selected = None;
@@ -248,6 +296,44 @@ impl RusticlensApp {
                     self.status_message = format!("Restarted deployment {name}");
                     self.backend.send(BackendCommand::RefreshList);
                 }
+                BackendEvent::StatefulSetRestarted { name } => {
+                    self.status_message = format!("Restarted statefulset {name}");
+                    self.backend.send(BackendCommand::RefreshList);
+                }
+                BackendEvent::WorkloadScaled { kind, name, replicas } => {
+                    self.status_message =
+                        format!("Scaled {} {name} to {replicas} replicas", kind.api_kind());
+                    self.scale_dialog = None;
+                    self.backend.send(BackendCommand::RefreshList);
+                }
+                BackendEvent::YamlApplied { resources } => {
+                    self.apply_yaml_open = false;
+                    self.status_message = format!("Applied: {}", resources.join(", "));
+                    self.backend.send(BackendCommand::RefreshList);
+                }
+                BackendEvent::DashboardLoaded { dashboard } => {
+                    self.dashboard = Some(dashboard);
+                }
+                BackendEvent::PortForwardStarted { info } => {
+                    self.port_forwards.retain(|p| p.id != info.id);
+                    self.port_forwards.push(info.clone());
+                    self.status_message = format!(
+                        "Port-forward {} → localhost:{}",
+                        info.label, info.local_port
+                    );
+                }
+                BackendEvent::PortForwardStopped { id } => {
+                    self.port_forwards.retain(|p| p.id != id);
+                }
+                #[cfg(feature = "embedded-terminal")]
+                BackendEvent::EmbeddedExecOutput { line } => {
+                    self.embedded_terminal.lines.push(line);
+                    self.embedded_terminal.running = true;
+                }
+                #[cfg(feature = "embedded-terminal")]
+                BackendEvent::EmbeddedExecStopped => {
+                    self.embedded_terminal.running = false;
+                }
                 BackendEvent::Error(msg) => {
                     self.error_message = Some(msg);
                     self.connecting = false;
@@ -267,6 +353,33 @@ impl RusticlensApp {
         self.table
             .selected_name(self.current_rows())
             .map(str::to_string)
+    }
+
+    /// Local and remote ports for port-forward (from Service spec when available).
+    fn port_forward_ports_for_selection(&self) -> (u16, u16) {
+        let Some(idx) = self.table.selected else {
+            return (8080, 80);
+        };
+        let Some(row) = self.current_rows().get(idx) else {
+            return (8080, 80);
+        };
+        if let Some(&remote) = row.service_ports.first() {
+            return (remote, remote);
+        }
+        (8080, 80)
+    }
+
+    fn start_port_forward_for_selection(&mut self, kind: ResourceKind) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        let (local_port, remote_port) = self.port_forward_ports_for_selection();
+        self.backend.send(BackendCommand::StartPortForward {
+            kind,
+            name,
+            local_port,
+            remote_port,
+        });
     }
 
     fn fetch_yaml_for_selection(&mut self) {
@@ -414,6 +527,53 @@ impl RusticlensApp {
         let _ = rl_core::save_settings(&settings);
     }
 
+    fn pin_favorite(&mut self, fav: FavoriteResource) {
+        if self.favorites.iter().any(|f| f == &fav) {
+            self.status_message = "Already in favorites.".into();
+            return;
+        }
+        self.favorites.push(fav);
+        let mut settings = rl_core::load_settings();
+        settings.favorites = self.favorites.clone();
+        let _ = rl_core::save_settings(&settings);
+        self.status_message = "Pinned to favorites.".into();
+    }
+
+    fn unpin_favorite(&mut self, fav: &FavoriteResource) {
+        self.favorites.retain(|f| f != fav);
+        let mut settings = rl_core::load_settings();
+        settings.favorites = self.favorites.clone();
+        let _ = rl_core::save_settings(&settings);
+        self.status_message = "Removed from favorites.".into();
+    }
+
+    fn navigate_to_favorite(&mut self, fav: &FavoriteResource) {
+        let Some(kind) = ResourceKind::from_api_kind(&fav.kind) else {
+            return;
+        };
+        self.sidebar.show_overview = false;
+        self.sidebar.selected_kind = kind;
+        self.backend.send(BackendCommand::SetActiveKind(kind));
+        if !kind.is_cluster_scoped()
+            && fav.namespace != "-"
+            && fav.namespace != self.active_namespace
+        {
+            self.backend
+                .send(BackendCommand::SetNamespace(fav.namespace.clone()));
+        }
+        self.pending_favorite_select = Some(fav.name.clone());
+        self.backend.send(BackendCommand::RefreshList);
+    }
+
+    fn apply_sidebar_action(&mut self, action: crate::ui::sidebar::SidebarAction) {
+        if let Some(fav) = action.selected_favorite {
+            self.navigate_to_favorite(&fav);
+        }
+        if let Some(fav) = action.unpin_favorite {
+            self.unpin_favorite(&fav);
+        }
+    }
+
     fn persist_bottom_height(&self) {
         let mut settings = rl_core::load_settings();
         settings.bottom_panel_height = Some(self.bottom_height);
@@ -469,6 +629,46 @@ impl RusticlensApp {
         self.persist_pinned_contexts();
     }
 
+    fn ensure_cluster_tab(&mut self, context: &str) {
+        if !self.cluster_tabs.iter().any(|c| c == context) {
+            self.cluster_tabs.push(context.to_string());
+            self.persist_cluster_tabs();
+        }
+    }
+
+    fn persist_cluster_tabs(&self) {
+        let mut settings = rl_core::load_settings();
+        settings.open_cluster_tabs = self.cluster_tabs.clone();
+        let _ = rl_core::save_settings(&settings);
+    }
+
+    fn apply_cluster_tab_action(&mut self, action: ClusterTabAction) {
+        match action {
+            ClusterTabAction::None => {}
+            ClusterTabAction::Select(ctx) => {
+                if ctx != self.active_context {
+                    self.status_message = format!("Switching to {ctx}...");
+                    self.backend.send(BackendCommand::SwitchContext(ctx));
+                }
+            }
+            ClusterTabAction::Close(ctx) => {
+                self.cluster_tabs.retain(|c| c != &ctx);
+                if self.cluster_tabs.is_empty() {
+                    self.cluster_tabs.push(self.active_context.clone());
+                }
+                self.persist_cluster_tabs();
+                if ctx == self.active_context {
+                    let next = self.cluster_tabs.first().cloned().unwrap_or(ctx);
+                    self.backend.send(BackendCommand::SwitchContext(next));
+                }
+            }
+            ClusterTabAction::Add(ctx) => {
+                self.ensure_cluster_tab(&ctx);
+                self.backend.send(BackendCommand::SwitchContext(ctx));
+            }
+        }
+    }
+
     fn apply_icon_rail_action(&mut self, action: IconRailAction) {
         if action.show_overview {
             self.sidebar.show_overview = true;
@@ -491,6 +691,9 @@ impl RusticlensApp {
                 self.pinned_contexts.retain(|c| c != &ctx);
                 self.persist_pinned_contexts();
             }
+        }
+        if action.open_settings {
+            self.settings_dialog.open_from_settings();
         }
     }
 
@@ -590,8 +793,50 @@ impl RusticlensApp {
             }
             RowContextAction::Restart => {
                 if let Some(name) = self.selected_name() {
-                    self.backend.send(BackendCommand::RestartDeployment {
-                        name: name.to_string(),
+                    match kind {
+                        ResourceKind::StatefulSet => {
+                            self.backend.send(BackendCommand::RestartStatefulSet {
+                                name: name.to_string(),
+                            });
+                        }
+                        _ => {
+                            self.backend.send(BackendCommand::RestartDeployment {
+                                name: name.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            RowContextAction::Scale => {
+                let replicas = self
+                    .current_rows()
+                    .get(row_idx)
+                    .and_then(|row| parse_desired_replicas(&row.ready))
+                    .unwrap_or(1);
+                if let Some(name) = self.selected_name() {
+                    self.scale_dialog = Some(ScaleDialog {
+                        kind,
+                        name,
+                        replicas,
+                    });
+                }
+            }
+            RowContextAction::PinFavorite => {
+                if let Some(row) = self.current_rows().get(row_idx) {
+                    self.pin_favorite(FavoriteResource {
+                        kind: kind.api_kind().to_string(),
+                        namespace: row.namespace.clone(),
+                        name: row.name.clone(),
+                    });
+                }
+            }
+            RowContextAction::PortForward { remote_port } => {
+                if let Some(name) = self.selected_name() {
+                    self.backend.send(BackendCommand::StartPortForward {
+                        kind,
+                        name,
+                        local_port: remote_port,
+                        remote_port,
                     });
                 }
             }
@@ -621,6 +866,22 @@ impl RusticlensApp {
                 label: "Delete selected".into(),
                 command: PaletteCommand::Delete,
             },
+            PaletteAction {
+                label: "Apply YAML".into(),
+                command: PaletteCommand::ApplyYaml,
+            },
+            PaletteAction {
+                label: if self.theme_mode == ThemeMode::Dark {
+                    "Switch to light theme".into()
+                } else {
+                    "Switch to dark theme".into()
+                },
+                command: PaletteCommand::ToggleTheme,
+            },
+            PaletteAction {
+                label: "Cluster / kubeconfig settings".into(),
+                command: PaletteCommand::ClusterSettings,
+            },
         ];
         if self.sidebar.selected_kind == ResourceKind::Pod {
             actions.push(PaletteAction {
@@ -635,12 +896,17 @@ impl RusticlensApp {
                 label: "Open terminal (kubectl exec)".into(),
                 command: PaletteCommand::OpenTerminal,
             });
+            #[cfg(feature = "embedded-terminal")]
+            actions.push(PaletteAction {
+                label: "Open embedded shell".into(),
+                command: PaletteCommand::OpenEmbeddedShell,
+            });
             actions.push(PaletteAction {
                 label: "Copy port-forward command".into(),
                 command: PaletteCommand::CopyPortForward,
             });
             actions.push(PaletteAction {
-                label: "Start port-forward (kubectl)".into(),
+                label: "Start port-forward".into(),
                 command: PaletteCommand::StartPortForward,
             });
         }
@@ -650,6 +916,10 @@ impl RusticlensApp {
             actions.push(PaletteAction {
                 label: "Copy port-forward command".into(),
                 command: PaletteCommand::CopyPortForward,
+            });
+            actions.push(PaletteAction {
+                label: "Start port-forward".into(),
+                command: PaletteCommand::StartPortForward,
             });
         }
         actions
@@ -699,39 +969,126 @@ impl RusticlensApp {
                     }
                 }
             }
+            #[cfg(feature = "embedded-terminal")]
+            PaletteCommand::OpenEmbeddedShell => {
+                if let Some(name) = self.selected_name() {
+                    self.embedded_terminal.open_for_pod(name);
+                }
+            }
             PaletteCommand::CopyPortForward => {
                 if let Some(name) = self.selected_name() {
+                    let (local_port, remote_port) = self.port_forward_ports_for_selection();
                     let cmd = kubectl_port_forward_command(
                         &self.active_namespace,
                         self.sidebar.selected_kind,
                         &name,
-                        8080,
-                        80,
+                        local_port,
+                        remote_port,
                     );
                     ctx.copy_text(cmd);
                     self.status_message = "Copied port-forward command.".into();
                 }
             }
             PaletteCommand::StartPortForward => {
-                if let Some(name) = self.selected_name() {
-                    match spawn_kubectl_port_forward(
-                        &self.active_namespace,
-                        self.sidebar.selected_kind,
-                        &name,
-                        8080,
-                        80,
-                    ) {
-                        Ok(_) => {
-                            self.status_message =
-                                "Started kubectl port-forward on localhost:8080.".into()
-                        }
-                        Err(err) => self.error_message = Some(err.user_message()),
-                    }
-                }
+                self.start_port_forward_for_selection(self.sidebar.selected_kind);
+            }
+            PaletteCommand::ToggleTheme => {
+                self.theme_mode = self.theme_mode.toggle();
+                let mut settings = rl_core::load_settings();
+                settings.theme = Some(self.theme_mode.as_str().to_string());
+                let _ = rl_core::save_settings(&settings);
+                Theme::apply_mode(ctx, self.theme_mode);
+            }
+            PaletteCommand::ApplyYaml => {
+                self.apply_yaml_open = true;
+            }
+            PaletteCommand::ClusterSettings => {
+                self.settings_dialog.open_from_settings();
             }
         }
         self.palette_open = false;
         self.palette_query.clear();
+    }
+
+    fn show_scale_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.scale_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut cancel = false;
+        egui::Window::new("Scale workload")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("{} {}", dialog.kind.api_kind(), dialog.name));
+                ui.horizontal(|ui| {
+                    ui.label("Replicas:");
+                    ui.add(egui::DragValue::new(&mut dialog.replicas).range(0..=1000));
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("Scale").clicked() {
+                        let cmd = match dialog.kind {
+                            ResourceKind::Deployment => BackendCommand::ScaleDeployment {
+                                name: dialog.name.clone(),
+                                replicas: dialog.replicas as i32,
+                            },
+                            ResourceKind::StatefulSet => BackendCommand::ScaleStatefulSet {
+                                name: dialog.name.clone(),
+                                replicas: dialog.replicas as i32,
+                            },
+                            _ => return,
+                        };
+                        self.backend.send(cmd);
+                    }
+                });
+            });
+        if open && !cancel {
+            self.scale_dialog = Some(dialog);
+        }
+    }
+
+    fn show_apply_yaml_window(&mut self, ctx: &egui::Context) {
+        if !self.apply_yaml_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Apply YAML")
+            .default_size(egui::vec2(520.0, 420.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Paste one or more YAML documents (server-side apply):");
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.apply_yaml_text)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(16),
+                        );
+                    });
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.apply_yaml_open = false;
+                    }
+                    let can_apply = !self.apply_yaml_text.trim().is_empty();
+                    if ui
+                        .add_enabled(can_apply, egui::Button::new("Apply"))
+                        .clicked()
+                    {
+                        self.backend.send(BackendCommand::ApplyYaml {
+                            yaml: self.apply_yaml_text.clone(),
+                        });
+                    }
+                });
+            });
+        if !open {
+            self.apply_yaml_open = false;
+        }
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
@@ -777,6 +1134,9 @@ impl RusticlensApp {
             self.detail_tab = DetailTab::Events;
             self.detail.tab = DetailTab::Events;
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::Slash)) && self.log_tabs.active_id().is_some() {
+            self.log_panel.focus_filter = true;
+        }
     }
 
     fn show_palette(&mut self, ctx: &egui::Context) {
@@ -812,10 +1172,81 @@ impl RusticlensApp {
 
 impl eframe::App for RusticlensApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        Theme::apply(ctx);
+        Theme::apply_mode(ctx, self.theme_mode);
         self.process_events();
         self.handle_keyboard(ctx);
+        self.show_scale_dialog(ctx);
+        self.show_apply_yaml_window(ctx);
+        let settings_action = settings_dialog::show(ctx, &mut self.settings_dialog);
+        if settings_action.reload_contexts {
+            self.status_message = "Reloading contexts from kubeconfig...".into();
+            self.backend.send(BackendCommand::Reconnect);
+        }
         self.show_palette(ctx);
+
+        egui::TopBottomPanel::top("cluster_tabs")
+            .frame(egui::Frame::new().fill(Theme::PANEL).inner_margin(4.0))
+            .show(ctx, |ui| {
+                let contexts = self.contexts.clone();
+                let tab_action = cluster_tabs::show(
+                    ui,
+                    &self.cluster_tabs,
+                    &self.active_context,
+                    &contexts,
+                    &mut self.cluster_tab_picker_open,
+                );
+                self.apply_cluster_tab_action(tab_action);
+
+                if !self.port_forwards.is_empty() {
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Forwards:").small().color(Theme::TEXT_MUTED));
+                        let mut stop_id = None;
+                        for pf in &self.port_forwards {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} → localhost:{}",
+                                    pf.label, pf.local_port
+                                ))
+                                .small(),
+                            );
+                            if ui.small_button(format!("Stop#{}", pf.id)).clicked() {
+                                stop_id = Some(pf.id);
+                            }
+                        }
+                        if let Some(id) = stop_id {
+                            self.backend.send(BackendCommand::StopPortForward { id });
+                        }
+                    });
+                }
+            });
+
+        #[cfg(feature = "embedded-terminal")]
+        {
+            let term_action = embedded_terminal::show(
+                ctx,
+                &mut self.embedded_terminal,
+                self.selected_container.as_deref(),
+            );
+            match term_action {
+                EmbeddedTerminalAction::None => {}
+                EmbeddedTerminalAction::Start => {
+                    self.backend.send(BackendCommand::StartEmbeddedExec {
+                        pod_name: self.embedded_terminal.pod_name.clone(),
+                        container: self.selected_container.clone(),
+                    });
+                    self.embedded_terminal.running = true;
+                }
+                EmbeddedTerminalAction::Stop => {
+                    self.backend.send(BackendCommand::StopEmbeddedExec);
+                    self.embedded_terminal.running = false;
+                }
+                EmbeddedTerminalAction::SendInput(bytes) => {
+                    self.backend
+                        .send(BackendCommand::EmbeddedExecInput { bytes });
+                }
+            }
+        }
 
         if let Some((kind, name, force)) = self.pending_delete.take() {
             self.delete_confirm = Some((kind, name, force));
@@ -894,7 +1325,10 @@ impl eframe::App for RusticlensApp {
             .frame(egui::Frame::side_top_panel(&ctx.style()).fill(Theme::PANEL))
             .show(ctx, |ui| {
                 let context = self.active_context.clone();
-                crate::ui::sidebar::show(ui, &mut self.sidebar, &context);
+                let favorites = self.favorites.clone();
+                let sidebar_action =
+                    crate::ui::sidebar::show(ui, &mut self.sidebar, &context, &favorites);
+                self.apply_sidebar_action(sidebar_action);
 
                 if self.sidebar.selected_kind == ResourceKind::Crd && !self.crd_targets.is_empty() {
                     ui.separator();
@@ -912,6 +1346,12 @@ impl eframe::App for RusticlensApp {
                     }
                 }
             });
+
+        if self.sidebar.show_overview && self.connected && self.sidebar.show_overview != prev_overview
+        {
+            self.dashboard = None;
+            self.backend.send(BackendCommand::FetchDashboard);
+        }
 
         if (self.sidebar.selected_kind != prev_kind || self.sidebar.show_overview != prev_overview)
             && !self.sidebar.show_overview
@@ -1010,6 +1450,15 @@ impl eframe::App for RusticlensApp {
                         self.restart_active_log_stream(true);
                     } else if let Some(tab_id) = content_action.load_older {
                         self.fetch_older_logs(tab_id);
+                    } else if content_action.export_logs {
+                        if let Some(tab) = self.log_tabs.active_tab() {
+                            let count = tab.line_count();
+                            ctx.copy_text(tab.lines().join("\n"));
+                            self.status_message =
+                                format!("Copied {count} log line(s) to clipboard.");
+                        }
+                    } else if let Some(msg) = content_action.status_message {
+                        self.status_message = msg;
                     }
 
                     if let Some(err) = &self.error_message {
@@ -1124,6 +1573,7 @@ impl eframe::App for RusticlensApp {
                         ui,
                         &self.active_context,
                         &self.active_namespace,
+                        self.dashboard.as_ref(),
                         pods,
                         dep_count,
                         job_count,
@@ -1146,6 +1596,13 @@ impl eframe::App for RusticlensApp {
                     .map(|s| s.rows.clone())
                     .unwrap_or_default();
                 self.row_count = rows.len();
+
+                if let Some(name) = self.pending_favorite_select.take() {
+                    if let Some(idx) = rows.iter().position(|r| r.name == name) {
+                        self.table.selected = Some(idx);
+                        self.on_table_selection_changed(kind);
+                    }
+                }
 
                 let namespaces = self.namespaces.clone();
                 let namespace = self.active_namespace.clone();
@@ -1201,6 +1658,11 @@ impl eframe::App for RusticlensApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist_settings();
         self.persist_detail_panel_width();
+        for pf in self.port_forwards.drain(..) {
+            self.backend.send(BackendCommand::StopPortForward { id: pf.id });
+        }
+        #[cfg(feature = "embedded-terminal")]
+        self.backend.send(BackendCommand::StopEmbeddedExec);
         self.backend.send(BackendCommand::CloseAllLogs);
         self.backend.send(BackendCommand::Shutdown);
     }
@@ -1213,4 +1675,8 @@ fn set_bottom_panel_persisted_height(ctx: &egui::Context, panel_id: egui::Id, he
     ctx.data_mut(|d| {
         d.insert_persisted(panel_id, egui::containers::panel::PanelState { rect });
     });
+}
+
+fn parse_desired_replicas(ready: &str) -> Option<u32> {
+    ready.split('/').nth(1)?.trim().parse().ok()
 }

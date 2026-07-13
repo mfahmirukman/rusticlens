@@ -12,7 +12,8 @@ name = "rusticlens"
 path = "src/main.rs"
 
 [features]
-default = ["mimalloc"]
+default = ["mimalloc", "embedded-terminal"]
+embedded-terminal = []
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]

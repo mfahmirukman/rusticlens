@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::Result;
 use crate::helm;
+use crate::kinds_ext;
 use crate::resources::{format_age, pod_ready_string, ResourceKind, ResourceRow};
 
 /// Snapshot of resources for UI rendering.
@@ -36,6 +37,13 @@ struct StoreState {
     secrets: Vec<ResourceRow>,
     namespaces: Vec<ResourceRow>,
     nodes: Vec<ResourceRow>,
+    networkpolicies: Vec<ResourceRow>,
+    pvcs: Vec<ResourceRow>,
+    storageclasses: Vec<ResourceRow>,
+    roles: Vec<ResourceRow>,
+    rolebindings: Vec<ResourceRow>,
+    clusterroles: Vec<ResourceRow>,
+    clusterrolebindings: Vec<ResourceRow>,
     revision: u64,
 }
 
@@ -155,6 +163,13 @@ fn rows_for_kind(guard: &StoreState, kind: ResourceKind) -> Vec<ResourceRow> {
         ResourceKind::Secret => guard.secrets.clone(),
         ResourceKind::Namespace => guard.namespaces.clone(),
         ResourceKind::Node => guard.nodes.clone(),
+        ResourceKind::NetworkPolicy => guard.networkpolicies.clone(),
+        ResourceKind::PersistentVolumeClaim => guard.pvcs.clone(),
+        ResourceKind::StorageClass => guard.storageclasses.clone(),
+        ResourceKind::Role => guard.roles.clone(),
+        ResourceKind::RoleBinding => guard.rolebindings.clone(),
+        ResourceKind::ClusterRole => guard.clusterroles.clone(),
+        ResourceKind::ClusterRoleBinding => guard.clusterrolebindings.clone(),
         ResourceKind::HelmRelease | ResourceKind::Crd => Vec::new(),
     }
 }
@@ -172,6 +187,13 @@ fn apply_rows(guard: &mut StoreState, kind: ResourceKind, rows: Vec<ResourceRow>
         ResourceKind::Secret => guard.secrets = rows,
         ResourceKind::Namespace => guard.namespaces = rows,
         ResourceKind::Node => guard.nodes = rows,
+        ResourceKind::NetworkPolicy => guard.networkpolicies = rows,
+        ResourceKind::PersistentVolumeClaim => guard.pvcs = rows,
+        ResourceKind::StorageClass => guard.storageclasses = rows,
+        ResourceKind::Role => guard.roles = rows,
+        ResourceKind::RoleBinding => guard.rolebindings = rows,
+        ResourceKind::ClusterRole => guard.clusterroles = rows,
+        ResourceKind::ClusterRoleBinding => guard.clusterrolebindings = rows,
         ResourceKind::HelmRelease | ResourceKind::Crd => {}
     }
 }
@@ -283,6 +305,69 @@ fn spawn_kind_watch(
             },
             cancel_rx,
         ),
+        ResourceKind::NetworkPolicy => spawn_watch(
+            kinds_ext::watch_networkpolicies(client, namespace),
+            state,
+            |guard, rows| {
+                guard.networkpolicies = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::PersistentVolumeClaim => spawn_watch(
+            kinds_ext::watch_pvcs(client, namespace),
+            state,
+            |guard, rows| {
+                guard.pvcs = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::StorageClass => spawn_watch(
+            kinds_ext::watch_storageclasses(client),
+            state,
+            |guard, rows| {
+                guard.storageclasses = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::Role => spawn_watch(
+            kinds_ext::watch_roles(client, namespace),
+            state,
+            |guard, rows| {
+                guard.roles = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::RoleBinding => spawn_watch(
+            kinds_ext::watch_rolebindings(client, namespace),
+            state,
+            |guard, rows| {
+                guard.rolebindings = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::ClusterRole => spawn_watch(
+            kinds_ext::watch_clusterroles(client),
+            state,
+            |guard, rows| {
+                guard.clusterroles = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
+        ResourceKind::ClusterRoleBinding => spawn_watch(
+            kinds_ext::watch_clusterrolebindings(client),
+            state,
+            |guard, rows| {
+                guard.clusterrolebindings = rows;
+                guard.revision += 1;
+            },
+            cancel_rx,
+        ),
         ResourceKind::HelmRelease | ResourceKind::Crd => tokio::spawn(async {}),
     }
 }
@@ -320,13 +405,13 @@ where
     })
 }
 
-enum WatchDelta {
+pub(crate) enum WatchDelta {
     Upsert(Box<ResourceRow>),
     Remove(String),
     Noop,
 }
 
-fn apply_delta(map: &mut HashMap<String, ResourceRow>, delta: WatchDelta) {
+pub(crate) fn apply_delta(map: &mut HashMap<String, ResourceRow>, delta: WatchDelta) {
     match delta {
         WatchDelta::Upsert(row) if !row.name.is_empty() => {
             map.insert(row.name.clone(), *row);
@@ -762,20 +847,84 @@ fn cronjob_to_row(cj: &CronJob, namespace: &str) -> ResourceRow {
 
 fn service_to_row(svc: &Service, namespace: &str) -> ResourceRow {
     let name = svc.metadata.name.clone().unwrap_or_default();
-    let svc_type = svc
-        .spec
-        .as_ref()
+    let spec = svc.spec.as_ref();
+    let svc_type = spec
         .and_then(|s| s.type_.clone())
         .unwrap_or_else(|| "ClusterIP".into());
 
-    ResourceRow::new(
+    let cluster_ip = spec
+        .and_then(|s| s.cluster_ip.clone())
+        .filter(|ip| !ip.is_empty())
+        .unwrap_or_else(|| "None".into());
+
+    let external_ip = format_service_external_ips(svc);
+    let (ports, service_ports) = format_service_ports(spec);
+
+    let mut row = ResourceRow::new(
         name,
         namespace.to_string(),
         "-".to_string(),
-        svc_type,
+        "Active".to_string(),
         "-".to_string(),
         format_age(svc.metadata.creation_timestamp.as_ref()),
-    )
+    );
+    row.service_type = svc_type;
+    row.cluster_ip = cluster_ip;
+    row.external_ip = external_ip;
+    row.ports = ports;
+    row.service_ports = service_ports;
+    row
+}
+
+fn format_service_ports(spec: Option<&k8s_openapi::api::core::v1::ServiceSpec>) -> (String, Vec<u16>) {
+    let Some(ports) = spec.and_then(|s| s.ports.as_ref()) else {
+        return ("-".into(), Vec::new());
+    };
+    if ports.is_empty() {
+        return ("-".into(), Vec::new());
+    }
+    let mut numbers = Vec::new();
+    let display = ports
+        .iter()
+        .map(|p| {
+            numbers.push(p.port as u16);
+            let proto = p.protocol.as_deref().unwrap_or("TCP");
+            format!("{}/{}", p.port, proto)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    (display, numbers)
+}
+
+fn format_service_external_ips(svc: &Service) -> String {
+    let mut ips = Vec::new();
+    if let Some(spec) = &svc.spec {
+        if let Some(ext) = &spec.external_ips {
+            ips.extend(ext.iter().cloned());
+        }
+    }
+    if ips.is_empty() {
+        if let Some(lb) = svc
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+        {
+            if let Some(ingress) = &lb.ingress {
+                for entry in ingress {
+                    if let Some(ip) = &entry.ip {
+                        ips.push(ip.clone());
+                    } else if let Some(host) = &entry.hostname {
+                        ips.push(host.clone());
+                    }
+                }
+            }
+        }
+    }
+    if ips.is_empty() {
+        "-".into()
+    } else {
+        ips.join(", ")
+    }
 }
 
 fn ingress_to_row(ing: &Ingress, namespace: &str) -> ResourceRow {
@@ -994,6 +1143,13 @@ pub async fn list_initial_rows(
                 .map(node_to_row)
                 .collect())
         }
+        ResourceKind::NetworkPolicy => kinds_ext::list_networkpolicies(client, namespace).await,
+        ResourceKind::PersistentVolumeClaim => kinds_ext::list_pvcs(client, namespace).await,
+        ResourceKind::StorageClass => kinds_ext::list_storageclasses(client).await,
+        ResourceKind::Role => kinds_ext::list_roles(client, namespace).await,
+        ResourceKind::RoleBinding => kinds_ext::list_rolebindings(client, namespace).await,
+        ResourceKind::ClusterRole => kinds_ext::list_clusterroles(client).await,
+        ResourceKind::ClusterRoleBinding => kinds_ext::list_clusterrolebindings(client).await,
         ResourceKind::HelmRelease => helm::list_helm_releases(client, namespace).await,
         ResourceKind::Crd => Ok(Vec::new()),
     }

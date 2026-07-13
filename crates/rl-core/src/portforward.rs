@@ -38,7 +38,7 @@ pub fn spawn_kubectl_port_forward(
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| crate::error::Error::Message(err.to_string()))
 }

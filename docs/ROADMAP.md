@@ -6,7 +6,7 @@
 - [x] YAML describe, pod logs, delete, kubectl exec copy
 - [x] kube-rs watchers, CI pipeline
 
-## v0.2 (current)
+## v0.2 (done)
 
 - [x] Events panel for selected resources
 - [x] Container picker for multi-container pod logs
@@ -22,32 +22,35 @@
 - [x] Plugin registry skeleton
 - [x] TUI (`rl-tui` with ratatui)
 - [x] Documentation (README, ARCHITECTURE, DEVELOPMENT, ROADMAP)
+- [x] Detail panel search and selectable describe/events text
+- [x] 50/50 log panel split until user resizes
 
-## v0.3 (planned)
+## v0.3 (done)
 
-- [ ] Resource creation / apply YAML from editor
-- [ ] Replica scaling for deployments/statefulsets
-- [ ] Rollout restart
-- [ ] Log search and export
-- [ ] Multiple kubeconfig files / merge support
-- [ ] Dark/light theme toggle in egui
-- [ ] TUI: logs streaming, context switcher
+- [x] Apply YAML from editor (server-side apply via command palette)
+- [x] Replica scaling for Deployments and StatefulSets (context menu + dialog)
+- [x] Rollout restart for Deployments and StatefulSets
+- [x] Log export (copy to clipboard + save to file)
+- [x] Log search in GUI panel (filter, highlight, `/` focus, Enter navigation)
+- [x] Dark/light theme toggle (command palette, persisted in settings)
+- [x] Multi-kubeconfig merge UI (extra paths in cluster settings, reload contexts)
+- [x] TUI: logs streaming, context switcher
 
-## v0.4 (planned)
+## v0.4 (done)
 
-- [ ] Aggregated cluster dashboard (node pressure, pod counts)
-- [ ] Network policy viewer
-- [ ] PVC / StorageClass browser
-- [ ] RBAC viewer (roles, bindings)
-- [ ] Favorites / pinned resources
+- [x] Aggregated cluster dashboard (node pressure, cluster-wide pod counts on Overview)
+- [x] Network policy viewer (Network Policies in sidebar)
+- [x] PVC / StorageClass browser (Storage section)
+- [x] RBAC viewer (Roles, Role Bindings, Cluster Roles, Cluster Role Bindings)
+- [x] Favorites / pinned resources (sidebar + context menu, persisted)
 
-## v0.5 (planned)
+## v0.5 (done)
 
-- [ ] Plugin loading (WASM or native)
-- [ ] Built-in port-forward without kubectl subprocess
-- [ ] Embedded terminal (optional feature flag)
-- [ ] Multi-cluster tabs
-- [ ] Packaging: Flatpak, .deb, Homebrew formula
+- [x] Plugin loading via TOML manifests in `~/.config/rusticlens/plugins/`
+- [x] Built-in port-forward without kubectl subprocess (kube-rs WebSocket)
+- [x] Embedded terminal (optional `embedded-terminal` feature flag)
+- [x] Multi-cluster tabs (context tab bar + persisted open tabs)
+- [x] Packaging scaffolds: Flatpak, .deb, Homebrew formula
 
 ## Non-goals
 

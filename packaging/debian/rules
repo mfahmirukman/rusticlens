@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+
+export CARGO_HOME=$(CURDIR)/debian/cargo_home
+export CARGO_TARGET_DIR=$(CURDIR)/target
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release -p rl-app
+
+override_dh_auto_install:
+	install -Ddm755 debian/rusticlens/usr/bin
+	install -m755 target/release/rusticlens debian/rusticlens/usr/bin/rusticlens

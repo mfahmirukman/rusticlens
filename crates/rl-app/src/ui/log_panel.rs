@@ -12,6 +12,10 @@ pub struct LogPanelState {
     pub show_timestamps: bool,
     pub log_filter: String,
     pub follow_tail: bool,
+    pub filter_match_index: usize,
+    pub focus_filter: bool,
+    pub save_dialog_open: bool,
+    pub save_path: String,
 }
 
 impl Default for LogPanelState {
@@ -21,6 +25,10 @@ impl Default for LogPanelState {
             show_timestamps: false,
             log_filter: String::new(),
             follow_tail: true,
+            filter_match_index: 0,
+            focus_filter: false,
+            save_dialog_open: false,
+            save_path: String::new(),
         }
     }
 }
@@ -36,6 +44,8 @@ pub struct LogContentAction {
     pub container: Option<(u64, String)>,
     pub restart_stream: bool,
     pub load_older: Option<u64>,
+    pub export_logs: bool,
+    pub status_message: Option<String>,
 }
 
 pub fn show_tab_bar(
@@ -173,16 +183,127 @@ pub fn show_tab_content(
                 });
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("Save")
+                .on_hover_text("Save log lines to a file")
+                .clicked()
+            {
+                state.save_dialog_open = true;
+                if state.save_path.is_empty() {
+                    state.save_path = default_log_save_path(&tab.pod_name);
+                }
+            }
+            if ui
+                .small_button("Copy")
+                .on_hover_text("Copy all log lines to clipboard")
+                .clicked()
+            {
+                action.export_logs = true;
+            }
             ui.checkbox(&mut state.show_timestamps, "Show timestamps");
             ui.checkbox(&mut state.word_wrap, "Word wrap");
             ui.checkbox(&mut state.follow_tail, "Follow tail");
-            ui.add(
+            let filter_response = ui.add(
                 egui::TextEdit::singleline(&mut state.log_filter)
-                    .hint_text("Search logs...")
+                    .hint_text("Search logs (/)...")
                     .desired_width(140.0),
             );
+            if state.focus_filter {
+                filter_response.request_focus();
+                state.focus_filter = false;
+            }
+            if filter_response.changed() {
+                state.filter_match_index = 0;
+                tab.scroll_to_match_row = Some(0);
+            }
+            if filter_response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let match_count = tab.matching_indices(&state.log_filter.to_lowercase()).len();
+                if ui.input(|i| i.modifiers.shift) {
+                    prev_log_match(state, match_count);
+                } else {
+                    next_log_match(state, match_count);
+                }
+                tab.scroll_to_match_row = Some(state.filter_match_index);
+            }
         });
     });
+
+    if !state.log_filter.is_empty() {
+        let matches = tab.matching_indices(&state.log_filter.to_lowercase());
+        if state.filter_match_index >= matches.len() && !matches.is_empty() {
+            state.filter_match_index = matches.len() - 1;
+        }
+        ui.horizontal(|ui| {
+            if matches.is_empty() {
+                ui.label(
+                    egui::RichText::new("No matches")
+                        .small()
+                        .color(Theme::TEXT_MUTED),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} / {}",
+                        state.filter_match_index + 1,
+                        matches.len()
+                    ))
+                    .small()
+                    .color(Theme::TEXT_MUTED),
+                );
+                if ui.small_button("^").on_hover_text("Previous (Shift+Enter)").clicked() {
+                    prev_log_match(state, matches.len());
+                    tab.scroll_to_match_row = Some(state.filter_match_index);
+                }
+                if ui.small_button("v").on_hover_text("Next (Enter)").clicked() {
+                    next_log_match(state, matches.len());
+                    tab.scroll_to_match_row = Some(state.filter_match_index);
+                }
+            }
+            if ui.small_button("Clr").on_hover_text("Clear search").clicked() {
+                state.log_filter.clear();
+                state.filter_match_index = 0;
+            }
+        });
+    }
+
+    if state.save_dialog_open {
+        let mut close_save = false;
+        egui::Window::new("Save logs")
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label("File path:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.save_path)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        close_save = true;
+                    }
+                    if ui.button("Save").clicked() {
+                        let text = tab.lines().join("\n");
+                        match std::fs::write(&state.save_path, &text) {
+                            Ok(()) => {
+                                action.status_message = Some(format!(
+                                    "Saved {} line(s) to {}",
+                                    tab.line_count(),
+                                    state.save_path
+                                ));
+                                close_save = true;
+                            }
+                            Err(err) => {
+                                action.status_message =
+                                    Some(format!("Failed to save logs: {err}"));
+                            }
+                        }
+                    }
+                });
+            });
+        if close_save {
+            state.save_dialog_open = false;
+        }
+    }
 
     ui.add_space(2.0);
 
@@ -244,36 +365,64 @@ pub fn show_tab_content(
                         );
                     })
                 } else {
-                    // `show_rows` takes row height *without* item spacing; it adds spacing internally.
-                    scroll.show_rows(ui, LOG_LINE_HEIGHT, total_rows, |ui, row_range| {
+                    let current_line_idx = if filter.is_empty() {
+                        None
+                    } else {
+                        filtered.get(state.filter_match_index).copied()
+                    };
+                    let scroll_to_row = tab.scroll_to_match_row;
+                    let scroll_out = scroll.show_rows(ui, LOG_LINE_HEIGHT, total_rows, |ui, row_range| {
+                        let mut scroll_rect = None;
                         for row in row_range {
-                            let line = if filter.is_empty() {
-                                lines.get(row).map(String::as_str)
+                            let line_idx = if filter.is_empty() {
+                                row
                             } else {
-                                filtered
-                                    .get(row)
-                                    .and_then(|&idx| lines.get(idx))
-                                    .map(String::as_str)
+                                filtered.get(row).copied().unwrap_or(row)
                             };
+                            let line = lines.get(line_idx).map(String::as_str);
                             if let Some(line) = line {
                                 let shown = if state.show_timestamps {
-                                    line
+                                    rl_core::ops::strip_ansi_codes(line)
                                 } else {
-                                    rl_core::ops::strip_log_timestamp(line)
+                                    rl_core::ops::strip_ansi_codes(rl_core::ops::strip_log_timestamp(
+                                        line,
+                                    ))
                                 };
-                                let shown = rl_core::ops::strip_ansi_codes(shown);
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(shown)
-                                            .monospace()
-                                            .color(Theme::TEXT),
-                                    )
-                                    .wrap_mode(wrap_mode)
-                                    .selectable(true),
-                                );
+                                let is_current = current_line_idx == Some(line_idx);
+                                let response = ui.horizontal_wrapped(|ui| {
+                                    if filter.is_empty() {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&shown)
+                                                    .monospace()
+                                                    .color(Theme::TEXT),
+                                            )
+                                            .wrap_mode(wrap_mode)
+                                            .selectable(true),
+                                        );
+                                    } else {
+                                        render_log_line_with_highlights(
+                                            ui,
+                                            &shown,
+                                            &filter,
+                                            is_current,
+                                            wrap_mode,
+                                        );
+                                    }
+                                });
+                                if scroll_to_row == Some(row) {
+                                    scroll_rect = Some(response.response.rect);
+                                }
                             }
                         }
-                    })
+                        if let Some(rect) = scroll_rect {
+                            ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                        }
+                    });
+                    if scroll_to_row.is_some() {
+                        tab.scroll_to_match_row = None;
+                    }
+                    scroll_out
                 };
 
                 let mut offset_y = scroll_out.state.offset.y;
@@ -346,4 +495,111 @@ fn truncate_context_label(context: &str) -> String {
     } else {
         format!("{}...", &short[..9])
     }
+}
+
+fn next_log_match(state: &mut LogPanelState, count: usize) {
+    if count == 0 {
+        state.filter_match_index = 0;
+        return;
+    }
+    state.filter_match_index = (state.filter_match_index + 1) % count;
+}
+
+fn prev_log_match(state: &mut LogPanelState, count: usize) {
+    if count == 0 {
+        state.filter_match_index = 0;
+        return;
+    }
+    state.filter_match_index = if state.filter_match_index == 0 {
+        count - 1
+    } else {
+        state.filter_match_index - 1
+    };
+}
+
+fn default_log_save_path(pod_name: &str) -> String {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let safe_pod: String = pod_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    home.join(format!("rusticlens-{safe_pod}.log"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn render_log_line_with_highlights(
+    ui: &mut Ui,
+    line: &str,
+    query: &str,
+    is_current: bool,
+    wrap_mode: TextWrapMode,
+) {
+    if query.is_empty() {
+        ui.add(
+            egui::Label::new(egui::RichText::new(line).monospace().color(Theme::TEXT))
+                .wrap_mode(wrap_mode)
+                .selectable(true),
+        );
+        return;
+    }
+
+    let lower_line = line.to_lowercase();
+    let lower_query = query.to_lowercase();
+    let mut start = 0;
+    let mut found = false;
+    ui.horizontal_wrapped(|ui| {
+        while let Some(rel) = lower_line[start..].find(&lower_query) {
+            found = true;
+            let match_start = start + rel;
+            let match_end = match_start + query.len();
+            if match_start > start {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&line[start..match_start])
+                            .monospace()
+                            .color(Theme::TEXT),
+                    )
+                    .wrap_mode(wrap_mode)
+                    .selectable(true),
+                );
+            }
+            let bg = if is_current {
+                Theme::SEARCH_CURRENT
+            } else {
+                Theme::SEARCH_HIGHLIGHT
+            };
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&line[match_start..match_end.min(line.len())])
+                        .monospace()
+                        .color(Theme::TEXT)
+                        .background_color(bg),
+                )
+                .wrap_mode(wrap_mode)
+                .selectable(true),
+            );
+            start = match_end;
+        }
+        if start < line.len() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&line[start..])
+                        .monospace()
+                        .color(Theme::TEXT),
+                )
+                .wrap_mode(wrap_mode)
+                .selectable(true),
+            );
+        }
+        if !found {
+            ui.add(
+                egui::Label::new(egui::RichText::new(line).monospace().color(Theme::TEXT))
+                    .wrap_mode(wrap_mode)
+                    .selectable(true),
+            );
+        }
+    });
 }

@@ -1,10 +1,17 @@
+pub mod cluster_tabs;
 pub mod cronjob_menu;
 pub mod deployment_menu;
 pub mod detail_panel;
+#[cfg(feature = "embedded-terminal")]
+pub mod embedded_terminal;
+pub mod generic_menu;
 pub mod icon_rail;
 pub mod log_panel;
 pub mod log_tabs;
 pub mod pod_menu;
 pub mod resource_table;
+pub mod service_menu;
+pub mod settings_dialog;
 pub mod sidebar;
+pub mod statefulset_menu;
 pub mod theme;

@@ -17,6 +17,7 @@ pub struct IconRailAction {
     pub show_overview: bool,
     pub pin: Option<String>,
     pub unpin: Option<String>,
+    pub open_settings: bool,
 }
 
 pub fn rail_width() -> f32 {
@@ -145,6 +146,11 @@ pub fn show_context_menu(
                         );
                     }
                 });
+            ui.add_space(4.0);
+            if crate::ui::settings_dialog::settings_link(ui) {
+                action.open_settings = true;
+                state.context_menu_open = false;
+            }
         });
 
     if !open {

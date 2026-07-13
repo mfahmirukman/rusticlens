@@ -13,6 +13,8 @@ use crate::ui::theme::Theme;
 
 fn main() -> eframe::Result<()> {
     logging::init();
+    rl_core::ensure_plugins_dir();
+    rl_core::write_example_manifest_if_missing();
 
     let backend = backend::spawn_backend();
 

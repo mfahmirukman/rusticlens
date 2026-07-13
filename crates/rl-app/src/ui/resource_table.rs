@@ -2,11 +2,14 @@ use std::collections::HashSet;
 
 use egui::{Color32, Ui};
 use egui_extras::{Column, TableBuilder};
-use rl_core::{ContainerInfo, ResourceKind, ResourceRow};
+use rl_core::{ClusterDashboard, ContainerInfo, ResourceKind, ResourceRow};
 
+use crate::ui::generic_menu::show_generic_context_menu;
 use crate::ui::cronjob_menu::show_cronjob_context_menu;
 use crate::ui::deployment_menu::show_deployment_context_menu;
 use crate::ui::pod_menu::show_pod_context_menu;
+use crate::ui::service_menu::show_service_context_menu;
+use crate::ui::statefulset_menu::show_statefulset_context_menu;
 use crate::ui::theme::Theme;
 
 const ROW_HEIGHT: f32 = 24.0;
@@ -37,6 +40,11 @@ pub enum RowContextAction {
     Suspend,
     Resume,
     Restart,
+    Scale,
+    PinFavorite,
+    PortForward {
+        remote_port: u16,
+    },
 }
 
 pub struct ListHeader<'a> {
@@ -143,6 +151,7 @@ pub fn show(
             false,
             on_pod_menu_open,
         ),
+        ResourceKind::Service => show_service_table(ui, &filtered, state, &mut None, false),
         _ => show_default_table(ui, kind, &filtered, state, &mut None, false),
     }
 }
@@ -203,6 +212,85 @@ pub fn show_cronjob_jobs(ui: &mut Ui, cronjob_name: &str, job_rows: &[ResourceRo
                 row.col(|ui| status_cell(ui, &resource.status, false));
             });
         });
+}
+
+fn show_service_table(
+    ui: &mut Ui,
+    filtered: &[(usize, &ResourceRow)],
+    state: &mut TableState,
+    context_action: &mut Option<(usize, RowContextAction)>,
+    inline_menu: bool,
+) -> Option<(usize, RowContextAction)> {
+    let mut action = context_action.clone();
+    TableBuilder::new(ui)
+        .striped(true)
+        .resizable(true)
+        .sense(egui::Sense::click())
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::auto().at_least(28.0))
+        .column(Column::auto().at_least(200.0))
+        .column(Column::auto().at_least(120.0))
+        .column(Column::auto().at_least(90.0))
+        .column(Column::auto().at_least(110.0))
+        .column(Column::auto().at_least(100.0))
+        .column(Column::auto().at_least(140.0))
+        .column(Column::auto().at_least(50.0))
+        .column(Column::auto().at_least(70.0))
+        .column(Column::auto().at_least(36.0))
+        .header(26.0, |mut header| {
+            header.col(|ui| header_cell(ui, ""));
+            header.col(|ui| header_cell(ui, "Name"));
+            header.col(|ui| header_cell(ui, "Namespace"));
+            header.col(|ui| header_cell(ui, "Type"));
+            header.col(|ui| header_cell(ui, "Cluster IP"));
+            header.col(|ui| header_cell(ui, "External IP"));
+            header.col(|ui| header_cell(ui, "Ports"));
+            header.col(|ui| header_cell(ui, "Age"));
+            header.col(|ui| header_cell(ui, "Status"));
+            header.col(|ui| header_cell(ui, ""));
+        })
+        .body(|body| {
+            body.rows(ROW_HEIGHT, filtered.len(), |mut row| {
+                let row_index = row.index();
+                let (original_idx, resource) = filtered[row_index];
+                let selected = state.selected == Some(original_idx);
+                row.set_selected(selected);
+
+                row.col(|ui| checkbox_cell(ui, original_idx, state));
+                row.col(|ui| {
+                    name_cell(ui, &resource.name, selected, || {
+                        state.selected = Some(original_idx);
+                    });
+                });
+                row.col(|ui| {
+                    text_cell(ui, &resource.namespace, selected, Some(Theme::LINK));
+                });
+                row.col(|ui| text_cell(ui, &resource.service_type, selected, None));
+                row.col(|ui| text_cell(ui, &resource.cluster_ip, selected, None));
+                row.col(|ui| text_cell(ui, &resource.external_ip, selected, None));
+                row.col(|ui| text_cell(ui, &resource.ports, selected, None));
+                row.col(|ui| text_cell(ui, &resource.age, selected, None));
+                row.col(|ui| status_cell(ui, &resource.status, selected));
+                row.col(|ui| {
+                    let ports = resource.service_ports.clone();
+                    action_menu_cell(ui, original_idx, selected, &mut action, |ui, idx, act| {
+                        show_service_context_menu(ui, idx, &ports, act);
+                    });
+                });
+
+                let row_resp = row.response();
+                handle_row_interaction(&row_resp, original_idx, state, &mut action);
+                let ports = resource.service_ports.clone();
+                row_resp.context_menu(|ui| {
+                    show_service_context_menu(ui, original_idx, &ports, &mut action);
+                });
+            });
+        });
+    if inline_menu {
+        action
+    } else {
+        std::mem::take(&mut action)
+    }
 }
 
 fn show_deployment_table(
@@ -530,8 +618,22 @@ fn show_default_table(
                 row.col(|ui| text_cell(ui, &resource.age, selected, None));
                 row.col(|ui| status_cell(ui, &resource.status, selected));
 
-                if row.response().clicked() {
+                let row_resp = row.response();
+                if row_resp.clicked() {
                     state.selected = Some(original_idx);
+                }
+                if kind == ResourceKind::StatefulSet {
+                    row_resp.context_menu(|ui| {
+                        show_statefulset_context_menu(ui, original_idx, &mut action);
+                    });
+                } else if kind == ResourceKind::Deployment {
+                    row_resp.context_menu(|ui| {
+                        show_deployment_context_menu(ui, original_idx, &mut action);
+                    });
+                } else if kind != ResourceKind::Pod && kind != ResourceKind::CronJob {
+                    row_resp.context_menu(|ui| {
+                        show_generic_context_menu(ui, original_idx, &mut action, true);
+                    });
                 }
             });
         });
@@ -638,6 +740,7 @@ pub fn show_overview(
     ui: &mut Ui,
     context: &str,
     namespace: &str,
+    dashboard: Option<&ClusterDashboard>,
     pod_rows: &[ResourceRow],
     deployment_count: usize,
     job_count: usize,
@@ -652,19 +755,91 @@ pub fn show_overview(
     );
     ui.add_space(8.0);
     ui.label(format!("Context: {context}"));
-    ui.label(format!("Namespace: {namespace}"));
+    ui.label(format!("Namespace: {namespace} (workload counts below are namespace-scoped)"));
     ui.add_space(12.0);
     ui.horizontal(|ui| {
-        stat_card(ui, "Pods", pod_rows.len());
-        stat_card(ui, "Deployments", deployment_count);
-        stat_card(ui, "Jobs", job_count);
-        stat_card(ui, "Cron Jobs", cronjob_count);
+        stat_card(ui, "Pods (ns)", pod_rows.len());
+        stat_card(ui, "Deployments (ns)", deployment_count);
+        stat_card(ui, "Jobs (ns)", job_count);
+        stat_card(ui, "Cron Jobs (ns)", cronjob_count);
         let running = pod_rows
             .iter()
             .filter(|r| r.status.eq_ignore_ascii_case("running"))
             .count();
-        stat_card(ui, "Running pods", running);
+        stat_card(ui, "Running (ns)", running);
     });
+
+    if let Some(dash) = dashboard {
+        ui.add_space(16.0);
+        ui.label(
+            egui::RichText::new("Cluster-wide")
+                .size(16.0)
+                .strong()
+                .color(Theme::TEXT),
+        );
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            stat_card(ui, "All pods", dash.total_pods);
+            stat_card(ui, "Running", dash.running_pods);
+            stat_card(ui, "Pending", dash.pending_pods);
+            stat_card(ui, "Failed", dash.failed_pods);
+            stat_card(ui, "Nodes", dash.nodes.len());
+        });
+
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new("Node pressure")
+                .strong()
+                .color(Theme::ACCENT),
+        );
+        ui.add_space(4.0);
+
+        if dash.nodes.is_empty() {
+            ui.label(
+                egui::RichText::new("No nodes found.")
+                    .color(Theme::TEXT_MUTED),
+            );
+        } else {
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(160.0))
+                .column(Column::auto().at_least(60.0))
+                .column(Column::auto().at_least(50.0))
+                .column(Column::auto().at_least(70.0))
+                .column(Column::auto().at_least(90.0))
+                .column(Column::auto().at_least(90.0))
+                .column(Column::auto().at_least(90.0))
+                .header(26.0, |mut header| {
+                    header.col(|ui| header_cell(ui, "Node"));
+                    header.col(|ui| header_cell(ui, "Ready"));
+                    header.col(|ui| header_cell(ui, "Pods"));
+                    header.col(|ui| header_cell(ui, "CPU alloc"));
+                    header.col(|ui| header_cell(ui, "Mem alloc"));
+                    header.col(|ui| header_cell(ui, "CPU cap"));
+                    header.col(|ui| header_cell(ui, "Mem cap"));
+                })
+                .body(|body| {
+                    body.rows(ROW_HEIGHT, dash.nodes.len(), |mut row| {
+                        let node = &dash.nodes[row.index()];
+                        row.col(|ui| text_cell(ui, &node.name, false, Some(Theme::LINK)));
+                        row.col(|ui| status_cell(ui, &node.ready, false));
+                        row.col(|ui| text_cell(ui, &node.pods.to_string(), false, None));
+                        row.col(|ui| text_cell(ui, &node.cpu_allocatable, false, None));
+                        row.col(|ui| text_cell(ui, &node.memory_allocatable, false, None));
+                        row.col(|ui| text_cell(ui, &node.cpu_capacity, false, None));
+                        row.col(|ui| text_cell(ui, &node.memory_capacity, false, None));
+                    });
+                });
+        }
+    } else {
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new("Loading cluster metrics...")
+                .color(Theme::TEXT_MUTED),
+        );
+    }
 }
 
 fn stat_card(ui: &mut Ui, label: &str, value: usize) {

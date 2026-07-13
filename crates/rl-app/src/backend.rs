@@ -51,6 +51,22 @@ pub enum BackendCommand {
     RestartDeployment {
         name: String,
     },
+    RestartStatefulSet {
+        name: String,
+    },
+    ScaleDeployment {
+        name: String,
+        replicas: i32,
+    },
+    ScaleStatefulSet {
+        name: String,
+        replicas: i32,
+    },
+    ApplyYaml {
+        yaml: String,
+    },
+    Reconnect,
+    FetchDashboard,
     StartLogs {
         tab_id: u64,
         pod_name: String,
@@ -63,6 +79,26 @@ pub enum BackendCommand {
     PersistSettings {
         kind: ResourceKind,
         container: Option<String>,
+    },
+    StartPortForward {
+        kind: ResourceKind,
+        name: String,
+        local_port: u16,
+        remote_port: u16,
+    },
+    StopPortForward {
+        id: u64,
+    },
+    #[cfg(feature = "embedded-terminal")]
+    StartEmbeddedExec {
+        pod_name: String,
+        container: Option<String>,
+    },
+    #[cfg(feature = "embedded-terminal")]
+    StopEmbeddedExec,
+    #[cfg(feature = "embedded-terminal")]
+    EmbeddedExecInput {
+        bytes: Vec<u8>,
     },
     Shutdown,
 }
@@ -124,6 +160,32 @@ pub enum BackendEvent {
     DeploymentRestarted {
         name: String,
     },
+    StatefulSetRestarted {
+        name: String,
+    },
+    WorkloadScaled {
+        kind: ResourceKind,
+        name: String,
+        replicas: i32,
+    },
+    YamlApplied {
+        resources: Vec<String>,
+    },
+    DashboardLoaded {
+        dashboard: rl_core::ClusterDashboard,
+    },
+    PortForwardStarted {
+        info: rl_core::PortForwardInfo,
+    },
+    PortForwardStopped {
+        id: u64,
+    },
+    #[cfg(feature = "embedded-terminal")]
+    EmbeddedExecOutput {
+        line: String,
+    },
+    #[cfg(feature = "embedded-terminal")]
+    EmbeddedExecStopped,
     Error(String),
 }
 
@@ -177,6 +239,29 @@ struct ActiveLogPoll {
     last_poll: std::time::Instant,
 }
 
+enum PortForwardSession {
+    Native(rl_core::PortForwardHandle),
+    Kubectl(std::process::Child),
+}
+
+impl PortForwardSession {
+    fn stop(self) {
+        match self {
+            PortForwardSession::Native(handle) => handle.stop(),
+            PortForwardSession::Kubectl(mut child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "embedded-terminal")]
+struct EmbeddedExecSession {
+    cancel_tx: tokio::sync::oneshot::Sender<()>,
+    input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
 async fn run_backend_loop(
     cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<BackendCommand>,
     event_tx: &std::sync::mpsc::Sender<BackendEvent>,
@@ -186,6 +271,10 @@ async fn run_backend_loop(
     let mut manager: Option<ClusterManager> = None;
     let mut active_kind = ResourceKind::Pod;
     let mut log_polls: HashMap<u64, ActiveLogPoll> = HashMap::new();
+    let mut port_forwards: HashMap<u64, PortForwardSession> = HashMap::new();
+    let mut next_port_forward_id: u64 = 1;
+    #[cfg(feature = "embedded-terminal")]
+    let mut embedded_exec: Option<EmbeddedExecSession> = None;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
     let mut list_tick = tokio::time::interval(std::time::Duration::from_secs(3));
     let log_poll_interval = std::time::Duration::from_secs(rl_core::ops::LOG_POLL_INTERVAL_SECS);
@@ -199,6 +288,10 @@ async fn run_backend_loop(
                     &mut manager,
                     &mut active_kind,
                     &mut log_polls,
+                    &mut port_forwards,
+                    &mut next_port_forward_id,
+                    #[cfg(feature = "embedded-terminal")]
+                    &mut embedded_exec,
                     event_tx,
                 ).await {
                     break;
@@ -218,7 +311,13 @@ async fn run_backend_loop(
         }
     }
 
-    for (_, _) in log_polls.drain() {}
+    for (_, session) in port_forwards.drain() {
+        session.stop();
+    }
+    #[cfg(feature = "embedded-terminal")]
+    if let Some(session) = embedded_exec.take() {
+        let _ = session.cancel_tx.send(());
+    }
 }
 
 async fn handle_command(
@@ -226,12 +325,25 @@ async fn handle_command(
     manager: &mut Option<rl_core::ClusterManager>,
     active_kind: &mut ResourceKind,
     log_polls: &mut HashMap<u64, ActiveLogPoll>,
+    port_forwards: &mut HashMap<u64, PortForwardSession>,
+    next_port_forward_id: &mut u64,
+    #[cfg(feature = "embedded-terminal")]
+    embedded_exec: &mut Option<EmbeddedExecSession>,
     event_tx: &std::sync::mpsc::Sender<BackendEvent>,
 ) -> bool {
-    use rl_core::{format_events_text, format_metrics_text, ClusterManager};
+    use rl_core::{format_events_text, format_metrics_text, load_settings, ClusterManager};
 
     match cmd {
-        BackendCommand::Shutdown => return false,
+        BackendCommand::Shutdown => {
+            for (_, handle) in port_forwards.drain() {
+                handle.stop();
+            }
+            #[cfg(feature = "embedded-terminal")]
+            if let Some(session) = embedded_exec.take() {
+                let _ = session.cancel_tx.send(());
+            }
+            return false;
+        }
         BackendCommand::ConnectDefault => {
             let _ = event_tx.send(BackendEvent::Connecting);
             match ClusterManager::connect_default(*active_kind).await {
@@ -495,6 +607,106 @@ async fn handle_command(
                 }
             }
         }
+        BackendCommand::RestartStatefulSet { name } => {
+            if let Some(mgr) = manager.as_ref() {
+                match mgr.restart_statefulset(&name).await {
+                    Ok(()) => {
+                        let _ = event_tx.send(BackendEvent::StatefulSetRestarted { name });
+                    }
+                    Err(err) => {
+                        let _ = event_tx.send(BackendEvent::Error(err.user_message()));
+                    }
+                }
+            }
+        }
+        BackendCommand::ScaleDeployment { name, replicas } => {
+            if let Some(mgr) = manager.as_ref() {
+                match mgr.scale_deployment(&name, replicas).await {
+                    Ok(()) => {
+                        let _ = event_tx.send(BackendEvent::WorkloadScaled {
+                            kind: ResourceKind::Deployment,
+                            name,
+                            replicas,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = event_tx.send(BackendEvent::Error(err.user_message()));
+                    }
+                }
+            }
+        }
+        BackendCommand::ScaleStatefulSet { name, replicas } => {
+            if let Some(mgr) = manager.as_ref() {
+                match mgr.scale_statefulset(&name, replicas).await {
+                    Ok(()) => {
+                        let _ = event_tx.send(BackendEvent::WorkloadScaled {
+                            kind: ResourceKind::StatefulSet,
+                            name,
+                            replicas,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = event_tx.send(BackendEvent::Error(err.user_message()));
+                    }
+                }
+            }
+        }
+        BackendCommand::ApplyYaml { yaml } => {
+            if let Some(mgr) = manager.as_ref() {
+                match mgr.apply_yaml(&yaml).await {
+                    Ok(resources) => {
+                        let _ = event_tx.send(BackendEvent::YamlApplied { resources });
+                    }
+                    Err(err) => {
+                        let _ = event_tx.send(BackendEvent::Error(err.user_message()));
+                    }
+                }
+            }
+        }
+        BackendCommand::Reconnect => {
+            let kind = *active_kind;
+            let context = manager
+                .as_ref()
+                .map(|m| m.context().to_string())
+                .or_else(|| rl_core::config::current_context_name().ok().flatten());
+            let _ = event_tx.send(BackendEvent::Connecting);
+            let result = match context {
+                Some(ctx) => ClusterManager::connect(&ctx, kind).await,
+                None => ClusterManager::connect_default(kind).await,
+            };
+            match result {
+                Ok(mgr) => {
+                    let contexts = ClusterManager::list_contexts().await.unwrap_or_default();
+                    let namespaces = mgr.list_namespaces().await.unwrap_or_default();
+                    let crd_targets = mgr.crd_targets().to_vec();
+                    push_all_snapshots(&mgr, event_tx);
+                    refresh_on_demand_list(&mgr, kind, event_tx).await;
+                    let _ = event_tx.send(BackendEvent::Connected {
+                        context: mgr.context().to_string(),
+                        namespace: mgr.namespace().to_string(),
+                        contexts,
+                        namespaces,
+                        crd_targets,
+                    });
+                    *manager = Some(mgr);
+                }
+                Err(err) => {
+                    let _ = event_tx.send(BackendEvent::Error(err.user_message()));
+                }
+            }
+        }
+        BackendCommand::FetchDashboard => {
+            if let Some(mgr) = manager.as_ref() {
+                match mgr.fetch_dashboard().await {
+                    Ok(dashboard) => {
+                        let _ = event_tx.send(BackendEvent::DashboardLoaded { dashboard });
+                    }
+                    Err(err) => {
+                        let _ = event_tx.send(BackendEvent::Error(err.user_message()));
+                    }
+                }
+            }
+        }
         BackendCommand::StartLogs {
             tab_id,
             pod_name,
@@ -516,9 +728,149 @@ async fn handle_command(
                 mgr.persist_settings(kind, container.as_deref());
             }
         }
+        BackendCommand::StartPortForward {
+            kind,
+            name,
+            local_port,
+            remote_port,
+        } => {
+            let settings = load_settings();
+            if let Some(mgr) = manager.as_ref() {
+                let id = *next_port_forward_id;
+                *next_port_forward_id += 1;
+                if settings.use_native_port_forward && kind != ResourceKind::Service {
+                    match rl_core::start_port_forward(
+                        mgr.client().clone(),
+                        mgr.namespace(),
+                        kind,
+                        &name,
+                        local_port,
+                        remote_port,
+                        id,
+                    )
+                    .await
+                    {
+                        Ok(handle) => {
+                            let info = handle.info.clone();
+                            port_forwards.insert(id, PortForwardSession::Native(handle));
+                            let _ = event_tx.send(BackendEvent::PortForwardStarted { info });
+                        }
+                        Err(err) => {
+                            tracing::info!(
+                                "native port-forward unavailable, using kubectl: {}",
+                                err.user_message()
+                            );
+                            try_kubectl_port_forward(
+                                mgr, kind, &name, local_port, remote_port, id, port_forwards,
+                                event_tx,
+                            );
+                        }
+                    }
+                } else {
+                    try_kubectl_port_forward(
+                        mgr, kind, &name, local_port, remote_port, id, port_forwards, event_tx,
+                    );
+                }
+            }
+        }
+        BackendCommand::StopPortForward { id } => {
+            if let Some(session) = port_forwards.remove(&id) {
+                session.stop();
+            }
+            let _ = event_tx.send(BackendEvent::PortForwardStopped { id });
+        }
+        #[cfg(feature = "embedded-terminal")]
+        BackendCommand::StartEmbeddedExec { pod_name, container } => {
+            if let Some(mgr) = manager.as_ref() {
+                if let Some(session) = embedded_exec.take() {
+                    let _ = session.cancel_tx.send(());
+                }
+                let (output_tx, mut output_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<String>();
+                let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let client = mgr.client().clone();
+                let namespace = mgr.namespace().to_string();
+                let event_tx_out = event_tx.clone();
+                let event_tx_exec = event_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(line) = output_rx.recv().await {
+                        let _ = event_tx_out.send(BackendEvent::EmbeddedExecOutput { line });
+                    }
+                });
+                tokio::spawn(async move {
+                    let result = rl_core::run_pod_exec(
+                        client,
+                        &namespace,
+                        &pod_name,
+                        container.as_deref(),
+                        output_tx,
+                        input_rx,
+                        cancel_rx,
+                    )
+                    .await;
+                    if let Err(err) = result {
+                        let _ = event_tx_exec.send(BackendEvent::EmbeddedExecOutput {
+                            line: format!("[error] {}", err.user_message()),
+                        });
+                    }
+                    let _ = event_tx_exec.send(BackendEvent::EmbeddedExecStopped);
+                });
+                *embedded_exec = Some(EmbeddedExecSession {
+                    cancel_tx,
+                    input_tx,
+                });
+            }
+        }
+        #[cfg(feature = "embedded-terminal")]
+        BackendCommand::StopEmbeddedExec => {
+            if let Some(session) = embedded_exec.take() {
+                let _ = session.cancel_tx.send(());
+            }
+            let _ = event_tx.send(BackendEvent::EmbeddedExecStopped);
+        }
+        #[cfg(feature = "embedded-terminal")]
+        BackendCommand::EmbeddedExecInput { bytes } => {
+            if let Some(session) = embedded_exec.as_ref() {
+                let _ = session.input_tx.send(bytes);
+            }
+        }
     }
 
     true
+}
+
+fn try_kubectl_port_forward(
+    mgr: &rl_core::ClusterManager,
+    kind: ResourceKind,
+    name: &str,
+    local_port: u16,
+    remote_port: u16,
+    id: u64,
+    port_forwards: &mut HashMap<u64, PortForwardSession>,
+    event_tx: &std::sync::mpsc::Sender<BackendEvent>,
+) {
+    match rl_core::spawn_kubectl_port_forward(
+        mgr.namespace(),
+        kind,
+        name,
+        local_port,
+        remote_port,
+    ) {
+        Ok(child) => {
+            let info = rl_core::PortForwardInfo {
+                id,
+                label: format!("{}/{}:{remote_port}", kind.api_kind(), name),
+                local_port,
+                remote_port,
+            };
+            port_forwards.insert(id, PortForwardSession::Kubectl(child));
+            let _ = event_tx.send(BackendEvent::PortForwardStarted { info });
+        }
+        Err(err) => {
+            let _ = event_tx.send(BackendEvent::Error(err.user_message()));
+        }
+    }
 }
 
 async fn start_log_poll(

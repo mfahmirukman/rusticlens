@@ -148,6 +148,11 @@ pub struct LogView {
     pub pod_name: String,
     pub container: Option<String>,
     pub lines: Vec<String>,
+    /// Cached soft-wrapped display rows (invalidated when width/lines change).
+    wrapped_cache: Vec<String>,
+    /// Source line index for each entry in `wrapped_cache`.
+    wrapped_sources: Vec<usize>,
+    wrap_cache_width: usize,
     pub scroll: usize,
     pub follow: bool,
     pub visible_lines: usize,
@@ -156,6 +161,7 @@ pub struct LogView {
     pub search_query: String,
     pub match_rows: Vec<usize>,
     pub match_cursor: usize,
+    matches_dirty: bool,
     pub error: Option<String>,
     /// Source line index to highlight after yank (all wrapped segments).
     pub highlight_source: Option<usize>,
@@ -271,7 +277,13 @@ pub struct TuiApp {
 #[derive(Debug, Clone)]
 pub enum ExternalRequest {
     ApplyYaml,
-    EditYaml { name: String },
+    EditYaml {
+        name: String,
+    },
+    ExecShell {
+        name: String,
+        container: Option<String>,
+    },
 }
 
 impl TuiApp {
@@ -421,17 +433,33 @@ impl TuiApp {
             log.stream_task.abort();
         }
         self.log_layout = None;
+        if self.status_message.contains("Polling service pod logs") {
+            self.status_message.clear();
+        }
     }
 
     pub fn poll_log_lines(&mut self) {
         let Some(log) = self.log_view.as_mut() else {
             return;
         };
-        while let Ok(line) = log.line_rx.try_recv() {
-            log.push_line(line);
+        // Cap intake per tick so a multi-pod flood cannot freeze the UI loop.
+        // Wrap updates are incremental, so a larger batch is fine.
+        const MAX_LINES_PER_TICK: usize = 1_024;
+        let mut received = 0usize;
+        while received < MAX_LINES_PER_TICK {
+            match log.line_rx.try_recv() {
+                Ok(line) => {
+                    log.push_line(line);
+                    received += 1;
+                }
+                Err(_) => break,
+            }
         }
         while let Ok(err) = log.err_rx.try_recv() {
             log.error = Some(err);
+        }
+        if received > 0 {
+            log.after_batch_ingest();
         }
     }
 
@@ -1691,17 +1719,35 @@ impl TuiApp {
             return;
         };
 
-        match manager.pods_for_service(&service_name).await {
-            Ok(pods) if pods.is_empty() => {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            manager.pods_for_service(&service_name),
+        )
+        .await
+        {
+            Ok(Ok(pods)) if pods.is_empty() => {
                 self.error_message = Some(format!(
                     "No pods match service `{service_name}` (missing or empty selector?)."
                 ));
             }
-            Ok(pods) => {
+            Ok(Ok(mut pods)) => {
+                const MAX_SERVICE_LOG_PODS: usize = 40;
+                if pods.len() > MAX_SERVICE_LOG_PODS {
+                    let dropped = pods.len() - MAX_SERVICE_LOG_PODS;
+                    pods.truncate(MAX_SERVICE_LOG_PODS);
+                    self.status_message = format!(
+                        "Service has many pods; streaming first {MAX_SERVICE_LOG_PODS} (+{dropped} skipped)."
+                    );
+                }
                 let title = format!("svc/{service_name} ({} pods)", pods.len());
                 self.open_multi_pod_log_view(title, pods).await;
             }
-            Err(err) => self.error_message = Some(err.user_message()),
+            Ok(Err(err)) => self.error_message = Some(err.user_message()),
+            Err(_) => {
+                self.error_message = Some(format!(
+                    "Timed out listing pods for service `{service_name}`."
+                ));
+            }
         }
     }
 
@@ -1711,7 +1757,7 @@ impl TuiApp {
             return;
         };
 
-        let (line_tx, line_rx) = mpsc::channel(512);
+        let (line_tx, line_rx) = mpsc::channel(8_192);
         let (err_tx, err_rx) = mpsc::channel(8);
         let stream_task =
             manager.spawn_log_stream(pod_name.clone(), container.clone(), true, line_tx, err_tx);
@@ -1720,6 +1766,9 @@ impl TuiApp {
             pod_name,
             container,
             lines: Vec::new(),
+            wrapped_cache: Vec::new(),
+            wrapped_sources: Vec::new(),
+            wrap_cache_width: 0,
             scroll: 0,
             follow: true,
             visible_lines: 1,
@@ -1728,6 +1777,7 @@ impl TuiApp {
             search_query: String::new(),
             match_rows: Vec::new(),
             match_cursor: 0,
+            matches_dirty: false,
             error: None,
             highlight_source: None,
             line_rx,
@@ -1743,7 +1793,7 @@ impl TuiApp {
             return;
         };
 
-        let (line_tx, line_rx) = mpsc::channel(1024);
+        let (line_tx, line_rx) = mpsc::channel(8_192);
         let (err_tx, err_rx) = mpsc::channel(8);
         let stream_task = manager.spawn_multi_pod_log_stream(pod_names, true, line_tx, err_tx);
 
@@ -1751,6 +1801,9 @@ impl TuiApp {
             pod_name: title,
             container: None,
             lines: Vec::new(),
+            wrapped_cache: Vec::new(),
+            wrapped_sources: Vec::new(),
+            wrap_cache_width: 0,
             scroll: 0,
             follow: true,
             visible_lines: 1,
@@ -1759,6 +1812,7 @@ impl TuiApp {
             search_query: String::new(),
             match_rows: Vec::new(),
             match_cursor: 0,
+            matches_dirty: false,
             error: None,
             highlight_source: None,
             line_rx,
@@ -1766,7 +1820,7 @@ impl TuiApp {
             stream_task,
         });
         self.error_message = None;
-        self.status_message = "Streaming logs from all service pods…".into();
+        self.status_message = "Polling service pod logs — Esc/q to close".into();
     }
 
     pub fn log_scroll(&mut self, delta: i32) {
@@ -1810,8 +1864,15 @@ impl TuiApp {
             return;
         };
         log.visible_lines = visible_lines.max(1);
-        log.wrap_width = wrap_width.max(1);
-        log.recompute_matches();
+        let width = wrap_width.max(1);
+        if log.wrap_width != width {
+            log.wrap_width = width;
+            log.invalidate_wrap_cache();
+        }
+        log.ensure_wrap_cache();
+        if log.matches_dirty {
+            log.recompute_matches();
+        }
         if log.follow {
             log.scroll_to_bottom();
         } else {
@@ -1831,17 +1892,6 @@ impl TuiApp {
         log.follow = false;
     }
 
-    pub fn exit_log_search(&mut self) {
-        let Some(log) = self.log_view.as_mut() else {
-            return;
-        };
-        log.search_mode = false;
-        log.recompute_matches();
-        if !log.search_query.is_empty() {
-            log.scroll_to_current_match();
-        }
-    }
-
     pub fn clear_log_search(&mut self) {
         let Some(log) = self.log_view.as_mut() else {
             return;
@@ -1850,6 +1900,20 @@ impl TuiApp {
         log.match_rows.clear();
         log.match_cursor = 0;
         log.search_mode = false;
+        log.matches_dirty = false;
+    }
+
+    pub fn exit_log_search(&mut self) {
+        let Some(log) = self.log_view.as_mut() else {
+            return;
+        };
+        log.search_mode = false;
+        if log.matches_dirty {
+            log.recompute_matches();
+        }
+        if !log.search_query.is_empty() {
+            log.scroll_to_current_match();
+        }
     }
 
     pub fn log_search_push_char(&mut self, ch: char) {
@@ -1857,6 +1921,7 @@ impl TuiApp {
             return;
         };
         log.search_query.push(ch);
+        log.matches_dirty = true;
         log.recompute_matches();
         log.scroll_to_current_match();
     }
@@ -1866,6 +1931,7 @@ impl TuiApp {
             return;
         };
         log.search_query.pop();
+        log.matches_dirty = true;
         log.recompute_matches();
         log.scroll_to_current_match();
     }
@@ -1942,38 +2008,66 @@ impl TuiApp {
 }
 
 impl LogView {
-    pub fn wrapped_lines(&self) -> Vec<String> {
-        wrap_log_lines(&self.lines, self.wrap_width)
+    pub fn wrapped_lines(&self) -> &[String] {
+        &self.wrapped_cache
     }
 
     pub fn source_line_for_wrapped_row(&self, wrapped_row: usize) -> usize {
-        let width = self.wrap_width.max(1);
-        let mut idx = 0;
-        for (source_i, line) in self.lines.iter().enumerate() {
-            let segs = wrapped_segment_count(line, width);
-            if wrapped_row < idx + segs {
-                return source_i;
-            }
-            idx += segs;
+        self.wrapped_sources
+            .get(wrapped_row)
+            .copied()
+            .unwrap_or_else(|| self.lines.len().saturating_sub(1))
+    }
+
+    fn invalidate_wrap_cache(&mut self) {
+        self.wrap_cache_width = 0;
+        self.wrapped_cache.clear();
+        self.wrapped_sources.clear();
+        if !self.search_query.is_empty() {
+            self.matches_dirty = true;
         }
-        self.lines.len().saturating_sub(1)
+    }
+
+    fn ensure_wrap_cache(&mut self) {
+        let width = self.wrap_width.max(1);
+        if self.wrap_cache_width == width
+            && self.wrapped_sources.len() == self.wrapped_cache.len()
+            && cache_covers_lines(&self.wrapped_sources, self.lines.len())
+        {
+            return;
+        }
+        self.rebuild_wrap_cache();
+    }
+
+    fn rebuild_wrap_cache(&mut self) {
+        let width = self.wrap_width.max(1);
+        let (wrapped, sources) = wrap_log_lines_with_sources(&self.lines, width);
+        self.wrapped_cache = wrapped;
+        self.wrapped_sources = sources;
+        self.wrap_cache_width = width;
+        if !self.search_query.is_empty() {
+            self.matches_dirty = true;
+        }
     }
 
     fn max_scroll(&self) -> usize {
-        self.wrapped_lines()
+        self.wrapped_cache
             .len()
-            .saturating_sub(self.visible_lines)
+            .saturating_sub(self.visible_lines.max(1))
     }
 
     fn scroll_to_bottom(&mut self) {
+        self.ensure_wrap_cache();
         self.scroll = self.max_scroll();
     }
 
     fn recompute_matches(&mut self) {
-        self.match_rows = find_log_match_rows(&self.wrapped_lines(), &self.search_query);
+        self.ensure_wrap_cache();
+        self.match_rows = find_log_match_rows(&self.wrapped_cache, &self.search_query);
         if self.match_cursor >= self.match_rows.len() {
             self.match_cursor = 0;
         }
+        self.matches_dirty = false;
     }
 
     fn scroll_to_current_match(&mut self) {
@@ -1981,6 +2075,7 @@ impl LogView {
             return;
         };
         self.follow = false;
+        self.ensure_wrap_cache();
         if row < self.scroll {
             self.scroll = row;
         } else if row >= self.scroll.saturating_add(self.visible_lines) {
@@ -1993,44 +2088,90 @@ impl LogView {
         self.match_rows.get(self.match_cursor).copied()
     }
 
+    /// Append one source line; wrap segments are added incrementally when cache is warm.
     fn push_line(&mut self, line: String) {
+        let source_idx = self.lines.len();
+        let width = self.wrap_width.max(1);
+        if self.wrap_cache_width == width {
+            append_wrapped_line(
+                &mut self.wrapped_cache,
+                &mut self.wrapped_sources,
+                &line,
+                source_idx,
+                width,
+            );
+        } else {
+            self.invalidate_wrap_cache();
+        }
         self.lines.push(line);
+        if !self.search_query.is_empty() {
+            self.matches_dirty = true;
+        }
         if self.lines.len() > LOG_BUFFER_MAX_LINES {
             let excess = self.lines.len() - LOG_BUFFER_MAX_LINES;
             self.lines.drain(0..excess);
-            self.scroll = self.scroll.min(self.max_scroll());
+            self.invalidate_wrap_cache();
+            if let Some(src) = self.highlight_source.as_mut() {
+                *src = src.saturating_sub(excess);
+            }
+        }
+    }
+
+    fn after_batch_ingest(&mut self) {
+        self.ensure_wrap_cache();
+        if self.matches_dirty {
+            // Defer full rematch until paint if the query is active; cheap path when empty.
+            if self.search_query.is_empty() {
+                self.matches_dirty = false;
+                self.match_rows.clear();
+            }
         }
         if self.follow {
-            self.scroll_to_bottom();
+            self.scroll = self.max_scroll();
+        } else {
+            self.scroll = self.scroll.min(self.max_scroll());
         }
     }
 }
 
-fn wrap_log_lines(lines: &[String], width: usize) -> Vec<String> {
+fn cache_covers_lines(sources: &[usize], line_count: usize) -> bool {
+    match sources.last() {
+        None => line_count == 0,
+        Some(&last) => last + 1 == line_count,
+    }
+}
+
+fn append_wrapped_line(
+    wrapped: &mut Vec<String>,
+    sources: &mut Vec<usize>,
+    line: &str,
+    source_idx: usize,
+    width: usize,
+) {
     let width = width.max(1);
-    let mut out = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let chars: Vec<char> = line.chars().collect();
-        let mut start = 0;
-        while start < chars.len() {
-            let end = (start + width).min(chars.len());
-            out.push(chars[start..end].iter().collect());
-            start = end;
-        }
+    if line.is_empty() {
+        wrapped.push(String::new());
+        sources.push(source_idx);
+        return;
     }
-    out
+    let chars: Vec<char> = line.chars().collect();
+    let mut start = 0;
+    while start < chars.len() {
+        let end = (start + width).min(chars.len());
+        wrapped.push(chars[start..end].iter().collect());
+        sources.push(source_idx);
+        start = end;
+    }
 }
 
-fn wrapped_segment_count(line: &str, width: usize) -> usize {
-    if line.is_empty() {
-        1
-    } else {
-        line.chars().count().div_ceil(width)
+fn wrap_log_lines_with_sources(lines: &[String], width: usize) -> (Vec<String>, Vec<usize>) {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+    let mut sources = Vec::new();
+    for (source_idx, line) in lines.iter().enumerate() {
+        append_wrapped_line(&mut wrapped, &mut sources, line, source_idx, width);
     }
+    (wrapped, sources)
 }
 
 fn find_detail_match_rows(content: &str, query: &str) -> Vec<usize> {

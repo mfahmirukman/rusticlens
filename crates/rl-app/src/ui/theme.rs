@@ -105,12 +105,12 @@ impl Theme {
         };
         visuals.widgets.active.bg_fill = Self::ACCENT_DIM;
         visuals.selection.bg_fill = row_selected;
-        visuals.selection.stroke = Stroke::new(1.0, text);
+        visuals.selection.stroke = Stroke::new(1.0_f32, text);
         visuals.hyperlink_color = Self::LINK;
         visuals.warn_fg_color = Self::WARNING;
         visuals.error_fg_color = Self::ERROR;
         visuals.override_text_color = Some(text);
-        visuals.window_stroke = Stroke::new(1.0, border);
+        visuals.window_stroke = Stroke::new(1.0_f32, border);
         ctx.set_visuals(visuals);
 
         let mut style = (*ctx.style()).clone();

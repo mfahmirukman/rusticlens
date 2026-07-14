@@ -278,7 +278,7 @@ pub fn show_workload_tabs(ui: &mut Ui, state: &mut SidebarState) {
     ui.painter().hline(
         rect.left()..=rect.right(),
         rect.bottom() - 1.0,
-        egui::Stroke::new(1.0, Theme::BORDER),
+        egui::Stroke::new(1.0_f32, Theme::BORDER),
     );
 }
 
@@ -294,7 +294,7 @@ fn tab_button(ui: &mut Ui, selected: bool, label: &str) -> bool {
         ui.painter().hline(
             r.left()..=r.right(),
             r.bottom(),
-            egui::Stroke::new(2.0, Theme::ACCENT),
+            egui::Stroke::new(2.0_f32, Theme::ACCENT),
         );
     }
     resp.clicked()

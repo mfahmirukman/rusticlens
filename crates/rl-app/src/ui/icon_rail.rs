@@ -194,7 +194,7 @@ fn show_pinned_context(
         let switch = ui.add(
             egui::Button::new(egui::RichText::new(body).size(10.5).color(text_color))
                 .fill(fill)
-                .stroke(egui::Stroke::new(1.0, border))
+                .stroke(egui::Stroke::new(1.0_f32, border))
                 .min_size(egui::vec2(LABEL_WIDTH, 32.0)),
         );
 

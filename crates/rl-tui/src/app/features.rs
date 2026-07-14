@@ -203,16 +203,10 @@ impl TuiApp {
             self.error_message = Some("No pod selected".into());
             return;
         };
-        let Some(manager) = self.manager.as_ref() else {
-            return;
-        };
-        match rl_core::spawn_kubectl_exec_terminal(manager.namespace(), &name, None) {
-            Ok(_) => {
-                self.status_message = format!("Opened exec for {name} in a new terminal window");
-                self.error_message = None;
-            }
-            Err(err) => self.error_message = Some(err.user_message()),
-        }
+        self.pending_external = Some(ExternalRequest::ExecShell {
+            name,
+            container: None,
+        });
     }
 
     pub fn prompt_port_forward(&mut self) {

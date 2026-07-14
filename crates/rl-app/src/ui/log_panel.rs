@@ -86,7 +86,7 @@ pub fn show_tab_bar(
                     egui::Button::new(egui::RichText::new(&title).size(11.0).color(text_color))
                         .fill(tab_fill)
                         .stroke(egui::Stroke::new(
-                            1.0,
+                            1.0_f32,
                             if selected {
                                 Theme::ACCENT
                             } else {
@@ -122,7 +122,7 @@ pub fn show_tab_bar(
     ui.painter().hline(
         line.left()..=line.right(),
         line.bottom() - 1.0,
-        egui::Stroke::new(1.0, Theme::BORDER),
+        egui::Stroke::new(1.0_f32, Theme::BORDER),
     );
     ui.add_space(2.0);
 

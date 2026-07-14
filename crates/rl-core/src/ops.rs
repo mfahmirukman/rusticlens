@@ -476,7 +476,127 @@ pub async fn list_pods_for_service(
     Ok(names)
 }
 
-/// Follow logs from multiple pods, prefixing each line with `[pod-name] `.
+/// Poll logs from multiple pods (initial tail + periodic `sinceTime` fetches).
+/// Prefer this over follow streams when many pods would open too many connections.
+pub async fn poll_multi_pod_logs(
+    client: &Client,
+    namespace: &str,
+    pod_names: Vec<String>,
+    _timestamps: bool,
+    tx: Sender<String>,
+) -> Result<()> {
+    if pod_names.is_empty() {
+        let _ = tx
+            .send("No pods to stream (empty selector or no endpoints).".into())
+            .await;
+        return Ok(());
+    }
+
+    const MULTI_TAIL: i64 = 80;
+    let interval = std::time::Duration::from_secs(LOG_POLL_INTERVAL_SECS);
+    let total = pod_names.len();
+
+    if tx
+        .send(format!(
+            "Fetching recent logs from {total} pod(s)… (poll every {LOG_POLL_INTERVAL_SECS}s)"
+        ))
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    // Always request API timestamps so sinceTime cursors work (same as GUI log tabs).
+    let mut since_by_pod: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+        std::collections::HashMap::new();
+
+    for (i, pod_name) in pod_names.iter().enumerate() {
+        let prefix = format!("[{pod_name}] ");
+        match fetch_pod_logs_tail(client, namespace, pod_name, None, true, MULTI_TAIL).await {
+            Ok(lines) if lines.is_empty() => {
+                since_by_pod.insert(pod_name.clone(), fallback_log_since_time());
+                if tx
+                    .send(format!("{prefix}(no recent log lines) [{}/{total}]", i + 1))
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            Ok(lines) => {
+                let next_since =
+                    since_time_after_lines(&lines).unwrap_or_else(fallback_log_since_time);
+                since_by_pod.insert(pod_name.clone(), next_since);
+                for line in lines {
+                    if tx.send(format!("{prefix}{line}")).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(err) => {
+                since_by_pod.insert(pod_name.clone(), fallback_log_since_time());
+                if tx
+                    .send(format!(
+                        "{prefix}failed to fetch tail: {} [{}/{total}]",
+                        err.user_message(),
+                        i + 1
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    if tx
+        .send(format!(
+            "--- polling {total} pod(s) every {LOG_POLL_INTERVAL_SECS}s (Esc to close) ---"
+        ))
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        for pod_name in &pod_names {
+            let prefix = format!("[{pod_name}] ");
+            let since = since_by_pod
+                .get(pod_name)
+                .copied()
+                .unwrap_or_else(fallback_log_since_time);
+
+            match fetch_pod_logs_since(client, namespace, pod_name, None, since).await {
+                Ok(new_lines) if new_lines.is_empty() => {}
+                Ok(new_lines) => {
+                    if let Some(next) = since_time_after_lines(&new_lines) {
+                        since_by_pod.insert(pod_name.clone(), next);
+                    }
+                    for line in new_lines {
+                        if tx.send(format!("{prefix}{line}")).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(err) => {
+                    if tx
+                        .send(format!("{prefix}poll error: {}", err.user_message()))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Deprecated name kept for call sites — multi-pod logs use polling, not follow.
 pub async fn stream_multi_pod_logs(
     client: &Client,
     namespace: &str,
@@ -484,51 +604,7 @@ pub async fn stream_multi_pod_logs(
     timestamps: bool,
     tx: Sender<String>,
 ) -> Result<()> {
-    if pod_names.is_empty() {
-        return Ok(());
-    }
-    let mut set = tokio::task::JoinSet::new();
-    for pod_name in pod_names {
-        let client = client.clone();
-        let namespace = namespace.to_string();
-        let tx = tx.clone();
-        set.spawn(async move {
-            let prefix = format!("[{pod_name}] ");
-            let api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
-            let container =
-                match containers::resolve_container(&client, &namespace, &pod_name, None).await {
-                    Ok(c) => c,
-                    Err(err) => {
-                        let _ = tx
-                            .send(format!("{prefix}log stream error: {}", err.user_message()))
-                            .await;
-                        return;
-                    }
-                };
-            let params = LogParams {
-                container: Some(container),
-                follow: true,
-                tail_lines: Some(MAX_LOG_LINES as i64),
-                timestamps,
-                ..Default::default()
-            };
-            let stream = match api.log_stream(&pod_name, &params).await {
-                Ok(s) => s,
-                Err(err) => {
-                    let _ = tx.send(format!("{prefix}log stream error: {err}")).await;
-                    return;
-                }
-            };
-            let mut lines = stream.lines();
-            while let Some(line) = lines.next().await.transpose().ok().flatten() {
-                if tx.send(format!("{prefix}{line}")).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    while set.join_next().await.is_some() {}
-    Ok(())
+    poll_multi_pod_logs(client, namespace, pod_names, timestamps, tx).await
 }
 
 pub fn kubectl_exec_command(namespace: &str, pod_name: &str, container: Option<&str>) -> String {

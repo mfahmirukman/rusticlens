@@ -1107,7 +1107,7 @@ Resources: d detail · 1/2/3 Describe/Events/Metrics · mouse scroll/select · L
 Search: / table filter · detail focus+/ or Ctrl+f find · n/N next/prev match · y copy name
 Detail pan: Shift+←/→ or Shift+h/l · Shift+wheel (or trackpad left/right)
 Ops: m actions · Ctrl+d delete · s scale · R restart · a apply · E edit
-Shell/PF: e exec (new window) · p port-forward · P list PF
+Shell/PF: e exec (this terminal) · p port-forward · P list PF
 Favorites: f toggle · F jump · o overview
 Clusters: [ ] cycle tabs · Ctrl+t add · Ctrl+w close
 UI: t theme · , settings · ? help · q quit";

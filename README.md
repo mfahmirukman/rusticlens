@@ -4,7 +4,7 @@ A native Rust Kubernetes IDE — a lightweight Freelens/Lens alternative without
 
 Built with **egui** for the desktop UI, **ratatui** for the terminal UI, and **kube-rs** for cluster communication. Typical GUI memory use is ~100–150 MB RSS (egui + async runtime + cluster watches), vs 300–800+ MB for Electron-based clients.
 
-**Current version: 0.5.2**
+**Current version: 0.5.3**
 
 ## What's implemented
 
@@ -23,7 +23,7 @@ Built with **egui** for the desktop UI, **ratatui** for the terminal UI, and **k
 | Cluster overview dashboard | Yes | Yes |
 | Port-forward | Yes (native + kubectl) | Yes (native + kubectl) |
 | Embedded shell | Yes (optional feature) | — |
-| External terminal (`kubectl exec`) | Yes | Yes (new window; TUI stays open) |
+| External terminal (`kubectl exec`) | Yes | Yes (suspends TUI in current terminal) |
 | Dark / light theme | Yes | Yes |
 | TOML plugins (`on_connect`) | Yes | Yes |
 
@@ -89,7 +89,7 @@ Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `ku
 - Context (`c`) / namespace (`n`) pickers; multi-cluster tabs (`[` / `]`, `Ctrl+t` add, `Ctrl+w` close)
 - Overview dashboard (`o`); favorites (`f` / `F`); theme toggle (`t`); settings (`,`)
 - Action menu (`m`): delete, scale, restart, CronJob trigger/suspend, port-forward, favorites
-- Apply / edit YAML via `$VISUAL`/`$EDITOR` (`a` / `E`); exec shell (`e`) opens a new terminal window
+- Apply / edit YAML via `$VISUAL`/`$EDITOR` (`a` / `E`); exec shell (`e`) suspends the TUI in the current terminal
 - Port-forward start/list/stop (`p` / `P`); plugins run `on_connect` on connect / context switch
 - Help overlay: `?`
 
@@ -100,7 +100,7 @@ Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `ku
 | `s` / `R` | Scale / rollout restart |
 | `a` / `E` | Apply / edit YAML in `$EDITOR` |
 | `p` / `P` | Start / list port-forwards |
-| `e` | Exec shell (new terminal window) |
+| `e` | Exec shell (current terminal; TUI suspends) |
 | `f` / `F` | Toggle favorite / jump |
 | `o` | Overview dashboard |
 | `t` | Theme toggle |

@@ -846,7 +846,7 @@ pub fn show_overview(
 fn stat_card(ui: &mut Ui, label: &str, value: usize) {
     egui::Frame::new()
         .fill(Theme::PANEL_ELEVATED)
-        .stroke(egui::Stroke::new(1.0, Theme::BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, Theme::BORDER))
         .inner_margin(12.0)
         .show(ui, |ui| {
             ui.label(egui::RichText::new(label).small().color(Theme::TEXT_MUTED));

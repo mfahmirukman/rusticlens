@@ -98,6 +98,12 @@ impl PortForwardSession {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerPickerPurpose {
+    Logs,
+    Exec,
+}
+
 #[derive(Debug, Clone)]
 pub struct PortForwardEntry {
     pub id: u64,
@@ -115,6 +121,7 @@ pub enum Overlay {
         pod_name: String,
         containers: Vec<String>,
         state: ListPickerState,
+        purpose: ContainerPickerPurpose,
     },
     Confirm {
         title: String,
@@ -1200,8 +1207,9 @@ impl TuiApp {
                 pod_name,
                 containers,
                 state,
+                purpose,
             } => {
-                self.confirm_container_picker(pod_name, containers, state)
+                self.confirm_container_picker(pod_name, containers, state, purpose)
                     .await
             }
             Overlay::Confirm { action, .. } => {
@@ -1242,6 +1250,7 @@ impl TuiApp {
         pod_name: String,
         containers: Vec<String>,
         state: ListPickerState,
+        purpose: ContainerPickerPurpose,
     ) {
         let indices = filter_indices(&containers, &state.search);
         let Some(&container_idx) = indices.get(state.selected) else {
@@ -1249,7 +1258,17 @@ impl TuiApp {
         };
         let container = containers[container_idx].clone();
         self.close_overlay();
-        self.open_log_view(pod_name, Some(container)).await;
+        match purpose {
+            ContainerPickerPurpose::Logs => {
+                self.open_log_view(pod_name, Some(container)).await;
+            }
+            ContainerPickerPurpose::Exec => {
+                self.pending_external = Some(ExternalRequest::ExecShell {
+                    name: pod_name,
+                    container: Some(container),
+                });
+            }
+        }
     }
 
     async fn confirm_context_picker(&mut self, state: ListPickerState) {
@@ -1691,6 +1710,7 @@ impl TuiApp {
                         search: String::new(),
                         selected: 0,
                     },
+                    purpose: ContainerPickerPurpose::Logs,
                 });
             }
             Ok(containers) => {

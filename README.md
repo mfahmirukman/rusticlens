@@ -4,7 +4,7 @@ A native Rust Kubernetes IDE — a lightweight Freelens/Lens alternative without
 
 Built with **egui** for the desktop UI, **ratatui** for the terminal UI, and **kube-rs** for cluster communication. Typical GUI memory use is ~100–150 MB RSS (egui + async runtime + cluster watches), vs 300–800+ MB for Electron-based clients.
 
-**Current version: 0.5.3**
+**Current version: 0.5.4**
 
 ## What's implemented
 
@@ -62,7 +62,7 @@ See [Roadmap](docs/ROADMAP.md) for version history (v0.1–v0.5) and future work
 - **Apply YAML** (server-side apply) via command palette (**Ctrl+K**)
 - **Dark / light theme** toggle (persisted)
 - Copy `kubectl edit` / `kubectl exec`; open **external terminal** (`kubectl exec -it`)
-- **Embedded shell** — in-app `/bin/sh` attach via kube API (see [known limitations](#known-limitations--bugs))
+- **Embedded shell** — in-app Freelens-style `sh -c "clear; (bash || ash || sh)"` via kube API (see [known limitations](#known-limitations--bugs))
 - **Port-forward** — native kube-rs for pods (default); kubectl fallback for services or when native fails
 - **TOML plugins** — `~/.config/rusticlens/plugins/*.toml` with optional `on_connect` shell hook
 - Command palette (**Ctrl+K**)
@@ -122,7 +122,7 @@ These are current behavioral limits worth knowing before daily use:
 
 ### Embedded shell
 - **Not a full terminal** — line-based stdout/stderr in a text window; no PTY, no raw mode, no resize signal.
-- **Shell only** — attaches with `/bin/sh`; interactive TUIs (`vim`, `top`, `htop`) will not work well.
+- **Shell only** — attaches with Freelens-style `sh -c "clear; (bash || ash || sh)"`; interactive TUIs (`vim`, `top`, `htop`) will not work well.
 - **One session** — only one embedded exec at a time.
 
 ### Logs
@@ -197,7 +197,18 @@ cargo build -p rl-app --release --no-default-features --features embedded-termin
 
 ### Releases
 
-Pre-built binaries are published on [GitHub Releases](https://github.com/mfahmirukman/rusticlens/releases) when a version tag is pushed (`v0.5.0`, etc.). Each archive contains `rusticlens` (GUI) and `rusticlens-tui` (TUI) for Linux x86_64, macOS Apple Silicon, and Windows x86_64.
+Pre-built binaries are published on [GitHub Releases](https://github.com/mfahmirukman/rusticlens/releases) when a version tag is pushed (`v0.5.0`, etc.). Each archive contains `rusticlens` (GUI) and `rusticlens-tui` (TUI) for Linux x86_64, macOS universal (Apple Silicon + Intel), and Windows x86_64.
+
+**macOS note:** GitHub downloads are unsigned (no Apple Developer ID / notarization). Finder may refuse to open them until you clear quarantine or approve once:
+
+```bash
+tar xzf rusticlens-*-macos-universal.tar.gz
+xattr -cr rusticlens rusticlens-tui
+./rusticlens          # GUI
+./rusticlens-tui      # TUI
+```
+
+Or in Finder: right-click the binary → **Open** → **Open**. Prefer running from Terminal for the first launch so any crash/error is visible.
 
 To trigger a release from source, bump `version` in `Cargo.toml`, commit, then:
 

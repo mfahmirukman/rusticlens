@@ -67,9 +67,11 @@ GitHub Actions runs `fmt`, `clippy`, `test`, and release build on push/PR. See `
 
 Pushing an annotated semver tag triggers `.github/workflows/release.yml`, which:
 
-1. Builds `rusticlens` (GUI) and `rusticlens-tui` (TUI) on Linux, macOS (Apple Silicon), and Windows
+1. Builds `rusticlens` (GUI) and `rusticlens-tui` (TUI) on Linux, macOS (universal `aarch64`+`x86_64`, ad-hoc signed), and Windows
 2. Packages per-platform archives (`rusticlens-<version>-<platform>.tar.gz` or `.zip`)
 3. Publishes a GitHub Release with binaries and `SHA256SUMS.txt`
+
+macOS archives are **ad-hoc signed** but not notarized. First launch after a browser download may need `xattr -cr rusticlens rusticlens-tui` (or Finder → right-click → Open). See the README Releases section.
 
 **Steps to cut a release:**
 

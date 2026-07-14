@@ -201,38 +201,28 @@ async fn handle_external(
             let Some(manager) = app.manager.as_ref() else {
                 return Ok(());
             };
+            let context = manager.context().to_string();
             let namespace = manager.namespace().to_string();
             let name = name.clone();
             let container = container.clone();
-            let mut argv: Vec<String> = vec![
-                "kubectl".into(),
-                "exec".into(),
-                "-it".into(),
-                "-n".into(),
-                namespace,
-                name.clone(),
-            ];
-            if let Some(c) = container.as_deref() {
-                argv.push("-c".into());
-                argv.push(c.to_string());
-            }
-            argv.push("--".into());
-            argv.push("/bin/sh".into());
 
+            // Capture result so failures are visible after the alternate screen returns.
+            let mut result: Result<(), String> = Ok(());
             suspend_for_command(terminal, || {
-                let status = Command::new(&argv[0]).args(&argv[1..]).status();
-                match status {
-                    Ok(s) if s.success() => {}
-                    Ok(s) => {
-                        let _ = writeln!(io::stderr(), "kubectl exec exited with {s}");
-                    }
-                    Err(err) => {
-                        let _ = writeln!(io::stderr(), "kubectl exec failed: {err}");
-                    }
-                }
+                result =
+                    run_kubectl_exec_in_place(&context, &namespace, &name, container.as_deref());
             })?;
-            app.status_message = format!("Returned from exec on {name}");
-            app.error_message = None;
+
+            match result {
+                Ok(()) => {
+                    app.status_message = format!("Returned from exec on {name}");
+                    app.error_message = None;
+                }
+                Err(err) => {
+                    app.error_message = Some(err);
+                    app.status_message = format!("Exec failed for {name}");
+                }
+            }
         }
     }
     Ok(())
@@ -295,6 +285,48 @@ where
     Ok(())
 }
 
+/// Run `kubectl exec -it` in the current TTY using the active rusticlens context.
+fn run_kubectl_exec_in_place(
+    context: &str,
+    namespace: &str,
+    pod_name: &str,
+    container: Option<&str>,
+) -> Result<(), String> {
+    let mut args = vec![
+        "exec".to_string(),
+        "-it".to_string(),
+        "--context".to_string(),
+        context.to_string(),
+        "-n".to_string(),
+        namespace.to_string(),
+        pod_name.to_string(),
+    ];
+    if let Some(c) = container {
+        args.push("-c".to_string());
+        args.push(c.to_string());
+    }
+    // Freelens/Lens: sh -c "clear; (bash || ash || sh)"
+    args.push("--".to_string());
+    args.push("sh".to_string());
+    args.push("-c".to_string());
+    args.push(rl_core::ops::POD_SHELL_WRAPPER.to_string());
+
+    let cmdline = format!("kubectl {}", args.join(" "));
+    let _ = writeln!(io::stdout(), "\nrusticlens: {cmdline}\n");
+
+    match Command::new("kubectl").args(&args).status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            let msg = format!(
+                "{cmdline} exited with {status}. If the image has no shell (bash/ash/sh), exec cannot work; otherwise check RBAC / container selection."
+            );
+            let _ = writeln!(io::stderr(), "{msg}");
+            Err(msg)
+        }
+        Err(err) => Err(format!("failed to run kubectl (is it on PATH?): {err}")),
+    }
+}
+
 async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.log_view_open() {
         return handle_log_key(app, key);
@@ -349,7 +381,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Char('E') if app.is_connected() => app.request_edit_yaml(),
         KeyCode::Char('p') if app.is_connected() => app.prompt_port_forward(),
         KeyCode::Char('P') if app.is_connected() => app.open_port_forward_list(),
-        KeyCode::Char('e') if app.is_connected() => app.request_exec_shell(),
+        KeyCode::Char('e') if app.is_connected() => app.request_exec_shell().await,
         KeyCode::Char('f') if app.is_connected() => app.toggle_favorite_selection(),
         KeyCode::Char('F') if app.is_connected() => app.open_favorites_picker(),
         KeyCode::Char('r') if app.is_connected() => {

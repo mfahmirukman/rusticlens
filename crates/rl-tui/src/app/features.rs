@@ -194,7 +194,7 @@ impl TuiApp {
         self.pending_external = Some(ExternalRequest::EditYaml { name });
     }
 
-    pub fn request_exec_shell(&mut self) {
+    pub async fn request_exec_shell(&mut self) {
         if self.active_kind != ResourceKind::Pod {
             self.error_message = Some("Exec is only available for pods.".into());
             return;
@@ -203,10 +203,38 @@ impl TuiApp {
             self.error_message = Some("No pod selected".into());
             return;
         };
-        self.pending_external = Some(ExternalRequest::ExecShell {
-            name,
-            container: None,
-        });
+        let Some(manager) = self.manager.as_ref() else {
+            return;
+        };
+
+        match manager.pod_containers(&name).await {
+            Ok(containers) if containers.len() > 1 => {
+                self.overlay = Some(Overlay::Container {
+                    pod_name: name,
+                    containers: containers.into_iter().map(|c| c.name).collect(),
+                    state: ListPickerState {
+                        search: String::new(),
+                        selected: 0,
+                    },
+                    purpose: crate::app::ContainerPickerPurpose::Exec,
+                });
+            }
+            Ok(containers) => {
+                let container = containers.first().map(|c| c.name.clone());
+                self.pending_external = Some(ExternalRequest::ExecShell { name, container });
+            }
+            Err(err) => {
+                // Still try exec without an explicit container; kubectl will pick the default.
+                self.error_message = Some(format!(
+                    "Could not list containers ({}); trying default container.",
+                    err.user_message()
+                ));
+                self.pending_external = Some(ExternalRequest::ExecShell {
+                    name,
+                    container: None,
+                });
+            }
+        }
     }
 
     pub fn prompt_port_forward(&mut self) {
@@ -383,7 +411,7 @@ impl TuiApp {
             PendingAction::ToggleFavorite => self.toggle_favorite_selection(),
             PendingAction::OpenLogs => self.start_logs_for_selection().await,
             PendingAction::OpenServiceLogs => self.start_logs_for_service_selection().await,
-            PendingAction::ExecShell => self.request_exec_shell(),
+            PendingAction::ExecShell => self.request_exec_shell().await,
             PendingAction::ApplyYaml => self.request_apply_yaml(),
             PendingAction::EditYaml => self.request_edit_yaml(),
         }

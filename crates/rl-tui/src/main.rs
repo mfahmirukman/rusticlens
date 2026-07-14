@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -112,11 +112,12 @@ async fn run(
 
         if event::poll(std::time::Duration::from_millis(200))? {
             match event::read()? {
-                Event::Key(key) => {
+                Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                     if handle_key(app, key).await {
                         break;
                     }
                 }
+                Event::Key(_) => {}
                 Event::Resize(_, _) => {
                     // Drop leftover glyphs from the previous geometry (classic "doubled" UI).
                     terminal.clear()?;
@@ -137,7 +138,7 @@ async fn run(
             }
         }
 
-        if app.is_connected() {
+        if app.is_connected() && !app.log_view_open() {
             app.poll_snapshots().await;
         }
     }
@@ -193,6 +194,43 @@ async fn handle_external(
                     Err(err) => app.error_message = Some(err.user_message()),
                 }
             }
+        }
+        ExternalRequest::ExecShell { name, container } => {
+            let Some(manager) = app.manager.as_ref() else {
+                return Ok(());
+            };
+            let namespace = manager.namespace().to_string();
+            let name = name.clone();
+            let container = container.clone();
+            let mut argv: Vec<String> = vec![
+                "kubectl".into(),
+                "exec".into(),
+                "-it".into(),
+                "-n".into(),
+                namespace,
+                name.clone(),
+            ];
+            if let Some(c) = container.as_deref() {
+                argv.push("-c".into());
+                argv.push(c.to_string());
+            }
+            argv.push("--".into());
+            argv.push("/bin/sh".into());
+
+            suspend_for_command(terminal, || {
+                let status = Command::new(&argv[0]).args(&argv[1..]).status();
+                match status {
+                    Ok(s) if s.success() => {}
+                    Ok(s) => {
+                        let _ = writeln!(io::stderr(), "kubectl exec exited with {s}");
+                    }
+                    Err(err) => {
+                        let _ = writeln!(io::stderr(), "kubectl exec failed: {err}");
+                    }
+                }
+            })?;
+            app.status_message = format!("Returned from exec on {name}");
+            app.error_message = None;
         }
     }
     Ok(())

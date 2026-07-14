@@ -19,7 +19,7 @@ pub fn actions_for_kind(kind: ResourceKind, has_selection: bool) -> Vec<ActionIt
             items.push(item("logs", "Open logs", PendingAction::OpenLogs));
             items.push(item(
                 "exec",
-                "Exec shell (new window)",
+                "Exec shell (this terminal)",
                 PendingAction::ExecShell,
             ));
             items.push(item("pf", "Port-forward", PendingAction::StartPortForward));

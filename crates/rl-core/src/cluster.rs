@@ -364,9 +364,9 @@ impl ClusterManager {
         let namespace = self.namespace.clone();
         tokio::spawn(async move {
             if let Err(err) =
-                ops::stream_multi_pod_logs(&client, &namespace, pod_names, timestamps, tx).await
+                ops::poll_multi_pod_logs(&client, &namespace, pod_names, timestamps, tx).await
             {
-                let message = format!("Log stream error: {}", err.user_message());
+                let message = format!("Log poll error: {}", err.user_message());
                 tracing::warn!("{message}");
                 let _ = err_tx.send(message).await;
             }

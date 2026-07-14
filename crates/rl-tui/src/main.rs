@@ -548,13 +548,12 @@ fn handle_detail_mouse(app: &mut TuiApp, mouse: MouseEvent) {
                 app.update_detail_selection(line, col);
             }
         }
-        MouseEventKind::Up(MouseButton::Left) => {
+        MouseEventKind::Up(MouseButton::Left)
             if app
                 .detail_selection
-                .is_some_and(|s| s.dragging || app.selected_detail_text().is_some())
-            {
-                app.finish_detail_selection();
-            }
+                .is_some_and(|s| s.dragging || app.selected_detail_text().is_some()) =>
+        {
+            app.finish_detail_selection();
         }
         _ => {}
     }
@@ -645,13 +644,12 @@ fn handle_table_mouse(
                 app.update_table_selection(line, col);
             }
         }
-        MouseEventKind::Up(MouseButton::Left) => {
+        MouseEventKind::Up(MouseButton::Left)
             if app
                 .table_selection
-                .is_some_and(|s| s.dragging || app.selected_table_text().is_some())
-            {
-                app.finish_table_selection();
-            }
+                .is_some_and(|s| s.dragging || app.selected_table_text().is_some()) =>
+        {
+            app.finish_table_selection();
         }
         _ => {}
     }

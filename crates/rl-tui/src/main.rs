@@ -112,7 +112,9 @@ async fn run(
 
         if event::poll(std::time::Duration::from_millis(200))? {
             match event::read()? {
-                Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
                     if handle_key(app, key).await {
                         break;
                     }

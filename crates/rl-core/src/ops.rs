@@ -516,10 +516,7 @@ pub async fn poll_multi_pod_logs(
             Ok(lines) if lines.is_empty() => {
                 since_by_pod.insert(pod_name.clone(), fallback_log_since_time());
                 if tx
-                    .send(format!(
-                        "{prefix}(no recent log lines) [{}/{total}]",
-                        i + 1
-                    ))
+                    .send(format!("{prefix}(no recent log lines) [{}/{total}]", i + 1))
                     .await
                     .is_err()
                 {
@@ -587,10 +584,7 @@ pub async fn poll_multi_pod_logs(
                 }
                 Err(err) => {
                     if tx
-                        .send(format!(
-                            "{prefix}poll error: {}",
-                            err.user_message()
-                        ))
+                        .send(format!("{prefix}poll error: {}", err.user_message()))
                         .await
                         .is_err()
                     {

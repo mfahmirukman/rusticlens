@@ -277,7 +277,9 @@ pub struct TuiApp {
 #[derive(Debug, Clone)]
 pub enum ExternalRequest {
     ApplyYaml,
-    EditYaml { name: String },
+    EditYaml {
+        name: String,
+    },
     ExecShell {
         name: String,
         container: Option<String>,

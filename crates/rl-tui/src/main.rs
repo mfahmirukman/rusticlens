@@ -11,11 +11,14 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crossterm::{
+    cursor::Show,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind, PopKeyboardEnhancementFlags,
     },
     execute,
+    style::ResetColor,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -29,6 +32,12 @@ async fn main() -> io::Result<()> {
 
     rl_core::ensure_plugins_dir();
     rl_core::write_example_manifest_if_missing();
+
+    // SIGINT/SIGTERM skip Rust Drop unless we restore explicitly first.
+    let _ = ctrlc::set_handler(|| {
+        restore_terminal();
+        std::process::exit(130);
+    });
 
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -51,8 +60,7 @@ async fn main() -> io::Result<()> {
         session.stop();
     }
 
-    // Guard Drop handles restore; keep an explicit drain before teardown for clarity.
-    drain_pending_events();
+    // Restore before Terminal Drop / runtime teardown.
     drop(_terminal_guard);
     let _ = terminal.show_cursor();
     result
@@ -68,21 +76,82 @@ impl Drop for TerminalRestoreGuard {
 }
 
 fn restore_terminal() {
-    // Leftover SGR mouse / key bytes land in the shell as "phantom typing" if we
-    // leave raw mode without consuming them first.
-    drain_pending_events();
-    let _ = disable_raw_mode();
+    // CRITICAL ORDER: disable mouse *before* leaving raw mode. If raw mode is cleared
+    // first, in-flight SGR mouse reports (`\x1b[<…M`) land in the shell as phantom typing.
     let _ = execute!(
         io::stdout(),
-        LeaveAlternateScreen,
         DisableMouseCapture,
-        crossterm::cursor::Show
+        DisableBracketedPaste,
+        DisableFocusChange,
+        PopKeyboardEnhancementFlags,
     );
+    // Belt-and-suspenders: some terminals keep a private mode if only one disable ran.
+    write_tty_bytes(
+        b"\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l",
+    );
+    let _ = io::stdout().flush();
+
+    drain_pending_events();
+    // Terminal emulators can still flush one last report after the disable CSI.
+    std::thread::sleep(Duration::from_millis(30));
+    drain_pending_events();
+
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, ResetColor, Show);
+    let _ = io::stdout().flush();
+    write_tty_bytes(b"\x1b[?1049l\x1b[0m\x1b[?25h");
+    let _ = disable_raw_mode();
+
+    // Drop any bytes still sitting in the kernel tty buffer after cooked mode returns.
+    drain_os_tty_input();
 }
 
 fn drain_pending_events() {
     while event::poll(Duration::from_millis(0)).unwrap_or(false) {
         let _ = event::read();
+    }
+}
+
+fn write_tty_bytes(bytes: &[u8]) {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = tty.write_all(bytes);
+            let _ = tty.flush();
+            return;
+        }
+    }
+    let _ = io::stdout().write_all(bytes);
+    let _ = io::stdout().flush();
+}
+
+fn drain_os_tty_input() {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(false).open("/dev/tty")
+        else {
+            return;
+        };
+        let fd = tty.as_raw_fd();
+        // SAFETY: setting O_NONBLOCK on our /dev/tty fd so read returns immediately.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        let mut buf = [0u8; 4096];
+        for _ in 0..16 {
+            match tty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -288,21 +357,28 @@ fn suspend_for_command<F>(
 where
     F: FnOnce(),
 {
-    drain_pending_events();
-    disable_raw_mode()?;
+    // Same order as restore_terminal: kill mouse tracking before leaving raw mode.
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        DisableFocusChange
     )?;
-    terminal.show_cursor()?;
+    let _ = terminal.backend_mut().flush();
+    drain_pending_events();
+    std::thread::sleep(Duration::from_millis(20));
+    drain_pending_events();
+
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, Show)?;
+    disable_raw_mode()?;
+    drain_os_tty_input();
 
     struct ReenterTui<'a> {
         terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>,
     }
     impl Drop for ReenterTui<'_> {
         fn drop(&mut self) {
-            drain_pending_events();
+            drain_os_tty_input();
             let _ = enable_raw_mode();
             let _ = execute!(
                 self.terminal.backend_mut(),

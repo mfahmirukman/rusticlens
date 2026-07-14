@@ -4,28 +4,28 @@ A native Rust Kubernetes IDE — a lightweight Freelens/Lens alternative without
 
 Built with **egui** for the desktop UI, **ratatui** for the terminal UI, and **kube-rs** for cluster communication. Typical GUI memory use is ~100–150 MB RSS (egui + async runtime + cluster watches), vs 300–800+ MB for Electron-based clients.
 
-**Current version: 0.5.0**
+**Current version: 0.5.2**
 
 ## What's implemented
 
 | Area | GUI (`rl-app`) | TUI (`rl-tui`) |
 |------|----------------|----------------|
 | Context / namespace switching | Yes | Yes |
-| Multi-cluster tabs | Yes | — |
-| Multi-kubeconfig merge | Yes | Uses merged config from disk |
+| Multi-cluster tabs | Yes | Yes |
+| Multi-kubeconfig merge | Yes | Yes (settings `,` + shared disk config) |
 | Resource browsers (20 kinds + CRD + Helm) | Yes | Yes |
 | Live watches + virtual scroll | Yes | Yes |
 | Describe / Events / Metrics | Yes | Yes |
 | Pod logs | Yes (polling) | Yes |
-| Scale / restart workloads | Yes | — |
-| Apply YAML | Yes | — |
-| Favorites | Yes | — |
-| Cluster overview dashboard | Yes | — |
-| Port-forward | Yes (native + kubectl) | — |
+| Scale / restart workloads | Yes | Yes |
+| Apply YAML | Yes | Yes (`$EDITOR`) |
+| Favorites | Yes | Yes |
+| Cluster overview dashboard | Yes | Yes |
+| Port-forward | Yes (native + kubectl) | Yes (native + kubectl) |
 | Embedded shell | Yes (optional feature) | — |
-| External terminal (`kubectl exec`) | Yes | — |
-| Dark / light theme | Yes | — |
-| TOML plugins (`on_connect`) | Yes | — |
+| External terminal (`kubectl exec`) | Yes | Yes (new window; TUI stays open) |
+| Dark / light theme | Yes | Yes |
+| TOML plugins (`on_connect`) | Yes | Yes |
 
 See [Roadmap](docs/ROADMAP.md) for version history (v0.1–v0.5) and future work.
 
@@ -81,14 +81,34 @@ on_connect = "echo \"connected to $RUSTICLENS_CONTEXT\""
 
 ## Features (TUI)
 
-- Sidebar navigation across all resource kinds (including Storage, Access, Network Policies)
-- Resource table with filter/search on pods
-- Detail panel: Describe / Events / Metrics
-- Pod log viewer with search (`/`), follow (`f`), scroll
-- Context picker (`c`), namespace picker (`n`)
-- Keyboard: `q` quit, `r` refresh, `d` detail, `L` logs, `Tab` cycle kinds, `y` cycle CRD type, `1`/`2`/`3` detail tabs
+Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `kubectl` where ratatui is a better fit than egui dialogs:
 
-The TUI does **not** yet include favorites, overview dashboard, port-forward, apply YAML, scale/restart dialogs, theme toggle, or embedded shell.
+- Sidebar navigation across all resource kinds; resource table; Describe / Events / Metrics
+- Resource name filter (`/`) on every kind; detail find (`/` when detail focused, or `Ctrl+f`) with `n`/`N` matches
+- Pod logs with search, follow (`f`), scroll / yank
+- Context (`c`) / namespace (`n`) pickers; multi-cluster tabs (`[` / `]`, `Ctrl+t` add, `Ctrl+w` close)
+- Overview dashboard (`o`); favorites (`f` / `F`); theme toggle (`t`); settings (`,`)
+- Action menu (`m`): delete, scale, restart, CronJob trigger/suspend, port-forward, favorites
+- Apply / edit YAML via `$VISUAL`/`$EDITOR` (`a` / `E`); exec shell (`e`) opens a new terminal window
+- Port-forward start/list/stop (`p` / `P`); plugins run `on_connect` on connect / context switch
+- Help overlay: `?`
+
+| Key | Action |
+|-----|--------|
+| `m` | Action menu |
+| `Ctrl+d` | Delete (confirm) |
+| `s` / `R` | Scale / rollout restart |
+| `a` / `E` | Apply / edit YAML in `$EDITOR` |
+| `p` / `P` | Start / list port-forwards |
+| `e` | Exec shell (new terminal window) |
+| `f` / `F` | Toggle favorite / jump |
+| `o` | Overview dashboard |
+| `t` | Theme toggle |
+| `Ctrl+f` | Find in detail panel |
+| `/` | Filter table names; find in detail when detail focused |
+| `[` / `]` | Prev/next cluster tab |
+| `Ctrl+t` / `Ctrl+w` | Add / close cluster tab |
+| `,` / `?` | Settings / help |
 
 ## Known limitations & bugs
 

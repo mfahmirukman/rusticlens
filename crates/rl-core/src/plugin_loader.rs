@@ -28,10 +28,15 @@ impl RusticlensPlugin for ManifestPlugin {
         let Some(cmd) = &self.manifest.on_connect else {
             return Ok(());
         };
+        // Never inherit stdout/stderr — writing to the tty corrupts ratatui / egui
+        // when the user has a TUI attached to the same terminal.
         Command::new("sh")
             .arg("-c")
             .arg(cmd)
             .env("RUSTICLENS_CONTEXT", context)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|err| err.to_string())?;
         Ok(())

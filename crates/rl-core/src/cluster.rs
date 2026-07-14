@@ -305,6 +305,10 @@ impl ClusterManager {
         list_pod_containers(&self.client, &self.namespace, pod_name).await
     }
 
+    pub async fn pods_for_service(&self, service_name: &str) -> Result<Vec<String>> {
+        ops::list_pods_for_service(&self.client, &self.namespace, service_name).await
+    }
+
     pub async fn pod_metrics(&self) -> Result<Vec<PodMetricSummary>> {
         list_pod_metrics(&self.client, &self.namespace).await
     }
@@ -341,6 +345,26 @@ impl ClusterManager {
                 tx,
             )
             .await
+            {
+                let message = format!("Log stream error: {}", err.user_message());
+                tracing::warn!("{message}");
+                let _ = err_tx.send(message).await;
+            }
+        })
+    }
+
+    pub fn spawn_multi_pod_log_stream(
+        &self,
+        pod_names: Vec<String>,
+        timestamps: bool,
+        tx: Sender<String>,
+        err_tx: Sender<String>,
+    ) -> tokio::task::JoinHandle<()> {
+        let client = self.client.clone();
+        let namespace = self.namespace.clone();
+        tokio::spawn(async move {
+            if let Err(err) =
+                ops::stream_multi_pod_logs(&client, &namespace, pod_names, timestamps, tx).await
             {
                 let message = format!("Log stream error: {}", err.user_message());
                 tracing::warn!("{message}");

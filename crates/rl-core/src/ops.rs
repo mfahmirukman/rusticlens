@@ -446,6 +446,91 @@ pub async fn stream_pod_logs(
     Ok(())
 }
 
+/// Pods selected by a Service's `spec.selector` labels (empty if headless / no selector).
+pub async fn list_pods_for_service(
+    client: &Client,
+    namespace: &str,
+    service_name: &str,
+) -> Result<Vec<String>> {
+    let api: Api<Service> = Api::namespaced(client.clone(), namespace);
+    let svc = api.get(service_name).await?;
+    let Some(selector) = svc.spec.as_ref().and_then(|s| s.selector.as_ref()) else {
+        return Ok(Vec::new());
+    };
+    if selector.is_empty() {
+        return Ok(Vec::new());
+    }
+    let label_sel = selector
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let list = pods.list(&ListParams::default().labels(&label_sel)).await?;
+    let mut names: Vec<String> = list
+        .items
+        .into_iter()
+        .filter_map(|p| p.metadata.name)
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Follow logs from multiple pods, prefixing each line with `[pod-name] `.
+pub async fn stream_multi_pod_logs(
+    client: &Client,
+    namespace: &str,
+    pod_names: Vec<String>,
+    timestamps: bool,
+    tx: Sender<String>,
+) -> Result<()> {
+    if pod_names.is_empty() {
+        return Ok(());
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for pod_name in pod_names {
+        let client = client.clone();
+        let namespace = namespace.to_string();
+        let tx = tx.clone();
+        set.spawn(async move {
+            let prefix = format!("[{pod_name}] ");
+            let api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+            let container =
+                match containers::resolve_container(&client, &namespace, &pod_name, None).await {
+                    Ok(c) => c,
+                    Err(err) => {
+                        let _ = tx
+                            .send(format!("{prefix}log stream error: {}", err.user_message()))
+                            .await;
+                        return;
+                    }
+                };
+            let params = LogParams {
+                container: Some(container),
+                follow: true,
+                tail_lines: Some(MAX_LOG_LINES as i64),
+                timestamps,
+                ..Default::default()
+            };
+            let stream = match api.log_stream(&pod_name, &params).await {
+                Ok(s) => s,
+                Err(err) => {
+                    let _ = tx.send(format!("{prefix}log stream error: {err}")).await;
+                    return;
+                }
+            };
+            let mut lines = stream.lines();
+            while let Some(line) = lines.next().await.transpose().ok().flatten() {
+                if tx.send(format!("{prefix}{line}")).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    while set.join_next().await.is_some() {}
+    Ok(())
+}
+
 pub fn kubectl_exec_command(namespace: &str, pod_name: &str, container: Option<&str>) -> String {
     match container {
         Some(c) => format!("kubectl exec -it -n {namespace} {pod_name} -c {c} -- /bin/sh"),

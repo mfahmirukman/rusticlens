@@ -279,6 +279,8 @@ pub struct TuiApp {
     /// Set by action handlers so main loop can suspend TUI for editor/exec.
     pub pending_external: Option<ExternalRequest>,
     connect_attempted: bool,
+    /// Non-blocking connect so crossterm keeps draining mouse/key input.
+    connect_task: Option<tokio::task::JoinHandle<Result<ClusterManager, rl_core::Error>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,10 +296,6 @@ pub enum ExternalRequest {
 }
 
 impl TuiApp {
-    pub fn connect_attempted(&self) -> bool {
-        self.connect_attempted
-    }
-
     pub fn new() -> Self {
         let settings = load_settings();
         let theme_mode = ThemeMode::from_settings();
@@ -359,6 +357,7 @@ impl TuiApp {
             dashboard: None,
             pending_external: None,
             connect_attempted: false,
+            connect_task: None,
         }
     }
 
@@ -485,49 +484,56 @@ impl TuiApp {
         )
     }
 
-    pub async fn connect(&mut self) {
-        if matches!(
-            self.connection,
-            ConnectionState::Connecting | ConnectionState::Connected
-        ) {
+    /// Start a background connect on first launch (does not block the event loop).
+    pub fn kickoff_connect_if_needed(&mut self) {
+        if self.connect_task.is_some()
+            || matches!(
+                self.connection,
+                ConnectionState::Connecting | ConnectionState::Connected
+            )
+            || self.connect_attempted
+        {
+            return;
+        }
+        self.spawn_connect();
+    }
+
+    fn spawn_connect(&mut self) {
+        if self.connect_task.is_some() {
             return;
         }
         self.connection = ConnectionState::Connecting;
         self.connect_attempted = true;
         self.error_message = None;
         self.status_message = "Connecting...".into();
+        let kind = self.active_kind;
+        self.connect_task = Some(tokio::spawn(async move {
+            ClusterManager::connect_default(kind).await
+        }));
+    }
 
-        match ClusterManager::connect_default(self.active_kind).await {
-            Ok(mut manager) => {
-                let namespaces = manager.list_namespaces().await.unwrap_or_default();
-                let namespace_index = namespaces
-                    .iter()
-                    .position(|n| n == manager.namespace())
-                    .unwrap_or(0);
-                self.crd_targets = manager.crd_targets().to_vec();
-                if self.active_kind == ResourceKind::Crd && !self.crd_targets.is_empty() {
-                    let target = self.crd_targets[self
-                        .selected_crd_index
-                        .min(self.crd_targets.len().saturating_sub(1))]
-                    .clone();
-                    manager.set_selected_crd(Some(target));
-                }
-                self.namespaces = namespaces;
-                self.namespace_index = namespace_index;
-                let ctx = manager.context().to_string();
-                if !self.cluster_tabs.iter().any(|t| t == &ctx) {
-                    self.cluster_tabs.push(ctx.clone());
-                }
-                self.manager = Some(manager);
-                self.sync_context_list().await;
-                self.connection = ConnectionState::Connected;
-                self.status_message = "Connected".into();
-                self.fire_plugins(&ctx);
-                self.persist_ui_settings();
-                self.refresh().await;
+    /// Apply a finished background connect without stalling crossterm reads.
+    pub async fn poll_connect(&mut self) {
+        let Some(handle) = self.connect_task.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let Some(handle) = self.connect_task.take() else {
+            return;
+        };
+        match handle.await {
+            Ok(Ok(manager)) => self.apply_connected_manager(manager).await,
+            Ok(Err(err)) => {
+                let msg = err.user_message();
+                self.connection = ConnectionState::Failed(msg.clone());
+                self.manager = None;
+                self.status_message.clear();
+                self.error_message = Some(msg);
             }
             Err(err) => {
-                let msg = err.user_message();
+                let msg = format!("Connect task failed: {err}");
                 self.connection = ConnectionState::Failed(msg.clone());
                 self.manager = None;
                 self.status_message.clear();
@@ -536,9 +542,42 @@ impl TuiApp {
         }
     }
 
+    async fn apply_connected_manager(&mut self, mut manager: ClusterManager) {
+        let namespaces = manager.list_namespaces().await.unwrap_or_default();
+        let namespace_index = namespaces
+            .iter()
+            .position(|n| n == manager.namespace())
+            .unwrap_or(0);
+        self.crd_targets = manager.crd_targets().to_vec();
+        if self.active_kind == ResourceKind::Crd && !self.crd_targets.is_empty() {
+            let target = self.crd_targets[self
+                .selected_crd_index
+                .min(self.crd_targets.len().saturating_sub(1))]
+            .clone();
+            manager.set_selected_crd(Some(target));
+        }
+        self.namespaces = namespaces;
+        self.namespace_index = namespace_index;
+        let ctx = manager.context().to_string();
+        if !self.cluster_tabs.iter().any(|t| t == &ctx) {
+            self.cluster_tabs.push(ctx.clone());
+        }
+        self.manager = Some(manager);
+        self.sync_context_list().await;
+        self.connection = ConnectionState::Connected;
+        self.status_message = "Connected".into();
+        self.fire_plugins(&ctx);
+        self.persist_ui_settings();
+        self.refresh().await;
+    }
+
     pub async fn retry_connect(&mut self) {
+        if self.connect_task.is_some() {
+            return;
+        }
         self.connection = ConnectionState::Disconnected;
-        self.connect().await;
+        self.connect_attempted = false;
+        self.spawn_connect();
     }
 
     pub fn is_connected(&self) -> bool {

@@ -34,15 +34,15 @@ async fn main() -> io::Result<()> {
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(backend).inspect_err(|_| restore_terminal())?;
 
-    // Restore the terminal if we panic mid-draw (otherwise the shell stays broken).
+    // Always restore termios / mouse / alt-screen — including on panic and early returns.
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        restore_terminal();
         original_hook(info);
     }));
+    let _terminal_guard = TerminalRestoreGuard;
 
     let mut app = TuiApp::new();
     let result = run(&mut terminal, &mut app).await;
@@ -51,14 +51,39 @@ async fn main() -> io::Result<()> {
         session.stop();
     }
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    // Guard Drop handles restore; keep an explicit drain before teardown for clarity.
+    drain_pending_events();
+    drop(_terminal_guard);
+    let _ = terminal.show_cursor();
     result
+}
+
+/// Ensures mouse tracking / raw mode / alt-screen are cleared even if cleanup is skipped.
+struct TerminalRestoreGuard;
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+fn restore_terminal() {
+    // Leftover SGR mouse / key bytes land in the shell as "phantom typing" if we
+    // leave raw mode without consuming them first.
+    drain_pending_events();
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    );
+}
+
+fn drain_pending_events() {
+    while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        let _ = event::read();
+    }
 }
 
 /// Route tracing to a log file — never to the tty (that garbles the ratatui frame).
@@ -98,9 +123,8 @@ async fn run(
     let mut last_click: Option<(u16, u16, Instant)> = None;
 
     loop {
-        if app.needs_connect() && !app.connect_attempted() {
-            app.connect().await;
-        }
+        app.kickoff_connect_if_needed();
+        app.poll_connect().await;
 
         if let Some(req) = app.pending_external.take() {
             handle_external(terminal, app, req).await?;
@@ -264,6 +288,7 @@ fn suspend_for_command<F>(
 where
     F: FnOnce(),
 {
+    drain_pending_events();
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -272,16 +297,26 @@ where
     )?;
     terminal.show_cursor()?;
 
-    f();
+    struct ReenterTui<'a> {
+        terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>,
+    }
+    impl Drop for ReenterTui<'_> {
+        fn drop(&mut self) {
+            drain_pending_events();
+            let _ = enable_raw_mode();
+            let _ = execute!(
+                self.terminal.backend_mut(),
+                EnterAlternateScreen,
+                EnableMouseCapture
+            );
+            let _ = self.terminal.hide_cursor();
+            let _ = self.terminal.clear();
+        }
+    }
 
-    enable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )?;
-    terminal.hide_cursor()?;
-    terminal.clear()?;
+    // Always re-enter TUI modes, even if the child panics or leaves termios messy.
+    let _reenter = ReenterTui { terminal };
+    f();
     Ok(())
 }
 
@@ -368,6 +403,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Char('q') => return true,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Char('?') => app.open_help(),
         KeyCode::Char(',') => app.open_settings(),
         KeyCode::Char('t') if app.is_connected() => app.toggle_theme(),

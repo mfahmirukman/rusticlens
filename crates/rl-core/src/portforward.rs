@@ -63,7 +63,9 @@ fn kubectl_argv(
     }
     if with_shell {
         args.push("--".to_string());
-        args.push("/bin/sh".to_string());
+        args.push("sh".to_string());
+        args.push("-c".to_string());
+        args.push(crate::ops::POD_SHELL_WRAPPER.to_string());
     }
     args
 }
@@ -175,8 +177,11 @@ mod tests {
     fn exec_argv_includes_exec_verb_and_shell() {
         let args = kubectl_argv("exec", "default", "nginx", Some("app"), true);
         assert_eq!(args[0], "exec");
-        assert!(args.windows(2).any(|w| w == ["--", "/bin/sh"]));
+        assert!(args.windows(2).any(|w| w == ["--", "sh"]));
         assert!(args.iter().any(|a| a == "nginx"));
         assert!(args.windows(2).any(|w| w == ["-c", "app"]));
+        assert!(args
+            .iter()
+            .any(|a| a.contains("bash") && a.contains("ash") && a.contains("sh")));
     }
 }

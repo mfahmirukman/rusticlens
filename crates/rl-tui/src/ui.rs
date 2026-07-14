@@ -850,7 +850,14 @@ fn draw_overlay(frame: &mut Frame, area: Rect, app: &TuiApp, overlay: &Overlay) 
             pod_name,
             containers,
             state,
-        } => draw_container_picker(frame, area, pod_name, containers, state),
+            purpose,
+        } => {
+            let title = match purpose {
+                crate::app::ContainerPickerPurpose::Logs => " Select container (logs) ",
+                crate::app::ContainerPickerPurpose::Exec => " Select container (exec) ",
+            };
+            draw_container_picker(frame, area, pod_name, containers, state, title)
+        }
         Overlay::Confirm { title, detail, .. } => draw_simple_popup(
             frame,
             area,
@@ -1219,6 +1226,7 @@ fn draw_container_picker(
     pod_name: &str,
     containers: &[String],
     state: &crate::app::ListPickerState,
+    title: &str,
 ) {
     let indices: Vec<usize> = {
         let query = state.search.to_lowercase();
@@ -1242,10 +1250,10 @@ fn draw_container_picker(
     draw_searchable_popup(
         frame,
         area,
-        &format!(" Logs — {pod_name} "),
+        title,
         &state.search,
         &lines,
-        "Select a container to stream logs from",
+        &format!("Pod: {pod_name}"),
         if indices.is_empty() {
             "No matching containers"
         } else {

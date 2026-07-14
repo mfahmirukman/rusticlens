@@ -28,8 +28,13 @@ pub async fn run_pod_exec(
         ..Default::default()
     };
 
+    // Freelens/Lens: sh -c "clear; (bash || ash || sh)"
     let mut attached = api
-        .exec(pod_name, vec!["/bin/sh"], &attach)
+        .exec(
+            pod_name,
+            vec!["sh", "-c", crate::ops::POD_SHELL_WRAPPER],
+            &attach,
+        )
         .await
         .map_err(|err| Error::Message(err.to_string()))?;
 

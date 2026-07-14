@@ -607,10 +607,17 @@ pub async fn stream_multi_pod_logs(
     poll_multi_pod_logs(client, namespace, pod_names, timestamps, tx).await
 }
 
+/// Freelens/Lens-style interactive shell: prefer bash, then ash (Alpine), then sh.
+pub const POD_SHELL_WRAPPER: &str = "clear; (bash || ash || sh)";
+
 pub fn kubectl_exec_command(namespace: &str, pod_name: &str, container: Option<&str>) -> String {
     match container {
-        Some(c) => format!("kubectl exec -it -n {namespace} {pod_name} -c {c} -- /bin/sh"),
-        None => format!("kubectl exec -it -n {namespace} {pod_name} -- /bin/sh"),
+        Some(c) => format!(
+            "kubectl exec -it -n {namespace} {pod_name} -c {c} -- sh -c '{POD_SHELL_WRAPPER}'"
+        ),
+        None => {
+            format!("kubectl exec -it -n {namespace} {pod_name} -- sh -c '{POD_SHELL_WRAPPER}'")
+        }
     }
 }
 
@@ -834,5 +841,7 @@ mod tests {
         let cmd = kubectl_exec_command("default", "api-123", Some("app"));
         assert!(cmd.contains("kubectl exec"));
         assert!(cmd.contains("-c app"));
+        assert!(cmd.contains("sh -c"));
+        assert!(cmd.contains(POD_SHELL_WRAPPER));
     }
 }

@@ -232,6 +232,8 @@ async fn run(
         }
 
         app.poll_connect().await;
+        app.poll_pending_op().await;
+        app.flush_pending_log_open().await;
 
         if let Some(req) = app.pending_external.take() {
             handle_external(terminal, app, req).await?;
@@ -264,6 +266,8 @@ async fn run(
         if app.is_connected() && !app.log_view_open() {
             app.poll_snapshots().await;
         }
+
+        app.poll_pending_op().await;
     }
     Ok(())
 }
@@ -479,6 +483,11 @@ fn run_kubectl_exec_in_place(
 async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if matches!(key.code, KeyCode::Esc) && app.screen_selection.is_some() {
         app.clear_screen_selection();
+        return false;
+    }
+
+    // While a background op owns the manager, ignore everything but quit.
+    if app.pending_op_open() {
         return false;
     }
 

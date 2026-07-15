@@ -172,6 +172,8 @@ pub struct LogView {
     pub error: Option<String>,
     /// Source line index to highlight after yank (all wrapped segments).
     pub highlight_source: Option<usize>,
+    /// Last clicked / focused wrapped row (for `y` / Ctrl+C).
+    pub focus_wrapped_row: Option<usize>,
     line_rx: mpsc::Receiver<String>,
     err_rx: mpsc::Receiver<String>,
     stream_task: JoinHandle<()>,
@@ -184,11 +186,13 @@ pub struct LogViewLayout {
     pub scroll: usize,
 }
 
-/// Screen region of the detail body — mouse scroll / selection hit-testing.
+/// Screen region of the detail body — mouse scroll hit-testing.
 #[derive(Debug, Clone, Copy)]
 pub struct DetailLayout {
     pub area: Rect,
+    #[allow(dead_code)]
     pub scroll: usize,
+    #[allow(dead_code)]
     pub scroll_x: usize,
 }
 
@@ -258,6 +262,10 @@ pub struct TuiApp {
     /// Display lines for the filtered resource table (for mouse selection / copy).
     pub table_lines: Vec<String>,
     pub table_scroll: usize,
+    /// Full-frame cell grid captured after draw — enables selecting any on-screen text.
+    pub screen_cells: Vec<Vec<String>>,
+    /// Drag selection in terminal coordinates (`line` = row, `col` = column).
+    pub screen_selection: Option<TextSelection>,
     pub status_message: String,
     pub error_message: Option<String>,
     pub crd_targets: Vec<CrdTarget>,
@@ -279,6 +287,8 @@ pub struct TuiApp {
     /// Set by action handlers so main loop can suspend TUI for editor/exec.
     pub pending_external: Option<ExternalRequest>,
     connect_attempted: bool,
+    /// Non-blocking connect so crossterm keeps draining mouse/key input.
+    connect_task: Option<tokio::task::JoinHandle<Result<ClusterManager, rl_core::Error>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,10 +304,6 @@ pub enum ExternalRequest {
 }
 
 impl TuiApp {
-    pub fn connect_attempted(&self) -> bool {
-        self.connect_attempted
-    }
-
     pub fn new() -> Self {
         let settings = load_settings();
         let theme_mode = ThemeMode::from_settings();
@@ -339,6 +345,8 @@ impl TuiApp {
             table_selection: None,
             table_lines: Vec::new(),
             table_scroll: 0,
+            screen_cells: Vec::new(),
+            screen_selection: None,
             status_message: String::new(),
             error_message: None,
             crd_targets: Vec::new(),
@@ -359,6 +367,7 @@ impl TuiApp {
             dashboard: None,
             pending_external: None,
             connect_attempted: false,
+            connect_task: None,
         }
     }
 
@@ -485,49 +494,71 @@ impl TuiApp {
         )
     }
 
-    pub async fn connect(&mut self) {
-        if matches!(
-            self.connection,
-            ConnectionState::Connecting | ConnectionState::Connected
-        ) {
+    /// Start a background connect on first launch (does not block the event loop).
+    pub fn kickoff_connect_if_needed(&mut self) {
+        if self.connect_task.is_some()
+            || matches!(
+                self.connection,
+                ConnectionState::Connecting | ConnectionState::Connected
+            )
+            || self.connect_attempted
+        {
+            return;
+        }
+        self.spawn_connect();
+    }
+
+    fn spawn_connect(&mut self) {
+        if self.connect_task.is_some() {
             return;
         }
         self.connection = ConnectionState::Connecting;
         self.connect_attempted = true;
         self.error_message = None;
         self.status_message = "Connecting...".into();
+        let kind = self.active_kind;
+        self.connect_task = Some(tokio::spawn(async move {
+            ClusterManager::connect_default(kind).await
+        }));
+    }
 
-        match ClusterManager::connect_default(self.active_kind).await {
-            Ok(mut manager) => {
-                let namespaces = manager.list_namespaces().await.unwrap_or_default();
-                let namespace_index = namespaces
-                    .iter()
-                    .position(|n| n == manager.namespace())
-                    .unwrap_or(0);
-                self.crd_targets = manager.crd_targets().to_vec();
-                if self.active_kind == ResourceKind::Crd && !self.crd_targets.is_empty() {
-                    let target = self.crd_targets[self
-                        .selected_crd_index
-                        .min(self.crd_targets.len().saturating_sub(1))]
-                    .clone();
-                    manager.set_selected_crd(Some(target));
-                }
-                self.namespaces = namespaces;
-                self.namespace_index = namespace_index;
-                let ctx = manager.context().to_string();
-                if !self.cluster_tabs.iter().any(|t| t == &ctx) {
-                    self.cluster_tabs.push(ctx.clone());
-                }
-                self.manager = Some(manager);
-                self.sync_context_list().await;
-                self.connection = ConnectionState::Connected;
-                self.status_message = "Connected".into();
-                self.fire_plugins(&ctx);
-                self.persist_ui_settings();
-                self.refresh().await;
+    /// Abort an in-flight connect so quit/`q` is never stuck waiting on kube auth.
+    pub fn cancel_connect(&mut self) {
+        if let Some(handle) = self.connect_task.take() {
+            handle.abort();
+        }
+        if matches!(self.connection, ConnectionState::Connecting) {
+            self.connection = ConnectionState::Disconnected;
+            self.status_message = "Connect cancelled.".into();
+        }
+    }
+
+    /// Apply a finished background connect without stalling crossterm reads.
+    pub async fn poll_connect(&mut self) {
+        let Some(handle) = self.connect_task.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let Some(handle) = self.connect_task.take() else {
+            return;
+        };
+        match handle.await {
+            Ok(Ok(manager)) => self.apply_connected_manager(manager).await,
+            Ok(Err(err)) => {
+                let msg = err.user_message();
+                self.connection = ConnectionState::Failed(msg.clone());
+                self.manager = None;
+                self.status_message.clear();
+                self.error_message = Some(msg);
+            }
+            Err(err) if err.is_cancelled() => {
+                self.connection = ConnectionState::Disconnected;
+                self.status_message = "Connect cancelled.".into();
             }
             Err(err) => {
-                let msg = err.user_message();
+                let msg = format!("Connect task failed: {err}");
                 self.connection = ConnectionState::Failed(msg.clone());
                 self.manager = None;
                 self.status_message.clear();
@@ -536,9 +567,45 @@ impl TuiApp {
         }
     }
 
+    async fn apply_connected_manager(&mut self, mut manager: ClusterManager) {
+        // Mark connected before slow follow-up so the UI/input loop stays responsive.
+        self.connection = ConnectionState::Connected;
+        self.status_message = "Connected".into();
+        self.error_message = None;
+
+        let namespaces = manager.list_namespaces().await.unwrap_or_default();
+        let namespace_index = namespaces
+            .iter()
+            .position(|n| n == manager.namespace())
+            .unwrap_or(0);
+        self.crd_targets = manager.crd_targets().to_vec();
+        if self.active_kind == ResourceKind::Crd && !self.crd_targets.is_empty() {
+            let target = self.crd_targets[self
+                .selected_crd_index
+                .min(self.crd_targets.len().saturating_sub(1))]
+            .clone();
+            manager.set_selected_crd(Some(target));
+        }
+        self.namespaces = namespaces;
+        self.namespace_index = namespace_index;
+        let ctx = manager.context().to_string();
+        if !self.cluster_tabs.iter().any(|t| t == &ctx) {
+            self.cluster_tabs.push(ctx.clone());
+        }
+        self.manager = Some(manager);
+        self.sync_context_list().await;
+        self.fire_plugins(&ctx);
+        self.persist_ui_settings();
+        self.refresh().await;
+    }
+
     pub async fn retry_connect(&mut self) {
+        if self.connect_task.is_some() {
+            return;
+        }
         self.connection = ConnectionState::Disconnected;
-        self.connect().await;
+        self.connect_attempted = false;
+        self.spawn_connect();
     }
 
     pub fn is_connected(&self) -> bool {
@@ -715,89 +782,93 @@ impl TuiApp {
         Some((line, col))
     }
 
-    pub fn begin_table_selection(&mut self, line: usize, col: usize) {
-        self.focus = FocusPane::Table;
-        if line < self.table_lines.len() {
-            self.selected = line;
-        }
+    pub fn begin_screen_selection(&mut self, row: u16, col: u16) {
         self.detail_selection = None;
-        self.table_selection = Some(TextSelection {
-            start_line: line,
-            start_col: col,
-            end_line: line,
-            end_col: col,
+        self.table_selection = None;
+        self.screen_selection = Some(TextSelection {
+            start_line: row as usize,
+            start_col: col as usize,
+            end_line: row as usize,
+            end_col: col as usize,
             dragging: true,
         });
     }
 
-    pub fn update_table_selection(&mut self, line: usize, col: usize) {
-        let Some(sel) = self.table_selection.as_mut() else {
+    pub fn update_screen_selection(&mut self, row: u16, col: u16) {
+        let Some(sel) = self.screen_selection.as_mut() else {
             return;
         };
         if !sel.dragging {
             return;
         }
-        sel.end_line = line;
-        sel.end_col = col;
-        if line < self.table_lines.len() {
-            self.selected = line;
-        }
+        sel.end_line = row as usize;
+        sel.end_col = col as usize;
     }
 
-    pub fn finish_table_selection(&mut self) {
-        let Some(sel) = self.table_selection.as_mut() else {
-            return;
+    pub fn finish_screen_selection(&mut self) -> bool {
+        let Some(sel) = self.screen_selection.as_mut() else {
+            return false;
         };
         sel.dragging = false;
         let ((sl, sc), (el, ec)) = sel.normalized();
         if sl == el && sc == ec {
-            // Click without drag: keep row selected, clear text selection.
-            self.table_selection = None;
-            return;
+            self.screen_selection = None;
+            return false;
         }
-        if let Some(text) = self.selected_table_text() {
-            match crate::clipboard::copy_text(&text) {
-                Ok(()) => {
-                    let preview = if text.len() > 40 {
-                        format!("{}…", text.chars().take(40).collect::<String>())
-                    } else {
-                        text
-                    };
-                    self.status_message = format!("Copied selection: {preview}");
-                    self.error_message = None;
-                }
-                Err(err) => {
-                    self.error_message = Some(format!("Clipboard unavailable: {err}"));
+        if let Some(text) = self.selected_screen_text() {
+            let trimmed = text.trim_end_matches('\n').to_string();
+            if trimmed.chars().any(|c| !c.is_whitespace()) {
+                match crate::clipboard::copy_text(&trimmed) {
+                    Ok(()) => {
+                        let preview = if trimmed.chars().count() > 40 {
+                            format!("{}…", trimmed.chars().take(40).collect::<String>())
+                        } else {
+                            trimmed
+                        };
+                        self.status_message = format!("Copied selection: {preview}");
+                        self.error_message = None;
+                    }
+                    Err(err) => {
+                        self.error_message = Some(format!("Clipboard unavailable: {err}"));
+                    }
                 }
             }
         }
+        true
     }
 
-    pub fn selected_table_text(&self) -> Option<String> {
-        let sel = self.table_selection?;
-        let ((sl, sc), (el, ec)) = sel.normalized();
-        if self.table_lines.is_empty() || sl >= self.table_lines.len() {
+    pub fn clear_screen_selection(&mut self) {
+        self.screen_selection = None;
+    }
+
+    pub fn selected_screen_text(&self) -> Option<String> {
+        let sel = self.screen_selection?;
+        let ((sy, sx), (ey, ex)) = sel.normalized();
+        if self.screen_cells.is_empty() {
             return None;
         }
-        let el = el.min(self.table_lines.len().saturating_sub(1));
-        if sl == el {
-            let line = &self.table_lines[sl];
-            let start = sc.min(line.chars().count());
-            let end = ec.min(line.chars().count()).max(start);
-            return Some(line.chars().skip(start).take(end - start).collect());
-        }
+        let ey = ey.min(self.screen_cells.len().saturating_sub(1));
         let mut out = String::new();
-        let first = &self.table_lines[sl];
-        let start = sc.min(first.chars().count());
-        out.push_str(&first.chars().skip(start).collect::<String>());
-        out.push('\n');
-        for line in &self.table_lines[sl + 1..el] {
-            out.push_str(line);
-            out.push('\n');
+        for y in sy..=ey {
+            let row = &self.screen_cells[y];
+            if row.is_empty() {
+                if y < ey {
+                    out.push('\n');
+                }
+                continue;
+            }
+            let max_x = row.len().saturating_sub(1);
+            let from = if y == sy { sx.min(max_x) } else { 0 };
+            let to = if y == ey { ex.min(max_x) } else { max_x };
+            if from <= to {
+                for cell in &row[from..=to] {
+                    out.push_str(cell);
+                }
+            }
+            if y < ey {
+                out.push('\n');
+            }
         }
-        let last = &self.table_lines[el];
-        let end = ec.min(last.chars().count());
-        out.push_str(&last.chars().take(end).collect::<String>());
         Some(out)
     }
 
@@ -1515,31 +1586,6 @@ impl TuiApp {
         self.scroll_detail(delta);
     }
 
-    pub fn detail_pos_at_terminal(&self, row: u16, column: u16) -> Option<(usize, usize)> {
-        let layout = self.detail_layout?;
-        let area = layout.area;
-        if column < area.x
-            || column >= area.x.saturating_add(area.width)
-            || row < area.y
-            || row >= area.y.saturating_add(area.height)
-        {
-            return None;
-        }
-        let local_row = (row - area.y) as usize;
-        let local_col = (column - area.x) as usize;
-        let line = layout.scroll.saturating_add(local_row);
-        let content = self.detail_content();
-        let line_count = content.lines().count().max(1);
-        if line >= line_count && !content.is_empty() {
-            return Some((line_count.saturating_sub(1), 0));
-        }
-        let text = content.lines().nth(line).unwrap_or("");
-        let col = local_col
-            .saturating_add(layout.scroll_x)
-            .min(text.chars().count());
-        Some((line, col))
-    }
-
     pub fn detail_contains_pos(&self, row: u16, column: u16) -> bool {
         let Some(layout) = self.detail_layout else {
             return false;
@@ -1549,86 +1595,6 @@ impl TuiApp {
             && column < area.x.saturating_add(area.width)
             && row >= area.y
             && row < area.y.saturating_add(area.height)
-    }
-
-    pub fn begin_detail_selection(&mut self, line: usize, col: usize) {
-        self.focus = FocusPane::Detail;
-        self.table_selection = None;
-        self.detail_selection = Some(DetailSelection {
-            start_line: line,
-            start_col: col,
-            end_line: line,
-            end_col: col,
-            dragging: true,
-        });
-    }
-
-    pub fn update_detail_selection(&mut self, line: usize, col: usize) {
-        let Some(sel) = self.detail_selection.as_mut() else {
-            return;
-        };
-        if !sel.dragging {
-            return;
-        }
-        sel.end_line = line;
-        sel.end_col = col;
-    }
-
-    pub fn finish_detail_selection(&mut self) {
-        let Some(sel) = self.detail_selection.as_mut() else {
-            return;
-        };
-        sel.dragging = false;
-        let ((sl, sc), (el, ec)) = sel.normalized();
-        if sl == el && sc == ec {
-            self.detail_selection = None;
-            return;
-        }
-        if let Some(text) = self.selected_detail_text() {
-            match crate::clipboard::copy_text(&text) {
-                Ok(()) => {
-                    let preview = if text.len() > 40 {
-                        format!("{}…", text.chars().take(40).collect::<String>())
-                    } else {
-                        text
-                    };
-                    self.status_message = format!("Copied selection: {preview}");
-                    self.error_message = None;
-                }
-                Err(err) => {
-                    self.error_message = Some(format!("Clipboard unavailable: {err}"));
-                }
-            }
-        }
-    }
-
-    pub fn selected_detail_text(&self) -> Option<String> {
-        let sel = self.detail_selection?;
-        let ((sl, sc), (el, ec)) = sel.normalized();
-        let lines: Vec<&str> = self.detail_content().lines().collect();
-        if lines.is_empty() || sl >= lines.len() {
-            return None;
-        }
-        let el = el.min(lines.len().saturating_sub(1));
-        if sl == el {
-            let line = lines[sl];
-            let start = sc.min(line.chars().count());
-            let end = ec.min(line.chars().count()).max(start);
-            return Some(line.chars().skip(start).take(end - start).collect());
-        }
-        let mut out = String::new();
-        let first = lines[sl];
-        let start = sc.min(first.chars().count());
-        out.push_str(&first.chars().skip(start).collect::<String>());
-        out.push('\n');
-        for line in &lines[sl + 1..el] {
-            out.push_str(line);
-            out.push('\n');
-        }
-        let last = lines[el];
-        let end = ec.min(last.chars().count());
-        out.push_str(&last.chars().take(end).collect::<String>());
-        Some(out)
     }
 
     pub async fn load_detail(&mut self) {
@@ -1800,6 +1766,7 @@ impl TuiApp {
             matches_dirty: false,
             error: None,
             highlight_source: None,
+            focus_wrapped_row: None,
             line_rx,
             err_rx,
             stream_task,
@@ -1835,6 +1802,7 @@ impl TuiApp {
             matches_dirty: false,
             error: None,
             highlight_source: None,
+            focus_wrapped_row: None,
             line_rx,
             err_rx,
             stream_task,
@@ -1983,6 +1951,9 @@ impl TuiApp {
     }
 
     pub fn yank_log_line_at_wrapped_row(&mut self, wrapped_row: usize) {
+        if let Some(log) = self.log_view.as_mut() {
+            log.focus_wrapped_row = Some(wrapped_row);
+        }
         let Some(log) = self.log_view.as_mut() else {
             return;
         };
@@ -2001,8 +1972,33 @@ impl TuiApp {
                 self.error_message = None;
             }
             Err(err) => {
+                // Still mark the row so the user sees which line was targeted.
+                log.highlight_source = Some(source);
                 self.error_message = Some(format!("Clipboard unavailable: {err}"));
             }
+        }
+    }
+
+    /// Copy the focused / highlighted log line (or the top visible row as fallback).
+    pub fn yank_focused_log_line(&mut self) {
+        let Some(log) = self.log_view.as_ref() else {
+            return;
+        };
+        let wrapped = log
+            .focus_wrapped_row
+            .or_else(|| {
+                log.highlight_source
+                    .and_then(|src| log.wrapped_sources.iter().position(|&s| s == src))
+            })
+            .unwrap_or(log.scroll);
+        self.yank_log_line_at_wrapped_row(wrapped);
+    }
+
+    pub fn set_log_focus_wrapped_row(&mut self, wrapped_row: usize) {
+        if let Some(log) = self.log_view.as_mut() {
+            log.focus_wrapped_row = Some(wrapped_row);
+            log.highlight_source = Some(log.source_line_for_wrapped_row(wrapped_row));
+            log.follow = false;
         }
     }
 

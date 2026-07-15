@@ -14,8 +14,12 @@ path = "src/main.rs"
 [dependencies]
 arboard = "3"
 crossterm = "0.28"
+ctrlc = "3"
 ratatui = "0.29"
 rl-core = { path = "../rl-core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -31,6 +31,7 @@ pub fn draw(frame: &mut Frame, app: &mut TuiApp) {
 
     if app.log_view.is_some() {
         draw_log_view(frame, area, app);
+        capture_and_paint_selection(frame, app);
         return;
     }
 
@@ -77,6 +78,56 @@ pub fn draw(frame: &mut Frame, app: &mut TuiApp) {
 
     if let Some(overlay) = app.overlay.clone() {
         draw_overlay(frame, area, app, &overlay);
+    }
+
+    capture_and_paint_selection(frame, app);
+}
+
+/// Snapshot the rendered frame and overlay a drag-selection highlight so any
+/// on-screen text (header, sidebar, table, detail, overlays, logs) can be copied.
+pub fn capture_and_paint_selection(frame: &mut Frame, app: &mut TuiApp) {
+    let area = frame.area();
+    let buf = frame.buffer_mut();
+    let mut cells = Vec::with_capacity(area.height as usize);
+    for y in area.top()..area.bottom() {
+        let mut row = Vec::with_capacity(area.width as usize);
+        for x in area.left()..area.right() {
+            let symbol = buf
+                .cell((x, y))
+                .map(|c| c.symbol().to_string())
+                .unwrap_or_default();
+            row.push(symbol);
+        }
+        cells.push(row);
+    }
+    app.screen_cells = cells;
+
+    let Some(sel) = app.screen_selection else {
+        return;
+    };
+    let ((sy, sx), (ey, ex)) = sel.normalized();
+    let c = colors(app);
+    let style = Style::default()
+        .fg(Color::Black)
+        .bg(c.match_highlight)
+        .add_modifier(Modifier::BOLD);
+    let max_y = area.height.saturating_sub(1) as usize;
+    let max_x = area.width.saturating_sub(1) as usize;
+    let ey = ey.min(max_y);
+    let sy = sy.min(max_y);
+    for y in sy..=ey {
+        let from = if y == sy { sx.min(max_x) } else { 0 };
+        let to = if y == ey { ex.min(max_x) } else { max_x };
+        if from > to {
+            continue;
+        }
+        for x in from..=to {
+            let px = x as u16 + area.left();
+            let py = y as u16 + area.top();
+            if let Some(cell) = buf.cell_mut((px, py)) {
+                cell.set_style(style);
+            }
+        }
     }
 }
 
@@ -407,10 +458,11 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))
             .end_symbol(Some("↓"));
-        // Ratatui maps position 0..=content_length-1; for first-visible scroll that
-        // is max_scroll+1 positions so the thumb reaches the track bottom.
+        // content_length = scroll positions (0..=max_scroll); viewport=1 keeps the thumb
+        // small while still letting position=max_scroll land at the track end.
         let mut scroll_state = ratatui::widgets::ScrollbarState::default()
             .content_length(max_scroll.saturating_add(1))
+            .viewport_content_length(1)
             .position(scroll);
         frame.render_stateful_widget(scrollbar, body, &mut scroll_state);
     }
@@ -591,6 +643,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
             .end_symbol(Some("↓"));
         let mut scroll_state = ratatui::widgets::ScrollbarState::default()
             .content_length(max_scroll.saturating_add(1))
+            .viewport_content_length(1)
             .position(scroll.min(max_scroll));
         frame.render_stateful_widget(scrollbar, text_area, &mut scroll_state);
     }
@@ -602,6 +655,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
             .end_symbol(Some("→"));
         let mut scroll_state = ratatui::widgets::ScrollbarState::default()
             .content_length(max_scroll_x.saturating_add(1))
+            .viewport_content_length(1)
             .position(scroll_x.min(max_scroll_x));
         frame.render_stateful_widget(scrollbar, text_chunks[1], &mut scroll_state);
     }
@@ -765,7 +819,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &TuiApp) {
                     "q quit | / filter | Detail: Ctrl+f find · Shift+wheel pan | ? help | m actions"
                 }
             }
-            ConnectionState::Disconnected | ConnectionState::Connecting => "q quit | connecting...",
+            ConnectionState::Disconnected | ConnectionState::Connecting => {
+                "q quit (abort connect) | waiting for kube..."
+            }
             ConnectionState::Failed(_) => "q quit | r retry connect",
         }
     };
@@ -1110,14 +1166,15 @@ fn draw_settings(
 fn draw_help(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let body = "\
 Navigation: h/l focus · j/k move · Tab kind · c context · n namespace
-Resources: d detail · 1/2/3 Describe/Events/Metrics · mouse scroll/select · L logs
+Resources: d detail · 1/2/3 Describe/Events/Metrics · drag anywhere to copy · L logs
 Search: / table filter · detail focus+/ or Ctrl+f find · n/N next/prev match · y copy name
+Logs: click focus · y/Ctrl+C copy · right-click/double-click copy line · f follow
 Detail pan: Shift+←/→ or Shift+h/l · Shift+wheel (or trackpad left/right)
 Ops: m actions · Ctrl+d delete · s scale · R restart · a apply · E edit
 Shell/PF: e exec (this terminal) · p port-forward · P list PF
 Favorites: f toggle · F jump · o overview
 Clusters: [ ] cycle tabs · Ctrl+t add · Ctrl+w close
-UI: t theme · , settings · ? help · q quit";
+UI: t theme · , settings · ? help · q quit (Ctrl+C quits outside logs)";
     draw_simple_popup(frame, area, " Help ", body, "Esc/Enter close", app);
 }
 
@@ -1417,6 +1474,7 @@ fn draw_log_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
             .end_symbol(Some("↓"));
         let mut scroll_state = ratatui::widgets::ScrollbarState::default()
             .content_length(max_scroll.saturating_add(1))
+            .viewport_content_length(1)
             .position(scroll.min(max_scroll));
         frame.render_stateful_widget(scrollbar, log_chunks[1], &mut scroll_state);
     }
@@ -1424,7 +1482,7 @@ fn draw_log_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     let footer_text = if log.search_mode {
         "type search | Enter find | Esc clear/close search"
     } else {
-        "Esc/q close | / search | n/N match | ↑/↓ scroll | f follow | g/G top/bottom | double-click/`y` copy line"
+        "Esc/q close | / search | n/N match | ↑/↓ scroll | f follow | click focus | y/Ctrl+C/right-click/double-click copy line"
     };
     let footer = Paragraph::new(footer_text).style(Style::default().fg(MUTED));
     frame.render_widget(footer, footer_area);

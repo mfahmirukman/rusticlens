@@ -12,6 +12,11 @@ use eframe::egui;
 use crate::ui::theme::Theme;
 
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("rusticlens {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     logging::init();
     rl_core::ensure_plugins_dir();
     rl_core::write_example_manifest_if_missing();

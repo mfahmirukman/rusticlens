@@ -37,8 +37,11 @@ fn dirs_home() -> PathBuf {
 /// Build a client config for a named context.
 pub async fn config_for_context(context: &str) -> Result<Config> {
     let mut kubeconfig = load_kubeconfig()?;
+    // TUI/GUI owns stdin. Default kube exec auth inherits the tty and steals key
+    // presses (so `q` cannot quit while connecting). Force non-interactive exec.
+    disable_interactive_exec(&mut kubeconfig);
     kubeconfig.current_context = Some(context.to_string());
-    Config::from_custom_kubeconfig(
+    let mut config = Config::from_custom_kubeconfig(
         kubeconfig,
         &kube::config::KubeConfigOptions {
             context: Some(context.to_string()),
@@ -46,7 +49,21 @@ pub async fn config_for_context(context: &str) -> Result<Config> {
         },
     )
     .await
-    .map_err(Error::from)
+    .map_err(Error::from)?;
+    if let Some(exec) = config.auth_info.exec.as_mut() {
+        exec.interactive_mode = Some(kube::config::ExecInteractiveMode::Never);
+    }
+    Ok(config)
+}
+
+fn disable_interactive_exec(kubeconfig: &mut Kubeconfig) {
+    for named in &mut kubeconfig.auth_infos {
+        if let Some(auth) = named.auth_info.as_mut() {
+            if let Some(exec) = auth.exec.as_mut() {
+                exec.interactive_mode = Some(kube::config::ExecInteractiveMode::Never);
+            }
+        }
+    }
 }
 
 /// List all context names from kubeconfig.

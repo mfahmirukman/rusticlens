@@ -4,7 +4,7 @@ A native Rust Kubernetes IDE — a lightweight Freelens/Lens alternative without
 
 Built with **egui** for the desktop UI, **ratatui** for the terminal UI, and **kube-rs** for cluster communication. Typical GUI memory use is ~100–150 MB RSS (egui + async runtime + cluster watches), vs 300–800+ MB for Electron-based clients.
 
-**Current version: 0.5.6**
+**Current version: 0.5.7**
 
 ## What's implemented
 
@@ -85,11 +85,11 @@ Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `ku
 
 - Sidebar navigation across all resource kinds; resource table; Describe / Events / Metrics
 - Resource name filter (`/`) on every kind; detail find (`/` when detail focused, or `Ctrl+f`) with `n`/`N` matches
-- Pod logs with search, follow (`f`), scroll / yank
+- Pod / service logs with search, follow (`f`), scroll; **line copy** via click focus + `y` / `Ctrl+C` / right-click / double-click
 - Context (`c`) / namespace (`n`) pickers; multi-cluster tabs (`[` / `]`, `Ctrl+t` add, `Ctrl+w` close)
 - Overview dashboard (`o`); favorites (`f` / `F`); theme toggle (`t`); settings (`,`)
 - Action menu (`m`): delete, scale, restart, CronJob trigger/suspend, port-forward, favorites
-- Apply / edit YAML via `$VISUAL`/`$EDITOR` (`a` / `E`); exec shell (`e`) suspends the TUI in the current terminal
+- Apply / edit YAML via `$VISUAL`/`$EDITOR` (`a` / `E`); exec shell (`e`) suspends the TUI (Freelens-style `bash || ash || sh`)
 - Port-forward start/list/stop (`p` / `P`); plugins run `on_connect` on connect / context switch
 - Help overlay: `?`
 
@@ -105,10 +105,73 @@ Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `ku
 | `o` | Overview dashboard |
 | `t` | Theme toggle |
 | `Ctrl+f` | Find in detail panel |
-| `/` | Filter table names; find in detail when detail focused |
+| `/` | Filter table names; find in detail or logs when that pane is focused |
 | `[` / `]` | Prev/next cluster tab |
 | `Ctrl+t` / `Ctrl+w` | Add / close cluster tab |
 | `,` / `?` | Settings / help |
+| **Logs** | |
+| click | Focus a log line |
+| `y` / `Ctrl+C` | Copy focused log line |
+| right-click / double-click | Copy line under cursor |
+| `f` | Toggle follow |
+| `n` / `N` | Next / prev search match |
+
+### Clipboard (TUI yank / copy)
+
+Copy uses real OS clipboard tools when available (`wl-copy`, `xclip`/`xsel`, `pbcopy` on macOS), then `arboard`, then OSC 52 as a last resort (SSH / locked-down terminals).
+
+- **Wayland (recommended):** install `wl-clipboard` so yank/pastes into other apps work reliably.
+  - Fedora/Nobara: `sudo dnf install wl-clipboard`
+  - Debian/Ubuntu: `sudo apt install wl-clipboard`
+  - Arch: `sudo pacman -S wl-clipboard`
+- **X11:** `xclip` or `xsel`
+- **macOS:** `pbcopy` is built-in
+- OSC 52 alone is **not** enough on many Wayland terminals (they ignore it for security)
+
+`wl-clipboard` is **optional** — rusticlens runs without it; only yank/copy into the system clipboard needs a working backend.
+
+## Installation
+
+### Quick install (Linux / macOS)
+
+Downloads the latest GitHub Release for your platform, skips the download when already up to date, then replaces `rusticlens` and `rusticlens-tui` under `~/.local/bin` (override with `PREFIX`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mfahmirukman/rusticlens/develop/scripts/install.sh | bash
+```
+
+From a clone:
+
+```bash
+./scripts/install.sh
+# PREFIX=/usr/local/bin ./scripts/install.sh
+# FORCE=1 ./scripts/install.sh   # reinstall even if versions match
+```
+
+The script:
+
+1. Resolves the latest `v*` release from GitHub
+2. Compares against `~/.local/state/rusticlens/installed-version` (or `rusticlens* --version` if present)
+3. Downloads the matching archive, verifies `SHA256SUMS` when possible
+4. Atomically installs the new binaries and removes the previous ones
+5. On macOS, clears quarantine (`xattr -cr`) so Gatekeeper is less likely to block first launch
+
+Ensure `~/.local/bin` is on your `PATH`, then run `rusticlens` (GUI) or `rusticlens-tui` (TUI).
+
+### Manual download
+
+Pre-built archives: [GitHub Releases](https://github.com/mfahmirukman/rusticlens/releases) (`rusticlens` + `rusticlens-tui` for Linux x86_64, macOS universal, Windows x86_64).
+
+**macOS:** unsigned builds may need a one-time unblock:
+
+```bash
+tar xzf rusticlens-*-macos-universal.tar.gz
+xattr -cr rusticlens rusticlens-tui
+./rusticlens          # GUI
+./rusticlens-tui      # TUI
+```
+
+Or Finder: right-click → **Open** → **Open**.
 
 ## Known limitations & bugs
 
@@ -128,6 +191,7 @@ These are current behavioral limits worth knowing before daily use:
 ### Logs
 - **Polling, not streaming** — new log lines are fetched on a ~10s interval (Freelens-style `sinceTime` polling), not a live Kubernetes watch stream.
 - **Large logs** — “load older” chunks are capped; very chatty pods may feel sluggish.
+- **Copy needs a clipboard backend** — see [Clipboard (TUI yank / copy)](#clipboard-tui-yank--copy); mouse capture means the terminal’s native select→copy is unavailable while the TUI is open.
 
 ### Multi-cluster
 - **One active connection** — tabs switch contexts quickly and restore cached lists per context/namespace, but watches run for **one cluster at a time** (not parallel multi-cluster dashboards).
@@ -155,10 +219,11 @@ Please [open an issue](https://github.com/mfahmirukman/rusticlens/issues) if you
 
 ## Requirements
 
-- Rust 1.75+
+- Rust 1.75+ (only if building from source)
 - A valid `~/.kube/config` (or `KUBECONFIG`)
 - `kubectl` on PATH — optional for most GUI flows if native port-forward stays enabled; still needed for service port-forward, external terminal, and kubectl fallback
 - Access to a Kubernetes cluster
+- Optional clipboard tools for TUI copy (see above)
 
 ### Teleport
 
@@ -195,22 +260,9 @@ cargo run -p rl-app --no-default-features --features mimalloc
 cargo build -p rl-app --release --no-default-features --features embedded-terminal
 ```
 
-### Releases
+### Releases (maintainers)
 
-Pre-built binaries are published on [GitHub Releases](https://github.com/mfahmirukman/rusticlens/releases) when a version tag is pushed (`v0.5.0`, etc.). Each archive contains `rusticlens` (GUI) and `rusticlens-tui` (TUI) for Linux x86_64, macOS universal (Apple Silicon + Intel), and Windows x86_64.
-
-**macOS note:** GitHub downloads are unsigned (no Apple Developer ID / notarization). Finder may refuse to open them until you clear quarantine or approve once:
-
-```bash
-tar xzf rusticlens-*-macos-universal.tar.gz
-xattr -cr rusticlens rusticlens-tui
-./rusticlens          # GUI
-./rusticlens-tui      # TUI
-```
-
-Or in Finder: right-click the binary → **Open** → **Open**. Prefer running from Terminal for the first launch so any crash/error is visible.
-
-To trigger a release from source, bump `version` in `Cargo.toml`, commit, then:
+Pushing an annotated semver tag publishes archives via GitHub Actions. Tag version must match `version` in the root `Cargo.toml`:
 
 ```bash
 git tag -a v0.5.0 -m "rusticlens v0.5.0"

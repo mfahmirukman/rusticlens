@@ -28,6 +28,11 @@ use app::{DetailTab, ExternalRequest, Overlay, SettingsCursor, TuiApp, ViewMode}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("rusticlens-tui {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     init_tui_tracing();
 
     rl_core::ensure_plugins_dir();
@@ -131,7 +136,10 @@ fn drain_os_tty_input() {
         use std::io::Read;
         use std::os::fd::AsRawFd;
 
-        let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(false).open("/dev/tty")
+        let Ok(mut tty) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open("/dev/tty")
         else {
             return;
         };
@@ -193,6 +201,36 @@ async fn run(
 
     loop {
         app.kickoff_connect_if_needed();
+
+        // Drain input before slow connect apply/network so `q` always works.
+        let mut should_quit = false;
+        while event::poll(Duration::from_millis(0))? {
+            match event::read()? {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    if wants_global_quit(app, key) {
+                        should_quit = true;
+                        break;
+                    }
+                    if handle_key(app, key).await {
+                        should_quit = true;
+                        break;
+                    }
+                }
+                Event::Key(_) => {}
+                Event::Resize(_, _) => {
+                    terminal.clear()?;
+                }
+                Event::Mouse(mouse) => handle_mouse(app, mouse, &mut last_click),
+                _ => {}
+            }
+        }
+        if should_quit {
+            app.cancel_connect();
+            break;
+        }
+
         app.poll_connect().await;
 
         if let Some(req) = app.pending_external.take() {
@@ -203,32 +241,22 @@ async fn run(
 
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        if event::poll(std::time::Duration::from_millis(200))? {
+        // Idle wait — keep the period short so quit stays snappy while Connecting.
+        if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    if handle_key(app, key).await {
+                    if wants_global_quit(app, key) || handle_key(app, key).await {
+                        app.cancel_connect();
                         break;
                     }
                 }
                 Event::Key(_) => {}
                 Event::Resize(_, _) => {
-                    // Drop leftover glyphs from the previous geometry (classic "doubled" UI).
                     terminal.clear()?;
                 }
-                Event::Mouse(mouse) if app.log_view_open() && !app.log_search_active() => {
-                    handle_log_mouse(app, mouse, &mut last_click);
-                }
-                Event::Mouse(mouse)
-                    if app.is_connected()
-                        && !app.log_view_open()
-                        && !app.overlay_open()
-                        && app.view_mode == ViewMode::Browser =>
-                {
-                    handle_browser_mouse(app, mouse, &mut last_click);
-                }
-                Event::Mouse(_) => {}
+                Event::Mouse(mouse) => handle_mouse(app, mouse, &mut last_click),
                 _ => {}
             }
         }
@@ -238,6 +266,16 @@ async fn run(
         }
     }
     Ok(())
+}
+
+fn wants_global_quit(app: &TuiApp, key: KeyEvent) -> bool {
+    // Overlays / log / search own `q` (close view), and logs use Ctrl+C for yank.
+    if app.log_view_open() || app.detail_search_active() || app.search_mode || app.overlay_open() {
+        return false;
+    }
+    matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')))
 }
 
 async fn handle_external(
@@ -439,6 +477,11 @@ fn run_kubectl_exec_in_place(
 }
 
 async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if matches!(key.code, KeyCode::Esc) && app.screen_selection.is_some() {
+        app.clear_screen_selection();
+        return false;
+    }
+
     if app.log_view_open() {
         return handle_log_key(app, key);
     }
@@ -596,6 +639,14 @@ fn handle_log_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         return handle_log_search_key(app, key);
     }
 
+    // Ctrl+C copies the focused log line (does not quit while logs are open).
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        app.yank_focused_log_line();
+        return false;
+    }
+
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => app.close_log_view(),
         KeyCode::Char('/') => app.enter_log_search(),
@@ -613,32 +664,79 @@ fn handle_log_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Char('g') => app.log_scroll_top(),
         KeyCode::End => app.log_follow_bottom(),
         KeyCode::Home => app.log_scroll_top(),
-        KeyCode::Char('y') => {
-            if let Some(row) = app
-                .log_layout
-                .map(|layout| layout.scroll)
-                .or_else(|| app.log_view.as_ref().map(|log| log.scroll))
-            {
-                app.yank_log_line_at_wrapped_row(row);
-            }
-        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.yank_focused_log_line(),
         _ => {}
     }
     false
 }
 
-fn handle_log_mouse(
-    app: &mut TuiApp,
-    mouse: MouseEvent,
-    last_click: &mut Option<(u16, u16, Instant)>,
-) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => app.log_scroll(-3),
-        MouseEventKind::ScrollDown => app.log_scroll(3),
-        MouseEventKind::Down(MouseButton::Left) => {
-            let Some(wrapped_row) = app.wrapped_row_at_terminal_pos(mouse.row, mouse.column) else {
+/// Global mouse handling: drag-select any on-screen text, plus wheel / click shortcuts.
+fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, last_click: &mut Option<(u16, u16, Instant)>) {
+    let screen_dragging = app.screen_selection.is_some_and(|s| s.dragging);
+
+    // Wheel scrolls stay region-aware (and skip while drag-selecting).
+    if !screen_dragging
+        && matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        )
+    {
+        if app.log_view_open() && !app.log_search_active() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.log_scroll(-3),
+                MouseEventKind::ScrollDown => app.log_scroll(3),
+                _ => {}
+            }
+            return;
+        }
+        if app.is_connected() && !app.log_view_open() && !app.overlay_open() {
+            if app.detail_contains_pos(mouse.row, mouse.column) {
+                app.focus = app::FocusPane::Detail;
+                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                match mouse.kind {
+                    MouseEventKind::ScrollUp if shift => app.scroll_detail_x_by(-1),
+                    MouseEventKind::ScrollDown if shift => app.scroll_detail_x_by(1),
+                    MouseEventKind::ScrollLeft => app.scroll_detail_x_by(-1),
+                    MouseEventKind::ScrollRight => app.scroll_detail_x_by(1),
+                    MouseEventKind::ScrollUp => app.scroll_detail_by(-3),
+                    MouseEventKind::ScrollDown => app.scroll_detail_by(3),
+                    _ => {}
+                }
                 return;
-            };
+            }
+            if app.table_contains_pos(mouse.row, mouse.column)
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                )
+            {
+                let visible = app
+                    .table_layout
+                    .map(|l| l.area.height.max(1) as usize)
+                    .unwrap_or(10);
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => app.scroll_table_by(-5, visible),
+                    MouseEventKind::ScrollDown => app.scroll_table_by(5, visible),
+                    _ => {}
+                }
+            }
+        }
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Right) => {
+            if app.log_view_open() {
+                if let Some(wrapped_row) = app.wrapped_row_at_terminal_pos(mouse.row, mouse.column)
+                {
+                    app.yank_log_line_at_wrapped_row(wrapped_row);
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
             let now = Instant::now();
             let is_double = last_click.is_some_and(|(col, row, t)| {
                 col == mouse.column
@@ -646,154 +744,55 @@ fn handle_log_mouse(
                     && now.duration_since(t) < Duration::from_millis(400)
             });
             *last_click = Some((mouse.column, mouse.row, now));
+
             if is_double {
-                app.yank_log_line_at_wrapped_row(wrapped_row);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_detail_mouse(app: &mut TuiApp, mouse: MouseEvent) {
-    // Scroll whenever the pointer is over the detail body (trackpad / wheel).
-    if matches!(
-        mouse.kind,
-        MouseEventKind::ScrollUp
-            | MouseEventKind::ScrollDown
-            | MouseEventKind::ScrollLeft
-            | MouseEventKind::ScrollRight
-    ) {
-        if !app.detail_contains_pos(mouse.row, mouse.column) {
-            return;
-        }
-        app.focus = app::FocusPane::Detail;
-        let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
-        match mouse.kind {
-            MouseEventKind::ScrollUp if shift => app.scroll_detail_x_by(-1),
-            MouseEventKind::ScrollDown if shift => app.scroll_detail_x_by(1),
-            MouseEventKind::ScrollLeft => app.scroll_detail_x_by(-1),
-            MouseEventKind::ScrollRight => app.scroll_detail_x_by(1),
-            MouseEventKind::ScrollUp => app.scroll_detail_by(-3),
-            MouseEventKind::ScrollDown => app.scroll_detail_by(3),
-            _ => {}
-        }
-        return;
-    }
-
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            let Some((line, col)) = app.detail_pos_at_terminal(mouse.row, mouse.column) else {
-                return;
-            };
-            app.begin_detail_selection(line, col);
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some((line, col)) = app.detail_pos_at_terminal(mouse.row, mouse.column) {
-                app.update_detail_selection(line, col);
-            }
-        }
-        MouseEventKind::Up(MouseButton::Left)
-            if app
-                .detail_selection
-                .is_some_and(|s| s.dragging || app.selected_detail_text().is_some()) =>
-        {
-            app.finish_detail_selection();
-        }
-        _ => {}
-    }
-}
-
-fn handle_browser_mouse(
-    app: &mut TuiApp,
-    mouse: MouseEvent,
-    last_click: &mut Option<(u16, u16, Instant)>,
-) {
-    let table_dragging = app.table_selection.is_some_and(|s| s.dragging);
-    let detail_dragging = app.detail_selection.is_some_and(|s| s.dragging);
-
-    if app.table_contains_pos(mouse.row, mouse.column)
-        || (table_dragging
-            && matches!(
-                mouse.kind,
-                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
-            ))
-    {
-        handle_table_mouse(app, mouse, last_click);
-        return;
-    }
-    if app.detail_contains_pos(mouse.row, mouse.column)
-        || (detail_dragging
-            && matches!(
-                mouse.kind,
-                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
-            ))
-    {
-        handle_detail_mouse(app, mouse);
-    }
-}
-
-fn handle_table_mouse(
-    app: &mut TuiApp,
-    mouse: MouseEvent,
-    last_click: &mut Option<(u16, u16, Instant)>,
-) {
-    if matches!(
-        mouse.kind,
-        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-    ) {
-        let visible = app
-            .table_layout
-            .map(|l| l.area.height.max(1) as usize)
-            .unwrap_or(10);
-        // Always scroll the list when the wheel fires over the middle panel.
-        match mouse.kind {
-            MouseEventKind::ScrollUp => app.scroll_table_by(-5, visible),
-            MouseEventKind::ScrollDown => app.scroll_table_by(5, visible),
-            _ => {}
-        }
-        return;
-    }
-
-    // Text selection / row click only on the data body.
-    if !app.table_body_contains_pos(mouse.row, mouse.column)
-        && !app.table_selection.is_some_and(|s| s.dragging)
-    {
-        return;
-    }
-
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            let Some((line, col)) = app.table_pos_at_terminal(mouse.row, mouse.column) else {
-                return;
-            };
-            let now = Instant::now();
-            let is_double = last_click.is_some_and(|(c, r, t)| {
-                c == mouse.column
-                    && r == mouse.row
-                    && now.duration_since(t) < Duration::from_millis(400)
-            });
-            *last_click = Some((mouse.column, mouse.row, now));
-            if is_double {
-                if line < app.table_lines.len() {
-                    app.selected = line;
+                if app.log_view_open() {
+                    if let Some(wrapped_row) =
+                        app.wrapped_row_at_terminal_pos(mouse.row, mouse.column)
+                    {
+                        app.yank_log_line_at_wrapped_row(wrapped_row);
+                        app.clear_screen_selection();
+                        return;
+                    }
                 }
-                app.yank_selected_resource_name();
-                app.table_selection = None;
-                return;
+                if app.table_body_contains_pos(mouse.row, mouse.column) {
+                    if let Some((line, _)) = app.table_pos_at_terminal(mouse.row, mouse.column) {
+                        if line < app.table_lines.len() {
+                            app.selected = line;
+                        }
+                        app.yank_selected_resource_name();
+                        app.clear_screen_selection();
+                        return;
+                    }
+                }
             }
-            app.begin_table_selection(line, col);
+
+            app.begin_screen_selection(mouse.row, mouse.column);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some((line, col)) = app.table_pos_at_terminal(mouse.row, mouse.column) {
-                app.update_table_selection(line, col);
-            }
+            app.update_screen_selection(mouse.row, mouse.column);
         }
-        MouseEventKind::Up(MouseButton::Left)
-            if app
-                .table_selection
-                .is_some_and(|s| s.dragging || app.selected_table_text().is_some()) =>
-        {
-            app.finish_table_selection();
+        MouseEventKind::Up(MouseButton::Left) => {
+            let copied = app.finish_screen_selection();
+            if copied {
+                return;
+            }
+            // Click without drag: focus / select under the cursor.
+            if app.log_view_open() && !app.log_search_active() {
+                if let Some(wrapped_row) = app.wrapped_row_at_terminal_pos(mouse.row, mouse.column)
+                {
+                    app.set_log_focus_wrapped_row(wrapped_row);
+                }
+            } else if app.table_body_contains_pos(mouse.row, mouse.column) {
+                if let Some((line, _)) = app.table_pos_at_terminal(mouse.row, mouse.column) {
+                    if line < app.table_lines.len() {
+                        app.selected = line;
+                        app.focus = app::FocusPane::Table;
+                    }
+                }
+            } else if app.detail_contains_pos(mouse.row, mouse.column) {
+                app.focus = app::FocusPane::Detail;
+            }
         }
         _ => {}
     }

@@ -3487,7 +3487,7 @@ dependencies = [
 
 [[package]]
 name = "rl-app"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "eframe",
  "egui",
@@ -3501,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "rl-core"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "chrono",
  "futures",
@@ -3519,7 +3519,7 @@ dependencies = [
 
 [[package]]
 name = "rl-tui"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "arboard",
  "crossterm",

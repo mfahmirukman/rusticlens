@@ -1,36 +1,51 @@
 //! Clipboard helpers that avoid hanging on a broken/unreachable X11 display.
-//! Prefer: OSC 52 (terminal) → `wl-copy` / `xclip` / `xsel` → arboard (only with DISPLAY).
+//! Prefer: `wl-copy` / `xclip` / `xsel` / `pbcopy` → OSC 52 (via `/dev/tty`) → arboard.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub fn copy_text(text: &str) -> Result<(), String> {
-    // 1) Terminal clipboard — works without X11/Wayland from the process.
-    if copy_via_osc52(text).is_ok() {
-        // Still try OS clipboard tools so apps outside the terminal get it too.
-        let _ = copy_via_cli(text);
-        return Ok(());
-    }
-
+    // Prefer real OS clipboard tools first. OSC 52 writes "succeed" even when the
+    // terminal ignores them, which made yank look successful without pastable data.
     if copy_via_cli(text) {
+        let _ = copy_via_osc52(text);
         return Ok(());
     }
 
-    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        return arboard::Clipboard::new()
-            .and_then(|mut clip| clip.set_text(text.to_string()))
-            .map_err(|err| err.to_string());
+    let has_gui =
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+
+    if has_gui {
+        if let Ok(()) =
+            arboard::Clipboard::new().and_then(|mut clip| clip.set_text(text.to_string()))
+        {
+            let _ = copy_via_osc52(text);
+            return Ok(());
+        }
+        // Still emit OSC 52 for terminals that allow it, but require a real clipboard
+        // backend on local desktops — Wayland often blocks OSC 52.
+        let _ = copy_via_osc52(text);
+        return Err(
+            "clipboard unavailable — install wl-clipboard (`wl-copy`) or xclip, then retry".into(),
+        );
     }
 
-    Err("clipboard unavailable (terminal may block OSC 52; install wl-copy or xclip)".into())
+    // SSH / no display: OSC 52 may be the only path. Write to /dev/tty so ratatui's
+    // stdout buffering does not swallow the sequence.
+    copy_via_osc52(text).map_err(|_| {
+        "clipboard unavailable (allow OSC 52 in the terminal, or install wl-copy/xclip)".to_string()
+    })
 }
 
 fn copy_via_cli(text: &str) -> bool {
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() && pipe_stdin("wl-copy", &[], text).is_ok() {
+    if pipe_stdin("wl-copy", &[], text).is_ok() {
         return true;
     }
-    // Only touch X11 tools when DISPLAY is set — otherwise xclip/arboard can hang.
+    if cfg!(target_os = "macos") && pipe_stdin("pbcopy", &[], text).is_ok() {
+        return true;
+    }
+    // Only touch X11 tools when DISPLAY is set — otherwise xclip can hang.
     if std::env::var_os("DISPLAY").is_none() {
         return false;
     }
@@ -74,9 +89,24 @@ fn copy_via_osc52(text: &str) -> Result<(), String> {
     const MAX: usize = 100_000;
     let slice = if text.len() > MAX { &text[..MAX] } else { text };
     let encoded = base64_encode(slice.as_bytes());
+    let seq_bel = format!("\x1b]52;c;{encoded}\x07");
+    let seq_st = format!("\x1b]52;c;{encoded}\x1b\\");
+    write_tty(seq_bel.as_bytes())?;
+    write_tty(seq_st.as_bytes())?;
+    Ok(())
+}
+
+fn write_tty(bytes: &[u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            tty.write_all(bytes).map_err(|e| e.to_string())?;
+            tty.flush().map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
     let mut out = std::io::stdout();
-    write!(out, "\x1b]52;c;{encoded}\x07").map_err(|e| e.to_string())?;
-    write!(out, "\x1b]52;c;{encoded}\x1b\\").map_err(|e| e.to_string())?;
+    out.write_all(bytes).map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())
 }
 

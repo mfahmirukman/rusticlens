@@ -696,12 +696,24 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Char('k') => app.move_selection(-1),
         KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H')
-            if app.is_connected() && app.focus == app::FocusPane::Detail =>
+            if app.is_connected() && app.detail_panel_visible() =>
         {
             app.detail_pan_or_focus_left();
         }
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L')
-            if app.is_connected() && app.focus == app::FocusPane::Detail =>
+            if app.is_connected() && app.detail_panel_visible() =>
+        {
+            app.detail_pan_right();
+        }
+        // Unambiguous pan keys (useful over SSH when arrows are remapped).
+        // Note: `,` opens settings — do not reuse it here.
+        KeyCode::Char('<')
+            if app.is_connected() && app.detail_panel_visible() =>
+        {
+            app.detail_pan_or_focus_left();
+        }
+        KeyCode::Char('>') | KeyCode::Char('.')
+            if app.is_connected() && app.detail_panel_visible() =>
         {
             app.detail_pan_right();
         }

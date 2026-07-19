@@ -1287,9 +1287,15 @@ impl TuiApp {
             .map(|l| l.text_width.max(1))
             .unwrap_or(40);
         let max_x = self.detail_max_scroll_x(width);
-        let step = (width / 4).max(4) as i32;
-        let next = self.detail_scroll_x as i32 + delta * step;
+        if max_x == 0 {
+            self.status_message = "Detail fits width — nothing to pan".into();
+            return;
+        }
+        // One “page” step; keep at least 8 columns so a single keypress is obvious.
+        let step = (width / 3).max(8) as i32;
+        let next = self.detail_scroll_x as i32 + delta.signum() * step;
         self.detail_scroll_x = next.clamp(0, max_x as i32) as usize;
+        self.status_message = format!("Detail pan {}/{}", self.detail_scroll_x, max_x);
     }
 
     pub fn detail_max_scroll_x(&self, viewport_width: usize) -> usize {
@@ -1302,12 +1308,13 @@ impl TuiApp {
         max_len.saturating_sub(viewport_width.max(1))
     }
 
-    /// ← / h while detail is focused: pan left, or leave detail when already at the left edge.
+    /// Pan detail horizontally. Works whenever the detail pane is open (focus optional).
     pub fn detail_pan_or_focus_left(&mut self) {
-        if self.focus != FocusPane::Detail {
+        if !self.detail_panel_visible() {
             self.focus_left();
             return;
         }
+        self.focus = FocusPane::Detail;
         if self.detail_scroll_x > 0 {
             self.scroll_detail_x_by(-1);
         } else {
@@ -1316,10 +1323,11 @@ impl TuiApp {
     }
 
     pub fn detail_pan_right(&mut self) {
-        if self.focus != FocusPane::Detail {
+        if !self.detail_panel_visible() {
             self.focus_right();
             return;
         }
+        self.focus = FocusPane::Detail;
         self.scroll_detail_x_by(1);
     }
 

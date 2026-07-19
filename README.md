@@ -36,9 +36,10 @@ See [Roadmap](docs/ROADMAP.md) for version history (v0.1–v0.5) and future work
 - **Icon rail** for pinned contexts + **multi-cluster tabs** (open/switch/close contexts; tab list persisted)
 - Freelens-inspired layout: collapsible sidebar, workload tabs, resource list + bottom logs panel
 - **50/50 vertical split** between resource list and logs on first launch (until you resize)
-- **Detail panel** (Describe / Events / Metrics) on the right when a resource is selected — close with **✕** or **Esc**
+- **Detail panel** (Describe / Events / Metrics) opens on demand with **`D`** / palette Describe — not on row select alone; close with **✕** or **Esc** (selection stays)
 - Namespace selector; UI state persisted in `~/.config/rusticlens/settings.json`
 - **Cluster settings** — merge extra kubeconfig files and toggle native port-forward (Ctrl+K → Cluster settings)
+- Shared cluster cache with TUI (`~/.cache/rusticlens/cluster-cache.json`); soft-refuse stacked context/namespace/refresh with `Busy — …`
 
 ### Resources (20 built-in kinds)
 - **Workloads:** Pods, Deployments, StatefulSets, Jobs, Cron Jobs
@@ -289,10 +290,10 @@ See [Development — Releases](docs/DEVELOPMENT.md#releases-github-actions) for 
 |-----|--------|
 | `Ctrl+K` | Command palette |
 | `R` | Refresh watches |
-| `D` | Describe selected resource |
+| `D` | Open detail panel (Describe) for selected resource |
 | `L` | Open logs for selected pod |
 | `E` | Show events for selected resource |
-| `Esc` | Close detail panel |
+| `Esc` | Close detail panel (keeps row selection) |
 | `Ctrl+F` | Focus search in Describe / Events |
 | `/` | Focus log search (when a log tab is open) |
 

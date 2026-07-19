@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use eframe::egui;
 use rl_core::{
-    kubectl_edit_command, kubectl_exec_command, kubectl_port_forward_command,
-    spawn_kubectl_attach_terminal, spawn_kubectl_exec_terminal, ClusterDashboard, ContainerInfo,
-    CrdTarget, FavoriteResource, PortForwardInfo, ResourceKind, ResourceSnapshot,
+    kubectl_edit_command, kubectl_exec_command, kubectl_port_forward_command, load_cluster_cache,
+    save_cluster_cache, spawn_kubectl_attach_terminal, spawn_kubectl_exec_terminal, ClusterCache,
+    ClusterDashboard, ContainerInfo, CrdTarget, FavoriteResource, PortForwardInfo, ResourceKind,
+    ResourceSnapshot,
 };
 
 use crate::backend::{BackendCommand, BackendEvent, BackendHandle};
@@ -75,6 +76,9 @@ pub struct RusticlensApp {
     error_message: Option<String>,
     connected: bool,
     connecting: bool,
+    exclusive_busy: bool,
+    cluster_cache: ClusterCache,
+    detail_panel_visible: bool,
     log_tabs: LogTabsState,
     pending_delete: Option<(ResourceKind, String, bool)>,
     delete_confirm: Option<(ResourceKind, String, bool)>,
@@ -106,6 +110,13 @@ impl RusticlensApp {
     pub fn new(backend: BackendHandle) -> Self {
         backend.send(BackendCommand::ConnectDefault);
         let settings = rl_core::load_settings();
+        let disk_cache = load_cluster_cache();
+        let contexts = disk_cache.contexts.clone();
+        let namespaces = contexts
+            .first()
+            .and_then(|c| disk_cache.namespaces_by_context.get(c).cloned())
+            .or_else(|| disk_cache.namespaces_by_context.values().next().cloned())
+            .unwrap_or_default();
         Self {
             backend,
             sidebar: SidebarState::default(),
@@ -123,10 +134,10 @@ impl RusticlensApp {
             },
             detail_search: DetailSearchState::default(),
             snapshots: HashMap::new(),
-            contexts: Vec::new(),
+            contexts,
             pinned_contexts: settings.pinned_contexts,
             icon_rail: IconRailState::default(),
-            namespaces: Vec::new(),
+            namespaces,
             crd_targets: Vec::new(),
             selected_crd: None,
             containers: Vec::new(),
@@ -138,6 +149,9 @@ impl RusticlensApp {
             error_message: None,
             connected: false,
             connecting: true,
+            exclusive_busy: true,
+            cluster_cache: disk_cache,
+            detail_panel_visible: false,
             log_tabs: LogTabsState::default(),
             pending_delete: None,
             delete_confirm: None,
@@ -174,7 +188,19 @@ impl RusticlensApp {
             match event {
                 BackendEvent::Connecting => {
                     self.connecting = true;
+                    self.exclusive_busy = true;
                     self.status_message = "Connecting...".to_string();
+                }
+                BackendEvent::Busy => {
+                    self.status_message = "Busy — wait for current request…".into();
+                }
+                BackendEvent::ExclusiveDone => {
+                    self.exclusive_busy = false;
+                    if self.status_message.starts_with("Busy")
+                        || self.status_message.starts_with("Connecting")
+                    {
+                        self.status_message = "Refresh complete".into();
+                    }
                 }
                 BackendEvent::Connected {
                     context,
@@ -184,17 +210,20 @@ impl RusticlensApp {
                     crd_targets,
                 } => {
                     self.connecting = false;
+                    self.exclusive_busy = false;
                     self.connected = true;
                     self.active_context = context.clone();
                     self.active_namespace = namespace;
-                    self.contexts = contexts;
-                    self.namespaces = namespaces;
+                    self.contexts = contexts.clone();
+                    self.namespaces = namespaces.clone();
                     self.crd_targets = crd_targets;
+                    self.update_cache_from_connected(&context, &contexts, &namespaces);
                     self.sync_pinned_contexts(&context);
                     self.ensure_cluster_tab(&context);
                     // Pause live streams (wrong cluster client) but keep tab buffers.
                     self.backend.send(BackendCommand::CloseAllLogs);
                     self.table.selected = None;
+                    self.detail_panel_visible = false;
                     self.detail.clear();
                     if let Some(id) = self.log_tabs.active_id() {
                         self.resume_log_tab_stream(id);
@@ -338,9 +367,49 @@ impl RusticlensApp {
                 BackendEvent::Error(msg) => {
                     self.error_message = Some(msg);
                     self.connecting = false;
+                    self.exclusive_busy = false;
                 }
             }
         }
+    }
+
+    fn soft_refuse_exclusive(&mut self) -> bool {
+        if self.exclusive_busy {
+            if self.status_message.is_empty() || !self.status_message.starts_with("Busy") {
+                self.status_message = "Busy — wait for current request…".into();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn save_cluster_cache_async(&self) {
+        let cache = self.cluster_cache.clone();
+        std::thread::spawn(move || {
+            let _ = save_cluster_cache(&cache);
+        });
+    }
+
+    fn update_cache_from_connected(
+        &mut self,
+        context: &str,
+        contexts: &[String],
+        namespaces: &[String],
+    ) {
+        self.cluster_cache.contexts = contexts.to_vec();
+        self.cluster_cache
+            .namespaces_by_context
+            .insert(context.to_string(), namespaces.to_vec());
+        self.save_cluster_cache_async();
+    }
+
+    fn send_exclusive(&mut self, cmd: BackendCommand) {
+        if self.soft_refuse_exclusive() {
+            return;
+        }
+        self.exclusive_busy = true;
+        self.backend.send(cmd);
     }
 
     fn current_rows(&self) -> &[rl_core::ResourceRow] {
@@ -559,8 +628,7 @@ impl RusticlensApp {
             && fav.namespace != "-"
             && fav.namespace != self.active_namespace
         {
-            self.backend
-                .send(BackendCommand::SetNamespace(fav.namespace.clone()));
+            self.send_exclusive(BackendCommand::SetNamespace(fav.namespace.clone()));
         }
         self.pending_favorite_select = Some(fav.name.clone());
         self.backend.send(BackendCommand::RefreshList);
@@ -649,7 +717,7 @@ impl RusticlensApp {
             ClusterTabAction::Select(ctx) => {
                 if ctx != self.active_context {
                     self.status_message = format!("Switching to {ctx}...");
-                    self.backend.send(BackendCommand::SwitchContext(ctx));
+                    self.send_exclusive(BackendCommand::SwitchContext(ctx));
                 }
             }
             ClusterTabAction::Close(ctx) => {
@@ -660,12 +728,12 @@ impl RusticlensApp {
                 self.persist_cluster_tabs();
                 if ctx == self.active_context {
                     let next = self.cluster_tabs.first().cloned().unwrap_or(ctx);
-                    self.backend.send(BackendCommand::SwitchContext(next));
+                    self.send_exclusive(BackendCommand::SwitchContext(next));
                 }
             }
             ClusterTabAction::Add(ctx) => {
                 self.ensure_cluster_tab(&ctx);
-                self.backend.send(BackendCommand::SwitchContext(ctx));
+                self.send_exclusive(BackendCommand::SwitchContext(ctx));
             }
         }
     }
@@ -678,7 +746,7 @@ impl RusticlensApp {
             if ctx != self.active_context {
                 self.icon_rail.context_menu_open = false;
                 self.status_message = format!("Switching to {ctx}...");
-                self.backend.send(BackendCommand::SwitchContext(ctx));
+                self.send_exclusive(BackendCommand::SwitchContext(ctx));
             }
         }
         if let Some(ctx) = action.pin {
@@ -699,17 +767,37 @@ impl RusticlensApp {
     }
 
     fn close_detail_panel(&mut self) {
-        self.table.selected = None;
+        self.detail_panel_visible = false;
         self.detail.clear();
         self.detail_search.reset();
+    }
+
+    fn open_detail_panel(&mut self) {
+        self.open_detail_panel_tab(DetailTab::Describe);
+    }
+
+    fn open_detail_panel_tab(&mut self, tab: DetailTab) {
+        if self.table.selected.is_none() || !self.connected {
+            return;
+        }
+        self.detail_panel_visible = true;
+        self.detail_tab = tab;
+        self.detail.tab = tab;
+        match tab {
+            DetailTab::Describe => self.fetch_yaml_for_selection(),
+            DetailTab::Events => self.fetch_events_for_selection(),
+            DetailTab::Metrics => self.fetch_metrics(),
+        }
     }
 
     fn on_table_selection_changed(&mut self, _kind: ResourceKind) {
         self.selected_container = None;
         self.containers.clear();
-        self.fetch_yaml_for_selection();
-        self.detail_tab = DetailTab::Describe;
-        self.detail.tab = DetailTab::Describe;
+        if self.detail_panel_visible {
+            self.fetch_yaml_for_selection();
+        } else {
+            self.detail.clear();
+        }
     }
 
     fn handle_row_context(
@@ -928,19 +1016,17 @@ impl RusticlensApp {
 
     fn run_palette_command(&mut self, ctx: &egui::Context, command: PaletteCommand) {
         match command {
-            PaletteCommand::Refresh => self.backend.send(BackendCommand::RefreshWatch),
+            PaletteCommand::Refresh => self.send_exclusive(BackendCommand::RefreshWatch),
             PaletteCommand::Describe => {
-                self.fetch_yaml_for_selection();
-                self.detail_tab = DetailTab::Describe;
-                self.detail.tab = DetailTab::Describe;
+                self.open_detail_panel();
             }
             PaletteCommand::Logs => self.start_logs_for_selection(),
             PaletteCommand::Events => {
-                self.fetch_events_for_selection();
-                self.detail_tab = DetailTab::Events;
-                self.detail.tab = DetailTab::Events;
+                self.open_detail_panel_tab(DetailTab::Events);
             }
-            PaletteCommand::Metrics => self.fetch_metrics(),
+            PaletteCommand::Metrics => {
+                self.open_detail_panel_tab(DetailTab::Metrics);
+            }
             PaletteCommand::Delete => {
                 let kind = self.sidebar.selected_kind;
                 if let Some(name) = self.selected_name() {
@@ -1098,7 +1184,7 @@ impl RusticlensApp {
         }
 
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F))
-            && self.table.selected.is_some()
+            && self.detail_panel_visible
         {
             self.detail_search.open();
         }
@@ -1108,7 +1194,7 @@ impl RusticlensApp {
         }
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape))
-            && self.table.selected.is_some()
+            && self.detail_panel_visible
             && !ctx.wants_keyboard_input()
         {
             self.close_detail_panel();
@@ -1120,20 +1206,16 @@ impl RusticlensApp {
         }
 
         if ctx.input(|i| i.key_pressed(egui::Key::R)) {
-            self.backend.send(BackendCommand::RefreshWatch);
+            self.send_exclusive(BackendCommand::RefreshWatch);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::D)) {
-            self.fetch_yaml_for_selection();
-            self.detail_tab = DetailTab::Describe;
-            self.detail.tab = DetailTab::Describe;
+            self.open_detail_panel();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::L)) {
             self.start_logs_for_selection();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::E)) {
-            self.fetch_events_for_selection();
-            self.detail_tab = DetailTab::Events;
-            self.detail.tab = DetailTab::Events;
+            self.open_detail_panel_tab(DetailTab::Events);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Slash)) && self.log_tabs.active_id().is_some() {
             self.log_panel.focus_filter = true;
@@ -1181,7 +1263,7 @@ impl eframe::App for RusticlensApp {
         let settings_action = settings_dialog::show(ctx, &mut self.settings_dialog);
         if settings_action.reload_contexts {
             self.status_message = "Reloading contexts from kubeconfig...".into();
-            self.backend.send(BackendCommand::Reconnect);
+            self.send_exclusive(BackendCommand::Reconnect);
         }
         self.show_palette(ctx);
 
@@ -1399,7 +1481,7 @@ impl eframe::App for RusticlensApp {
                     ui.label(egui::RichText::new("Logs").color(Theme::ACCENT).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Refresh").clicked() {
-                            self.backend.send(BackendCommand::RefreshWatch);
+                            self.send_exclusive(BackendCommand::RefreshWatch);
                         }
                         if ui.small_button("Ctrl+K").clicked() {
                             self.palette_open = true;
@@ -1476,8 +1558,10 @@ impl eframe::App for RusticlensApp {
         self.apply_bottom_panel_resize(ctx, resize_id, max_bottom_h);
         set_bottom_panel_persisted_height(ctx, panel_id, self.bottom_height);
 
-        let show_detail =
-            self.table.selected.is_some() && !self.sidebar.show_overview && self.connected;
+        let show_detail = self.detail_panel_visible
+            && self.table.selected.is_some()
+            && !self.sidebar.show_overview
+            && self.connected;
 
         if show_detail {
             const DETAIL_PANEL_ID: &str = "detail_panel";
@@ -1623,6 +1707,7 @@ impl eframe::App for RusticlensApp {
                 let menu_containers_pod = self.menu_containers_pod.clone();
                 let cmd_tx = self.backend.cmd_tx.clone();
                 let mut pending_menu_pod = None;
+                let mut pending_namespace = None;
                 let row_context = crate::ui::resource_table::show(
                     ui,
                     kind,
@@ -1632,7 +1717,7 @@ impl eframe::App for RusticlensApp {
                     &namespaces,
                     &containers,
                     menu_containers_pod.as_deref(),
-                    &mut |ns| self.backend.send(BackendCommand::SetNamespace(ns)),
+                    &mut |ns| pending_namespace = Some(ns),
                     &mut |pod_name| {
                         pending_menu_pod = Some(pod_name.to_string());
                         let _ = cmd_tx.send(BackendCommand::FetchContainers {
@@ -1643,6 +1728,9 @@ impl eframe::App for RusticlensApp {
                 );
                 if let Some(pod) = pending_menu_pod {
                     self.menu_containers_pod = Some(pod);
+                }
+                if let Some(ns) = pending_namespace {
+                    self.send_exclusive(BackendCommand::SetNamespace(ns));
                 }
 
                 if let Some((idx, action)) = row_context {

@@ -330,7 +330,7 @@ impl TuiApp {
             .unwrap_or(ResourceKind::Pod);
 
         if self.manager.as_ref().map(|m| m.namespace()) != Some(fav.namespace.as_str()) {
-            self.switch_to_namespace(&fav.namespace).await;
+            self.switch_to_namespace(fav.namespace.clone()).await;
         }
         self.set_kind(kind).await;
         if let Some(idx) = self.rows.iter().position(|r| r.name == fav.name) {
@@ -362,7 +362,7 @@ impl TuiApp {
             self.error_message = Some(format!("Tab context \"{context}\" is not usable"));
             return;
         }
-        self.switch_to_context(&context).await;
+        self.switch_to_context(context).await;
     }
 
     pub fn add_cluster_tab(&mut self) {
@@ -395,7 +395,7 @@ impl TuiApp {
         let next = self.cluster_tabs[idx.min(self.cluster_tabs.len() - 1)].clone();
         self.persist_ui_settings();
         if next != current {
-            self.switch_to_context(&next).await;
+            self.switch_to_context(next).await;
         }
     }
 

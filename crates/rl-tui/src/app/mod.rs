@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 
 use rl_core::{
     config::context_is_usable, format_events_text, format_metrics_text, load_settings,
-    save_settings, ClusterDashboard, ClusterManager, CrdTarget, FavoriteResource,
+    save_settings, ClusterDashboard, ClusterManager, ContainerInfo, CrdTarget, FavoriteResource,
     PortForwardHandle, ResourceKind, ResourceRow, LOG_BUFFER_MAX_LINES,
 };
 use tokio::sync::mpsc;
@@ -289,7 +289,88 @@ pub struct TuiApp {
     connect_attempted: bool,
     /// Non-blocking connect so crossterm keeps draining mouse/key input.
     connect_task: Option<tokio::task::JoinHandle<Result<ClusterManager, rl_core::Error>>>,
+    /// Non-blocking slow ops (context switch, namespace switch, describe) so the
+    /// input loop stays responsive. Manager is moved into the task and returned.
+    pending_op: Option<PendingOp>,
+    /// Pending log-open request set by a finished FetchContainers/FetchServicePods
+    /// op — main loop opens the view next tick (needs async + &manager).
+    pending_open_log: Option<PendingLogOpen>,
 }
+
+#[derive(Clone)]
+pub enum PendingLogOpen {
+    Pod {
+        pod_name: String,
+        container: Option<String>,
+    },
+    MultiPod {
+        title: String,
+        pod_names: Vec<String>,
+    },
+}
+
+/// In-flight background op spawned off the crossterm input loop.
+pub enum PendingOp {
+    SwitchContext {
+        context: String,
+        handle: tokio::task::JoinHandle<(ClusterManager, SwitchContextOutcome)>,
+    },
+    SwitchNamespace {
+        namespace: String,
+        handle: tokio::task::JoinHandle<(ClusterManager, SwitchNamespaceOutcome)>,
+    },
+    LoadDetail {
+        handle: tokio::task::JoinHandle<(ClusterManager, LoadDetailOutcome)>,
+    },
+    FetchNamespaces {
+        handle: tokio::task::JoinHandle<(ClusterManager, FetchNamespacesOutcome)>,
+    },
+    FetchContainers {
+        pod_name: String,
+        handle: tokio::task::JoinHandle<(ClusterManager, FetchContainersOutcome)>,
+    },
+    FetchServicePods {
+        service_name: String,
+        handle: tokio::task::JoinHandle<(ClusterManager, FetchServicePodsOutcome)>,
+    },
+}
+
+pub type SwitchContextOutcome = Result<SwitchContextResult, rl_core::Error>;
+
+#[derive(Clone)]
+pub struct SwitchContextResult {
+    pub namespaces: Vec<String>,
+    pub namespace_index: usize,
+    pub crd_targets: Vec<CrdTarget>,
+}
+
+pub type SwitchNamespaceOutcome = Result<SwitchNamespaceResult, rl_core::Error>;
+
+#[derive(Clone, Default)]
+pub struct SwitchNamespaceResult {
+    pub rows: Vec<ResourceRow>,
+}
+
+pub type LoadDetailOutcome = Result<LoadDetailResult, rl_core::Error>;
+
+#[derive(Clone)]
+pub enum LoadDetailResult {
+    Describe(String),
+    Events(String),
+    Metrics(String),
+}
+
+pub type FetchNamespacesOutcome = FetchNamespacesResult;
+
+#[derive(Clone)]
+pub struct FetchNamespacesResult {
+    pub namespaces: Vec<String>,
+    pub namespace_index: usize,
+}
+
+pub type FetchContainersOutcome = Result<Vec<ContainerInfo>, rl_core::Error>;
+
+pub type FetchServicePodsOutcome = Result<Vec<String>, rl_core::Error>;
 
 #[derive(Debug, Clone)]
 pub enum ExternalRequest {
@@ -368,6 +449,8 @@ impl TuiApp {
             pending_external: None,
             connect_attempted: false,
             connect_task: None,
+            pending_op: None,
+            pending_open_log: None,
         }
     }
 
@@ -610,6 +693,109 @@ impl TuiApp {
 
     pub fn is_connected(&self) -> bool {
         matches!(self.connection, ConnectionState::Connected)
+    }
+
+    /// True while a background op owns the manager (input should be limited).
+    pub fn pending_op_open(&self) -> bool {
+        self.pending_op.is_some()
+    }
+
+    /// Non-blocking poll: if the in-flight op finished, apply its result.
+    pub async fn poll_pending_op(&mut self) {
+        let Some(op) = self.pending_op.as_ref() else {
+            return;
+        };
+        let finished = match op {
+            PendingOp::SwitchContext { handle, .. } => handle.is_finished(),
+            PendingOp::SwitchNamespace { handle, .. } => handle.is_finished(),
+            PendingOp::LoadDetail { handle, .. } => handle.is_finished(),
+            PendingOp::FetchNamespaces { handle } => handle.is_finished(),
+            PendingOp::FetchContainers { handle, .. } => handle.is_finished(),
+            PendingOp::FetchServicePods { handle, .. } => handle.is_finished(),
+        };
+        if !finished {
+            return;
+        }
+        let Some(op) = self.pending_op.take() else {
+            return;
+        };
+        match op {
+            PendingOp::SwitchContext { context, handle } => match handle.await {
+                Ok((manager, outcome)) => {
+                    self.apply_switch_context(manager, &context, outcome);
+                }
+                Err(err) => {
+                    self.error_message = Some(format!("Context switch task failed: {err}"));
+                    self.status_message.clear();
+                }
+            },
+            PendingOp::SwitchNamespace { namespace, handle } => match handle.await {
+                Ok((manager, outcome)) => {
+                    self.apply_switch_namespace(manager, &namespace, outcome);
+                }
+                Err(err) => {
+                    self.error_message = Some(format!("Namespace switch task failed: {err}"));
+                    self.status_message.clear();
+                }
+            },
+            PendingOp::LoadDetail { handle, .. } => match handle.await {
+                Ok((manager, outcome)) => {
+                    self.apply_load_detail(manager, outcome);
+                }
+                Err(err) => {
+                    self.error_message = Some(format!("Describe task failed: {err}"));
+                    self.status_message.clear();
+                }
+            },
+            PendingOp::FetchNamespaces { handle } => match handle.await {
+                Ok((manager, result)) => {
+                    self.apply_fetch_namespaces(manager, result);
+                }
+                Err(err) => {
+                    self.error_message = Some(format!("Namespace list task failed: {err}"));
+                    self.status_message.clear();
+                }
+            },
+            PendingOp::FetchContainers { pod_name, handle } => match handle.await {
+                Ok((manager, outcome)) => {
+                    self.apply_fetch_containers(manager, pod_name, outcome);
+                }
+                Err(err) => {
+                    self.error_message = Some(format!("Container list task failed: {err}"));
+                    self.status_message.clear();
+                }
+            },
+            PendingOp::FetchServicePods {
+                service_name,
+                handle,
+            } => match handle.await {
+                Ok((manager, outcome)) => {
+                    self.apply_fetch_service_pods(manager, service_name, outcome);
+                }
+                Err(err) => {
+                    self.error_message = Some(format!("Service pod list task failed: {err}"));
+                    self.status_message.clear();
+                }
+            },
+        }
+    }
+
+    /// Drain a pending log-open request set by a finished fetch op.
+    pub async fn flush_pending_log_open(&mut self) {
+        let Some(req) = self.pending_open_log.take() else {
+            return;
+        };
+        match req {
+            PendingLogOpen::Pod {
+                pod_name,
+                container,
+            } => {
+                self.open_log_view(pod_name, container).await;
+            }
+            PendingLogOpen::MultiPod { title, pod_names } => {
+                self.open_multi_pod_log_view(title, pod_names).await;
+            }
+        }
     }
 
     pub async fn refresh(&mut self) {
@@ -1016,14 +1202,54 @@ impl TuiApp {
     }
 
     pub async fn open_namespace_picker(&mut self) {
-        if let Some(manager) = self.manager.as_mut() {
-            self.namespaces = manager.list_namespaces().await.unwrap_or_default();
-            self.namespace_index = self
-                .namespaces
+        if self.pending_op.is_some() {
+            return;
+        }
+        // Fast path: reuse cached namespaces so repeated `n` presses are instant.
+        if !self.namespaces.is_empty() {
+            if let Some(manager) = self.manager.as_ref() {
+                self.namespace_index = self
+                    .namespaces
+                    .iter()
+                    .position(|n| n == manager.namespace())
+                    .unwrap_or(0);
+            }
+            let selected = self
+                .filtered_namespace_indices("")
+                .iter()
+                .position(|idx| *idx == self.namespace_index)
+                .unwrap_or(0);
+            self.overlay = Some(Overlay::Namespace(ListPickerState {
+                search: String::new(),
+                selected,
+            }));
+            return;
+        }
+        let Some(manager) = self.manager.take() else {
+            return;
+        };
+        self.status_message = "Loading namespaces…".into();
+        let handle = tokio::spawn(async move {
+            let namespaces = manager.list_namespaces().await.unwrap_or_default();
+            let namespace_index = namespaces
                 .iter()
                 .position(|n| n == manager.namespace())
                 .unwrap_or(0);
-        }
+            (
+                manager,
+                FetchNamespacesResult {
+                    namespaces,
+                    namespace_index,
+                },
+            )
+        });
+        self.pending_op = Some(PendingOp::FetchNamespaces { handle });
+    }
+
+    fn apply_fetch_namespaces(&mut self, manager: ClusterManager, result: FetchNamespacesOutcome) {
+        self.manager = Some(manager);
+        self.namespaces = result.namespaces;
+        self.namespace_index = result.namespace_index;
         let selected = self
             .filtered_namespace_indices("")
             .iter()
@@ -1033,6 +1259,7 @@ impl TuiApp {
             search: String::new(),
             selected,
         }));
+        self.status_message.clear();
     }
 
     pub fn picker_indices(&self) -> Vec<usize> {
@@ -1357,7 +1584,7 @@ impl TuiApp {
         }
 
         self.close_overlay();
-        self.switch_to_context(&context).await;
+        self.switch_to_context(context).await;
     }
 
     async fn confirm_namespace_picker(&mut self, state: ListPickerState) {
@@ -1367,63 +1594,120 @@ impl TuiApp {
         };
         let namespace = self.namespaces[namespace_idx].clone();
         self.close_overlay();
-        self.switch_to_namespace(&namespace).await;
+        self.switch_to_namespace(namespace).await;
     }
 
-    async fn switch_to_context(&mut self, context: &str) {
-        let kind = self.active_kind;
-        let Some(manager) = self.manager.as_mut() else {
+    async fn switch_to_context(&mut self, context: String) {
+        if self.pending_op.is_some() {
+            return;
+        }
+        let Some(mut manager) = self.manager.take() else {
             return;
         };
-
-        if let Err(err) = manager.switch_context(context, kind).await {
-            self.error_message = Some(err.user_message());
-            return;
-        }
-
-        self.context_index = self.contexts.iter().position(|c| c == context).unwrap_or(0);
-        self.namespaces = manager.list_namespaces().await.unwrap_or_default();
-        self.namespace_index = self
-            .namespaces
-            .iter()
-            .position(|n| n == manager.namespace())
-            .unwrap_or(0);
-        self.crd_targets = manager.crd_targets().to_vec();
-        self.selected_crd_index = 0;
-        if kind == ResourceKind::Crd && !self.crd_targets.is_empty() {
-            manager.set_selected_crd(Some(self.crd_targets[0].clone()));
-        }
-
-        self.selected = 0;
-        self.clear_detail();
+        let kind = self.active_kind;
+        self.status_message = format!("Switching to {context}…");
         self.error_message = None;
-        if !self.cluster_tabs.iter().any(|t| t == context) {
-            self.cluster_tabs.push(context.to_string());
-        }
-        self.fire_plugins(context);
-        self.persist_ui_settings();
-        self.refresh().await;
+        let ctx = context.clone();
+        let handle = tokio::spawn(async move {
+            let outcome = switch_context_work(&mut manager, &context, kind).await;
+            (manager, outcome)
+        });
+        self.pending_op = Some(PendingOp::SwitchContext {
+            context: ctx,
+            handle,
+        });
     }
 
-    async fn switch_to_namespace(&mut self, namespace: &str) {
-        if let Some(manager) = self.manager.as_mut() {
-            if let Err(err) = manager
-                .set_namespace(namespace.to_string(), self.active_kind)
-                .await
-            {
+    fn apply_switch_context(
+        &mut self,
+        manager: ClusterManager,
+        context: &str,
+        outcome: SwitchContextOutcome,
+    ) {
+        match outcome {
+            Ok(result) => {
+                self.context_index = self.contexts.iter().position(|c| c == context).unwrap_or(0);
+                self.namespaces = result.namespaces;
+                self.namespace_index = result.namespace_index;
+                self.crd_targets = result.crd_targets;
+                self.selected_crd_index = 0;
+                if self.active_kind == ResourceKind::Crd && !self.crd_targets.is_empty() {
+                    let target = self.crd_targets[0].clone();
+                    let mut manager = manager;
+                    manager.set_selected_crd(Some(target));
+                    self.manager = Some(manager);
+                } else {
+                    self.manager = Some(manager);
+                }
+                self.selected = 0;
+                self.clear_detail();
+                self.error_message = None;
+                if !self.cluster_tabs.iter().any(|t| t == context) {
+                    self.cluster_tabs.push(context.to_string());
+                }
+                self.fire_plugins(context);
+                self.persist_ui_settings();
+                self.status_message = format!("{context} ready");
+            }
+            Err(err) => {
+                self.manager = Some(manager);
                 self.error_message = Some(err.user_message());
-                return;
+                self.status_message.clear();
             }
         }
-        self.namespace_index = self
-            .namespaces
-            .iter()
-            .position(|n| n == namespace)
-            .unwrap_or(0);
-        self.selected = 0;
-        self.clear_detail();
+    }
+
+    async fn switch_to_namespace(&mut self, namespace: String) {
+        if self.pending_op.is_some() {
+            return;
+        }
+        let Some(mut manager) = self.manager.take() else {
+            return;
+        };
+        let kind = self.active_kind;
+        let ns = namespace.clone();
+        self.status_message = format!("Switching to {ns}…");
         self.error_message = None;
-        self.refresh().await;
+        let handle = tokio::spawn(async move {
+            let outcome = switch_namespace_work(&mut manager, &namespace, kind).await;
+            (manager, outcome)
+        });
+        self.pending_op = Some(PendingOp::SwitchNamespace {
+            namespace: ns,
+            handle,
+        });
+    }
+
+    fn apply_switch_namespace(
+        &mut self,
+        manager: ClusterManager,
+        namespace: &str,
+        outcome: SwitchNamespaceOutcome,
+    ) {
+        match outcome {
+            Ok(result) => {
+                self.namespace_index = self
+                    .namespaces
+                    .iter()
+                    .position(|n| n == namespace)
+                    .unwrap_or(0);
+                self.rows = result.rows;
+                if self.selected >= self.rows.len() {
+                    self.selected = self.rows.len().saturating_sub(1);
+                }
+                self.clamp_table_selection();
+                self.selected = 0;
+                self.clear_detail();
+                self.error_message = None;
+                self.manager = Some(manager);
+                self.status_message = format!("Switched to {namespace}");
+            }
+            Err(err) => {
+                self.manager = Some(manager);
+                self.error_message = Some(err.user_message());
+                self.status_message.clear();
+            }
+        }
     }
 
     pub async fn next_crd_target(&mut self) {
@@ -1598,48 +1882,53 @@ impl TuiApp {
     }
 
     pub async fn load_detail(&mut self) {
-        let Some(manager) = self.manager.as_ref() else {
+        if self.pending_op.is_some() {
+            return;
+        }
+        let Some(manager) = self.manager.take() else {
             return;
         };
         let Some(row_idx) = self.selected_row_index() else {
+            self.manager = Some(manager);
             self.error_message = Some("No resource selected".into());
             return;
         };
-        let Some(row) = self.rows.get(row_idx) else {
+        let Some(row) = self.rows.get(row_idx).cloned() else {
+            self.manager = Some(manager);
             self.error_message = Some("No resource selected".into());
             return;
         };
 
         self.error_message = None;
-        match self.detail_tab {
-            DetailTab::Describe => match manager.resource_yaml(self.active_kind, &row.name).await {
-                Ok(yaml) => self.detail_yaml = yaml,
-                Err(err) => self.detail_yaml = err.user_message(),
-            },
-            DetailTab::Events => match manager.resource_events(self.active_kind, &row.name).await {
-                Ok(events) => self.detail_events = format_events_text(&events),
-                Err(err) => self.detail_events = err.user_message(),
-            },
-            DetailTab::Metrics => {
-                if self.active_kind != ResourceKind::Pod {
-                    self.detail_metrics =
-                        "Metrics are only available for pods (requires metrics-server).".into();
-                } else {
-                    match manager.pod_metrics().await {
-                        Ok(metrics) => {
-                            let filtered: Vec<_> = metrics
-                                .into_iter()
-                                .filter(|m| m.pod_name == row.name)
-                                .collect();
-                            if filtered.is_empty() {
-                                self.detail_metrics =
-                                    "No metrics for this pod (is metrics-server installed?)".into();
-                            } else {
-                                self.detail_metrics = format_metrics_text(&filtered);
-                            }
-                        }
-                        Err(err) => self.detail_metrics = err.user_message(),
-                    }
+        let kind = self.active_kind;
+        let tab = self.detail_tab;
+        self.status_message = format!("Loading {tab:?}…");
+        let work_name = row.name.clone();
+        let handle = tokio::spawn(async move {
+            let outcome = load_detail_work(&manager, kind, &work_name, tab).await;
+            (manager, outcome)
+        });
+        self.pending_op = Some(PendingOp::LoadDetail { handle });
+    }
+
+    fn apply_load_detail(&mut self, manager: ClusterManager, outcome: LoadDetailOutcome) {
+        self.manager = Some(manager);
+        match outcome {
+            Ok(LoadDetailResult::Describe(yaml)) => {
+                self.detail_yaml = yaml;
+            }
+            Ok(LoadDetailResult::Events(text)) => {
+                self.detail_events = text;
+            }
+            Ok(LoadDetailResult::Metrics(text)) => {
+                self.detail_metrics = text;
+            }
+            Err(err) => {
+                let msg = err.user_message();
+                match self.detail_tab {
+                    DetailTab::Describe => self.detail_yaml = msg,
+                    DetailTab::Events => self.detail_events = msg,
+                    DetailTab::Metrics => self.detail_metrics = msg,
                 }
             }
         }
@@ -1647,6 +1936,7 @@ impl TuiApp {
         self.detail_scroll_x = 0;
         self.recompute_detail_matches();
         self.scroll_detail_to_current_match();
+        self.status_message.clear();
     }
 
     pub async fn start_logs_for_selection(&mut self) {
@@ -1654,20 +1944,41 @@ impl TuiApp {
             self.error_message = Some("Logs are only available for pods.".into());
             return;
         }
+        if self.pending_op.is_some() {
+            return;
+        }
         let Some(row_idx) = self.selected_row_index() else {
             self.error_message = Some("No pod selected.".into());
             return;
         };
-        let Some(row) = self.rows.get(row_idx) else {
+        let Some(row) = self.rows.get(row_idx).cloned() else {
             self.error_message = Some("No pod selected.".into());
             return;
         };
-        let pod_name = row.name.clone();
-        let Some(manager) = self.manager.as_ref() else {
+        let Some(manager) = self.manager.take() else {
             return;
         };
 
-        match manager.pod_containers(&pod_name).await {
+        let pod_name = row.name.clone();
+        self.status_message = format!("Loading containers for {pod_name}…");
+        self.error_message = None;
+        let work_pod = pod_name.clone();
+        let handle = tokio::spawn(async move {
+            let outcome = manager.pod_containers(&work_pod).await;
+            (manager, outcome)
+        });
+        self.pending_op = Some(PendingOp::FetchContainers { pod_name, handle });
+    }
+
+    fn apply_fetch_containers(
+        &mut self,
+        manager: ClusterManager,
+        pod_name: String,
+        outcome: FetchContainersOutcome,
+    ) {
+        self.manager = Some(manager);
+        self.status_message.clear();
+        match outcome {
             Ok(containers) if containers.len() > 1 => {
                 self.overlay = Some(Overlay::Container {
                     pod_name,
@@ -1681,7 +1992,10 @@ impl TuiApp {
             }
             Ok(containers) => {
                 let container = containers.first().map(|c| c.name.clone());
-                self.open_log_view(pod_name, container).await;
+                self.pending_open_log = Some(PendingLogOpen::Pod {
+                    pod_name,
+                    container,
+                });
             }
             Err(err) => self.error_message = Some(err.user_message()),
         }
@@ -1692,31 +2006,50 @@ impl TuiApp {
             self.error_message = Some("Service logs are only available for Services.".into());
             return;
         }
+        if self.pending_op.is_some() {
+            return;
+        }
         let Some(row_idx) = self.selected_row_index() else {
             self.error_message = Some("No service selected.".into());
             return;
         };
-        let Some(row) = self.rows.get(row_idx) else {
+        let Some(row) = self.rows.get(row_idx).cloned() else {
             self.error_message = Some("No service selected.".into());
             return;
         };
-        let service_name = row.name.clone();
-        let Some(manager) = self.manager.as_ref() else {
+        let Some(manager) = self.manager.take() else {
             return;
         };
 
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            manager.pods_for_service(&service_name),
-        )
-        .await
-        {
-            Ok(Ok(pods)) if pods.is_empty() => {
+        let service_name = row.name.clone();
+        self.status_message = format!("Finding pods for {service_name}…");
+        self.error_message = None;
+        let work_svc = service_name.clone();
+        let handle = tokio::spawn(async move {
+            let outcome = manager.pods_for_service(&work_svc).await;
+            (manager, outcome)
+        });
+        self.pending_op = Some(PendingOp::FetchServicePods {
+            service_name,
+            handle,
+        });
+    }
+
+    fn apply_fetch_service_pods(
+        &mut self,
+        manager: ClusterManager,
+        service_name: String,
+        outcome: FetchServicePodsOutcome,
+    ) {
+        self.manager = Some(manager);
+        self.status_message.clear();
+        match outcome {
+            Ok(pods) if pods.is_empty() => {
                 self.error_message = Some(format!(
                     "No pods match service `{service_name}` (missing or empty selector?)."
                 ));
             }
-            Ok(Ok(mut pods)) => {
+            Ok(mut pods) => {
                 const MAX_SERVICE_LOG_PODS: usize = 40;
                 if pods.len() > MAX_SERVICE_LOG_PODS {
                     let dropped = pods.len() - MAX_SERVICE_LOG_PODS;
@@ -1726,14 +2059,12 @@ impl TuiApp {
                     );
                 }
                 let title = format!("svc/{service_name} ({} pods)", pods.len());
-                self.open_multi_pod_log_view(title, pods).await;
+                self.pending_open_log = Some(PendingLogOpen::MultiPod {
+                    title,
+                    pod_names: pods,
+                });
             }
-            Ok(Err(err)) => self.error_message = Some(err.user_message()),
-            Err(_) => {
-                self.error_message = Some(format!(
-                    "Timed out listing pods for service `{service_name}`."
-                ));
-            }
+            Err(err) => self.error_message = Some(err.user_message()),
         }
     }
 
@@ -2224,4 +2555,68 @@ fn filter_indices(items: &[String], search: &str) -> Vec<usize> {
         .filter(|(_, name)| query.is_empty() || name.to_lowercase().contains(&query))
         .map(|(idx, _)| idx)
         .collect()
+}
+
+/// Network work for a context switch, run off the input loop.
+/// Returns namespaces + namespace index + crd targets for app-side apply.
+async fn switch_context_work(
+    manager: &mut ClusterManager,
+    context: &str,
+    kind: ResourceKind,
+) -> SwitchContextOutcome {
+    manager.switch_context(context, kind).await?;
+    let namespaces = manager.list_namespaces().await.unwrap_or_default();
+    let namespace_index = namespaces
+        .iter()
+        .position(|n| n == manager.namespace())
+        .unwrap_or(0);
+    let crd_targets = manager.crd_targets().to_vec();
+    Ok(SwitchContextResult {
+        namespaces,
+        namespace_index,
+        crd_targets,
+    })
+}
+
+async fn load_detail_work(
+    manager: &ClusterManager,
+    kind: ResourceKind,
+    name: &str,
+    tab: DetailTab,
+) -> LoadDetailOutcome {
+    match tab {
+        DetailTab::Describe => Ok(LoadDetailResult::Describe(
+            manager.resource_yaml(kind, name).await?,
+        )),
+        DetailTab::Events => {
+            let events = manager.resource_events(kind, name).await?;
+            Ok(LoadDetailResult::Events(format_events_text(&events)))
+        }
+        DetailTab::Metrics => {
+            if kind != ResourceKind::Pod {
+                return Ok(LoadDetailResult::Metrics(
+                    "Metrics are only available for pods (requires metrics-server).".into(),
+                ));
+            }
+            let metrics = manager.pod_metrics().await?;
+            let filtered: Vec<_> = metrics.into_iter().filter(|m| m.pod_name == name).collect();
+            if filtered.is_empty() {
+                Ok(LoadDetailResult::Metrics(
+                    "No metrics for this pod (is metrics-server installed?)".into(),
+                ))
+            } else {
+                Ok(LoadDetailResult::Metrics(format_metrics_text(&filtered)))
+            }
+        }
+    }
+}
+
+async fn switch_namespace_work(
+    manager: &mut ClusterManager,
+    namespace: &str,
+    kind: ResourceKind,
+) -> SwitchNamespaceOutcome {
+    manager.set_namespace(namespace.to_string(), kind).await?;
+    let rows = manager.list_rows(kind).await.unwrap_or_default();
+    Ok(SwitchNamespaceResult { rows })
 }

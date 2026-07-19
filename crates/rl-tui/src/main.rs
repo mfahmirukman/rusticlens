@@ -623,6 +623,12 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         return handle_overlay_key(app, key).await;
     }
 
+    // Esc closes the detail pane when open.
+    if matches!(key.code, KeyCode::Esc) && app.is_connected() && app.detail_panel_visible() {
+        app.close_detail_panel();
+        return false;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('d') if app.is_connected() => {
@@ -673,9 +679,18 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         }
         KeyCode::Char('r') if app.needs_connect() => app.retry_connect().await,
         KeyCode::Char('d') if app.is_connected() => app.load_detail().await,
-        KeyCode::Char('1') if app.is_connected() => app.set_detail_tab(DetailTab::Describe),
-        KeyCode::Char('2') if app.is_connected() => app.set_detail_tab(DetailTab::Events),
-        KeyCode::Char('3') if app.is_connected() => app.set_detail_tab(DetailTab::Metrics),
+        KeyCode::Char('1') if app.is_connected() && app.detail_panel_visible() => {
+            app.set_detail_tab(DetailTab::Describe);
+            app.load_detail().await;
+        }
+        KeyCode::Char('2') if app.is_connected() && app.detail_panel_visible() => {
+            app.set_detail_tab(DetailTab::Events);
+            app.load_detail().await;
+        }
+        KeyCode::Char('3') if app.is_connected() && app.detail_panel_visible() => {
+            app.set_detail_tab(DetailTab::Metrics);
+            app.load_detail().await;
+        }
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
         KeyCode::Char('k') => app.move_selection(-1),

@@ -1310,7 +1310,8 @@ impl TuiApp {
     pub fn focus_right(&mut self) {
         self.focus = match self.focus {
             FocusPane::Sidebar => FocusPane::Table,
-            FocusPane::Table => FocusPane::Detail,
+            FocusPane::Table if self.detail_panel_visible() => FocusPane::Detail,
+            FocusPane::Table => FocusPane::Table,
             FocusPane::Detail => FocusPane::Detail,
         };
     }
@@ -1871,6 +1872,22 @@ impl TuiApp {
         self.scroll_detail_to_current_match();
     }
 
+    /// Right-hand Describe/Events/Metrics pane — hidden until `d` loads content.
+    pub fn detail_panel_visible(&self) -> bool {
+        self.detail_loading()
+            || !self.detail_yaml.is_empty()
+            || !self.detail_events.is_empty()
+            || !self.detail_metrics.is_empty()
+    }
+
+    pub fn detail_loading(&self) -> bool {
+        matches!(self.pending_op, Some(PendingOp::LoadDetail { .. }))
+    }
+
+    pub fn close_detail_panel(&mut self) {
+        self.clear_detail();
+    }
+
     fn clear_detail(&mut self) {
         self.detail_yaml.clear();
         self.detail_events.clear();
@@ -1879,6 +1896,10 @@ impl TuiApp {
         self.detail_scroll_x = 0;
         self.detail_selection = None;
         self.clear_detail_search();
+        self.detail_layout = None;
+        if self.focus == FocusPane::Detail {
+            self.focus = FocusPane::Table;
+        }
     }
 
     pub fn detail_search_active(&self) -> bool {
@@ -1890,6 +1911,9 @@ impl TuiApp {
     }
 
     pub fn enter_detail_search(&mut self) {
+        if !self.detail_panel_visible() {
+            return;
+        }
         self.focus = FocusPane::Detail;
         self.detail_search_mode = true;
         self.detail_selection = None;
@@ -2069,6 +2093,7 @@ impl TuiApp {
         self.detail_scroll_x = 0;
         self.recompute_detail_matches();
         self.scroll_detail_to_current_match();
+        self.focus = FocusPane::Detail;
         self.status_message.clear();
     }
 

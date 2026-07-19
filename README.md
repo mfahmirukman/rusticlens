@@ -83,7 +83,7 @@ on_connect = "echo \"connected to $RUSTICLENS_CONTEXT\""
 
 Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `kubectl` where ratatui is a better fit than egui dialogs:
 
-- Sidebar navigation across all resource kinds; resource table; Describe / Events / Metrics
+- Sidebar navigation across all resource kinds; resource table; detail pane opens on `d` (Describe / Events / Metrics) and closes with `Esc`
 - Resource name filter (`/`) on every kind; detail find (`/` when detail focused, or `Ctrl+f`) with `n`/`N` matches
 - Pod / service logs with search, follow (`f`), scroll; **line copy** via click focus + `y` / `Ctrl+C` / right-click / double-click
 - Context (`c`) / namespace (`n`) pickers; multi-cluster tabs (`[` / `]`, `Ctrl+t` add, `Ctrl+w` close)

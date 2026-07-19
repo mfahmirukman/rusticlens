@@ -241,18 +241,30 @@ fn draw_center_message(
 }
 
 fn draw_main_panels(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(22),
-            Constraint::Percentage(72),
-            Constraint::Percentage(28),
-        ])
-        .split(area);
+    let show_detail = app.detail_panel_visible();
+    let chunks = if show_detail {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(22),
+                Constraint::Percentage(55),
+                Constraint::Percentage(45),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(22), Constraint::Min(1)])
+            .split(area)
+    };
 
     draw_sidebar(frame, chunks[0], app);
     draw_table(frame, chunks[1], app);
-    draw_detail(frame, chunks[2], app);
+    if show_detail && chunks.len() > 2 {
+        draw_detail(frame, chunks[2], app);
+    } else {
+        app.detail_layout = None;
+    }
 }
 
 fn draw_sidebar(frame: &mut Frame, area: Rect, app: &TuiApp) {
@@ -523,7 +535,9 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     );
 
     let content = app.detail_content();
-    let display = if content.is_empty() {
+    let display = if app.detail_loading() && content.is_empty() {
+        "Loading…".to_string()
+    } else if content.is_empty() {
         "Select a resource and press d to load details.".to_string()
     } else {
         content.to_string()
@@ -826,9 +840,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &TuiApp) {
         match &app.connection {
             ConnectionState::Connected => {
                 if app.focus == FocusPane::Detail {
-                    "q quit | / or Ctrl+f find | Shift+←/→ pan | n/N matches | 1/2/3 tabs | d reload"
+                    "q quit | Esc close detail | / find | Shift+←/→ pan | 1/2/3 tabs | d reload"
+                } else if app.detail_panel_visible() {
+                    "q quit | / filter | Esc close detail | l focus detail | d reload | ? help"
                 } else {
-                    "q quit | / filter | Detail: Ctrl+f find · Shift+wheel pan | ? help | m actions"
+                    "q quit | / filter | d describe | ? help | m actions"
                 }
             }
             ConnectionState::Disconnected | ConnectionState::Connecting => {

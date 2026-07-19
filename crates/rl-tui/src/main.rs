@@ -98,13 +98,16 @@ fn mouse_wanted() -> bool {
     if std::env::args().any(|a| a == "--mouse") {
         return true;
     }
-    match std::env::var("RUSTICLENS_NO_MOUSE") {
-        Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => false,
-        _ => match std::env::var("RUSTICLENS_MOUSE") {
-            Ok(v) if matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "NO") => false,
-            _ => true,
-        },
+    if matches!(
+        std::env::var("RUSTICLENS_NO_MOUSE").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES")
+    ) {
+        return false;
     }
+    !matches!(
+        std::env::var("RUSTICLENS_MOUSE").as_deref(),
+        Ok("0" | "false" | "FALSE" | "no" | "NO")
+    )
 }
 
 fn enable_mouse_tracking() -> io::Result<()> {

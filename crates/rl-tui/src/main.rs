@@ -695,19 +695,15 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Down => app.move_selection(1),
         KeyCode::Char('k') => app.move_selection(-1),
         KeyCode::Char('j') => app.move_selection(1),
-        KeyCode::Left | KeyCode::Char('h')
-            if key.modifiers.contains(KeyModifiers::SHIFT)
-                && app.is_connected()
-                && app.focus == app::FocusPane::Detail =>
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H')
+            if app.is_connected() && app.focus == app::FocusPane::Detail =>
         {
-            app.scroll_detail_x_by(-1);
+            app.detail_pan_or_focus_left();
         }
-        KeyCode::Right | KeyCode::Char('l')
-            if key.modifiers.contains(KeyModifiers::SHIFT)
-                && app.is_connected()
-                && app.focus == app::FocusPane::Detail =>
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L')
+            if app.is_connected() && app.focus == app::FocusPane::Detail =>
         {
-            app.scroll_detail_x_by(1);
+            app.detail_pan_right();
         }
         KeyCode::Left | KeyCode::Char('h') => app.focus_left(),
         KeyCode::Right | KeyCode::Char('l') => app.focus_right(),

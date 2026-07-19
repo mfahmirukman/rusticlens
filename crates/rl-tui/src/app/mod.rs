@@ -194,6 +194,8 @@ pub struct LogViewLayout {
 #[derive(Debug, Clone, Copy)]
 pub struct DetailLayout {
     pub area: Rect,
+    /// Visible text columns (excludes vertical scrollbar gutter).
+    pub text_width: usize,
     #[allow(dead_code)]
     pub scroll: usize,
     #[allow(dead_code)]
@@ -1282,10 +1284,11 @@ impl TuiApp {
     pub fn scroll_detail_x_by(&mut self, delta: i32) {
         let width = self
             .detail_layout
-            .map(|l| (l.area.width as usize).max(1))
+            .map(|l| l.text_width.max(1))
             .unwrap_or(40);
         let max_x = self.detail_max_scroll_x(width);
-        let next = self.detail_scroll_x as i32 + delta;
+        let step = (width / 4).max(4) as i32;
+        let next = self.detail_scroll_x as i32 + delta * step;
         self.detail_scroll_x = next.clamp(0, max_x as i32) as usize;
     }
 
@@ -1297,6 +1300,27 @@ impl TuiApp {
             .max()
             .unwrap_or(0);
         max_len.saturating_sub(viewport_width.max(1))
+    }
+
+    /// ← / h while detail is focused: pan left, or leave detail when already at the left edge.
+    pub fn detail_pan_or_focus_left(&mut self) {
+        if self.focus != FocusPane::Detail {
+            self.focus_left();
+            return;
+        }
+        if self.detail_scroll_x > 0 {
+            self.scroll_detail_x_by(-1);
+        } else {
+            self.focus_left();
+        }
+    }
+
+    pub fn detail_pan_right(&mut self) {
+        if self.focus != FocusPane::Detail {
+            self.focus_right();
+            return;
+        }
+        self.scroll_detail_x_by(1);
     }
 
     pub fn focus_left(&mut self) {
@@ -2012,7 +2036,7 @@ impl TuiApp {
             .unwrap_or(0);
         let width = self
             .detail_layout
-            .map(|l| (l.area.width as usize).max(1))
+            .map(|l| l.text_width.max(1))
             .unwrap_or(40);
         if col < self.detail_scroll_x {
             self.detail_scroll_x = col;

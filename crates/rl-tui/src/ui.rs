@@ -605,6 +605,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
 
     app.detail_layout = Some(crate::app::DetailLayout {
         area: text_area,
+        text_width,
         scroll,
         scroll_x,
     });
@@ -840,7 +841,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &TuiApp) {
         match &app.connection {
             ConnectionState::Connected => {
                 if app.focus == FocusPane::Detail {
-                    "q quit | Esc close detail | / find | Shift+←/→ pan | 1/2/3 tabs | d reload"
+                    "q quit | Esc close | ←/→ or h/l pan | / find | 1/2/3 tabs | d reload"
                 } else if app.detail_panel_visible() {
                     "q quit | / filter | Esc close detail | l focus detail | d reload | ? help"
                 } else {
@@ -1197,7 +1198,7 @@ Navigation: h/l focus · j/k move · Tab kind · c context · n namespace
 Resources: d detail · 1/2/3 Describe/Events/Metrics · drag anywhere to copy · L logs
 Search: / table filter · detail focus+/ or Ctrl+f find · n/N next/prev match · y copy name
 Logs: click focus · y/Ctrl+C copy · right-click/double-click copy line · f follow
-Detail pan: Shift+←/→ or Shift+h/l · Shift+wheel (or trackpad left/right)
+Detail pan: ←/→ or h/l (detail focused) · Shift+wheel with --mouse
 Ops: m actions · Ctrl+d delete · s scale · R restart · a apply · E edit
 Shell/PF: e exec (this terminal) · p port-forward · P list PF
 Favorites: f toggle · F jump · o overview

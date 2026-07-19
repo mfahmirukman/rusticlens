@@ -614,7 +614,13 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     let scroll_x = app.detail_scroll_x.min(max_scroll_x);
     app.detail_scroll_x = scroll_x;
     app.detail_layout = Some(crate::app::DetailLayout {
+        panel: area,
         area: text_area,
+        hscroll_area: if show_hscroll {
+            Some(text_chunks[1])
+        } else {
+            None
+        },
         text_width,
         scroll,
         scroll_x,
@@ -854,9 +860,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &TuiApp) {
         match &app.connection {
             ConnectionState::Connected => {
                 if app.focus == FocusPane::Detail {
-                    "q quit | Esc close | ←/→ pan · </> or . | / find | 1/2/3 | d reload"
+                    "q quit | Esc close | wheel=vert · Shift/Alt/Ctrl+wheel=pan · ←/→ | / find"
                 } else if app.detail_panel_visible() {
-                    "q quit | / filter | Esc close detail | ←/→ pan detail | d reload | ? help"
+                    "q quit | / filter | Esc close detail | Shift+wheel pan | d reload | ? help"
                 } else {
                     "q quit | / filter | d describe | ? help | m actions"
                 }
@@ -1211,7 +1217,7 @@ Navigation: h/l focus · j/k move · Tab kind · c context · n namespace
 Resources: d detail · 1/2/3 Describe/Events/Metrics · drag anywhere to copy · L logs
 Search: / table filter · detail focus+/ or Ctrl+f find · n/N next/prev match · y copy name
 Logs: click focus · y/Ctrl+C copy · right-click/double-click copy line · f follow
-Detail pan: ←/→ or </> or . when detail open · title shows pan col
+Detail pan: Shift/Alt/Ctrl+wheel or wheel on ←→ bar · ←/→ or </> · title shows col
 Ops: m actions · Ctrl+d delete · s scale · R restart · a apply · E edit
 Shell/PF: e exec (this terminal) · p port-forward · P list PF
 Favorites: f toggle · F jump · o overview

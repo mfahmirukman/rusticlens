@@ -91,19 +91,18 @@ async fn main() -> io::Result<()> {
 }
 
 fn mouse_wanted() -> bool {
-    // Default OFF — leaving mouse tracking on after quit dumps SGR junk into the shell
-    // on several emulators (Ghostty, mobile TERM, etc.). Opt in explicitly.
-    if std::env::args().any(|a| a == "--mouse") {
-        return true;
-    }
+    // Default ON — hardened restore clears tracking on quit. Opt out for flaky TERM.
     if std::env::args().any(|a| a == "--no-mouse") {
         return false;
     }
-    match std::env::var("RUSTICLENS_MOUSE") {
-        Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => true,
-        _ => match std::env::var("RUSTICLENS_NO_MOUSE") {
-            Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => false,
-            _ => false,
+    if std::env::args().any(|a| a == "--mouse") {
+        return true;
+    }
+    match std::env::var("RUSTICLENS_NO_MOUSE") {
+        Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => false,
+        _ => match std::env::var("RUSTICLENS_MOUSE") {
+            Ok(v) if matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "NO") => false,
+            _ => true,
         },
     }
 }
@@ -843,12 +842,22 @@ fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, last_click: &mut Option<(u1
         if app.is_connected() && !app.log_view_open() && !app.overlay_open() {
             if app.detail_contains_pos(mouse.row, mouse.column) {
                 app.focus = app::FocusPane::Detail;
-                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                let mods = mouse.modifiers;
+                // Most mice only emit vertical wheel. Horizontal pan via:
+                // - ScrollLeft/ScrollRight (trackpad / tilt-wheel)
+                // - Shift/Alt/Ctrl + vertical wheel
+                // - vertical wheel while cursor is on the bottom ←→ scrollbar
+                let want_hpan = matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                ) || mods.intersects(
+                    KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+                ) || app.detail_hscroll_contains_pos(mouse.row, mouse.column);
                 match mouse.kind {
-                    MouseEventKind::ScrollUp if shift => app.scroll_detail_x_by(-1),
-                    MouseEventKind::ScrollDown if shift => app.scroll_detail_x_by(1),
                     MouseEventKind::ScrollLeft => app.scroll_detail_x_by(-1),
                     MouseEventKind::ScrollRight => app.scroll_detail_x_by(1),
+                    MouseEventKind::ScrollUp if want_hpan => app.scroll_detail_x_by(-1),
+                    MouseEventKind::ScrollDown if want_hpan => app.scroll_detail_x_by(1),
                     MouseEventKind::ScrollUp => app.scroll_detail_by(-3),
                     MouseEventKind::ScrollDown => app.scroll_detail_by(3),
                     _ => {}

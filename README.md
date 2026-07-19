@@ -95,7 +95,7 @@ Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `ku
 - Shared cluster manager (`Arc<RwLock<ClusterManager>>`) — the UI keeps the connection while background tasks lock briefly; sidebar kind switches stay inline/snappy
 - Context/namespace lists are cached in memory and on disk (`$XDG_CACHE_HOME/rusticlens/cluster-cache.json` or `~/.cache/rusticlens/cluster-cache.json`); namespace picker is instant; press `r` for a full reload (contexts + namespaces + rows + watch restart)
 - While a heavy exclusive op runs (context switch, namespace switch, full refresh), navigation and quit stay live; starting another exclusive op soft-refuses with `Busy — …` (describe/logs/fetch run concurrently via read locks)
-- Mouse is optional: **off by default** (avoids SGR mouse leaks on quit). Enable with `rusticlens-tui --mouse` or `RUSTICLENS_MOUSE=1`
+- Mouse is optional: **on by default** (hardened restore on quit). Disable with `rusticlens-tui --no-mouse` or `RUSTICLENS_NO_MOUSE=1`. Detail horizontal pan: Shift/Alt/Ctrl+wheel, wheel on the bottom ←→ bar, or trackpad side-swipe.
 
 | Key | Action |
 |-----|--------|
@@ -197,7 +197,7 @@ These are current behavioral limits worth knowing before daily use:
 - **Polling, not streaming** — new log lines are fetched on a ~10s interval (Freelens-style `sinceTime` polling), not a live Kubernetes watch stream.
 - **Large logs** — “load older” chunks are capped; very chatty pods may feel sluggish.
 - **Copy needs a clipboard backend** — see [Clipboard (TUI yank / copy)](#clipboard-tui-yank--copy); with `--mouse`, the terminal’s native select→copy is unavailable while the TUI is open.
-- **Mouse leak / phantom typing** — mouse tracking is **off by default**. If you enable it (`--mouse`) and still see `65;37;36M`-style junk after quit, run `printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l'` or `reset`.
+- **Mouse leak / phantom typing** — tracking is **on by default** with multi-pass disable on quit. If you still see `65;37;36M`-style junk, run `printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l'` or `reset`, or start with `--no-mouse`.
 
 ### Multi-cluster
 - **One active connection** — tabs switch contexts quickly and restore cached lists per context/namespace, but watches run for **one cluster at a time** (not parallel multi-cluster dashboards).

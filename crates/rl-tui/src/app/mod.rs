@@ -193,7 +193,12 @@ pub struct LogViewLayout {
 /// Screen region of the detail body — mouse scroll hit-testing.
 #[derive(Debug, Clone, Copy)]
 pub struct DetailLayout {
+    /// Full detail column (tabs + body) for coarse mouse hit-testing.
+    pub panel: Rect,
+    /// Text viewport only.
     pub area: Rect,
+    /// Bottom horizontal scrollbar track, if shown.
+    pub hscroll_area: Option<Rect>,
     /// Visible text columns (excludes vertical scrollbar gutter).
     pub text_width: usize,
     #[allow(dead_code)]
@@ -2070,7 +2075,17 @@ impl TuiApp {
         let Some(layout) = self.detail_layout else {
             return false;
         };
-        let area = layout.area;
+        let area = layout.panel;
+        column >= area.x
+            && column < area.x.saturating_add(area.width)
+            && row >= area.y
+            && row < area.y.saturating_add(area.height)
+    }
+
+    pub fn detail_hscroll_contains_pos(&self, row: u16, column: u16) -> bool {
+        let Some(area) = self.detail_layout.and_then(|l| l.hscroll_area) else {
+            return false;
+        };
         column >= area.x
             && column < area.x.saturating_add(area.width)
             && row >= area.y

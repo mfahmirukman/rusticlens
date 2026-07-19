@@ -193,7 +193,14 @@ pub struct LogViewLayout {
 /// Screen region of the detail body — mouse scroll hit-testing.
 #[derive(Debug, Clone, Copy)]
 pub struct DetailLayout {
+    /// Full detail column (tabs + body) for coarse mouse hit-testing.
+    pub panel: Rect,
+    /// Text viewport only.
     pub area: Rect,
+    /// Bottom horizontal scrollbar track, if shown.
+    pub hscroll_area: Option<Rect>,
+    /// Visible text columns (excludes vertical scrollbar gutter).
+    pub text_width: usize,
     #[allow(dead_code)]
     pub scroll: usize,
     #[allow(dead_code)]
@@ -787,8 +794,7 @@ impl TuiApp {
     pub(super) fn busy_soft_refuse(&mut self) -> bool {
         if self.exclusive_op_open() {
             if self.status_message.is_empty() || !self.status_message.starts_with("Busy") {
-                self.status_message =
-                    "Busy — wait for current request (or press q to quit)".into();
+                self.status_message = "Busy — wait for current request (or press q to quit)".into();
             }
             true
         } else {
@@ -961,9 +967,7 @@ impl TuiApp {
         let context = self.active_context.clone();
         self.status_message = "Refreshing…".into();
         self.error_message = None;
-        let handle = tokio::spawn(async move {
-            refresh_work(manager, kind, context).await
-        });
+        let handle = tokio::spawn(async move { refresh_work(manager, kind, context).await });
         self.pending_op = Some(PendingOp::Refresh { handle });
     }
 
@@ -1282,11 +1286,18 @@ impl TuiApp {
     pub fn scroll_detail_x_by(&mut self, delta: i32) {
         let width = self
             .detail_layout
-            .map(|l| (l.area.width as usize).max(1))
+            .map(|l| l.text_width.max(1))
             .unwrap_or(40);
         let max_x = self.detail_max_scroll_x(width);
-        let next = self.detail_scroll_x as i32 + delta;
+        if max_x == 0 {
+            self.status_message = "Detail fits width — nothing to pan".into();
+            return;
+        }
+        // One “page” step; keep at least 8 columns so a single keypress is obvious.
+        let step = (width / 3).max(8) as i32;
+        let next = self.detail_scroll_x as i32 + delta.signum() * step;
         self.detail_scroll_x = next.clamp(0, max_x as i32) as usize;
+        self.status_message = format!("Detail pan {}/{}", self.detail_scroll_x, max_x);
     }
 
     pub fn detail_max_scroll_x(&self, viewport_width: usize) -> usize {
@@ -1297,6 +1308,29 @@ impl TuiApp {
             .max()
             .unwrap_or(0);
         max_len.saturating_sub(viewport_width.max(1))
+    }
+
+    /// Pan detail horizontally. Works whenever the detail pane is open (focus optional).
+    pub fn detail_pan_or_focus_left(&mut self) {
+        if !self.detail_panel_visible() {
+            self.focus_left();
+            return;
+        }
+        self.focus = FocusPane::Detail;
+        if self.detail_scroll_x > 0 {
+            self.scroll_detail_x_by(-1);
+        } else {
+            self.focus_left();
+        }
+    }
+
+    pub fn detail_pan_right(&mut self) {
+        if !self.detail_panel_visible() {
+            self.focus_right();
+            return;
+        }
+        self.focus = FocusPane::Detail;
+        self.scroll_detail_x_by(1);
     }
 
     pub fn focus_left(&mut self) {
@@ -1310,7 +1344,8 @@ impl TuiApp {
     pub fn focus_right(&mut self) {
         self.focus = match self.focus {
             FocusPane::Sidebar => FocusPane::Table,
-            FocusPane::Table => FocusPane::Detail,
+            FocusPane::Table if self.detail_panel_visible() => FocusPane::Detail,
+            FocusPane::Table => FocusPane::Table,
             FocusPane::Detail => FocusPane::Detail,
         };
     }
@@ -1814,9 +1849,8 @@ impl TuiApp {
         let ns = namespace.clone();
         self.status_message = format!("Switching to {ns}…");
         self.error_message = None;
-        let handle = tokio::spawn(async move {
-            switch_namespace_work(manager, &namespace, kind).await
-        });
+        let handle =
+            tokio::spawn(async move { switch_namespace_work(manager, &namespace, kind).await });
         self.pending_op = Some(PendingOp::SwitchNamespace {
             namespace: ns,
             handle,
@@ -1871,6 +1905,22 @@ impl TuiApp {
         self.scroll_detail_to_current_match();
     }
 
+    /// Right-hand Describe/Events/Metrics pane — hidden until `d` loads content.
+    pub fn detail_panel_visible(&self) -> bool {
+        self.detail_loading()
+            || !self.detail_yaml.is_empty()
+            || !self.detail_events.is_empty()
+            || !self.detail_metrics.is_empty()
+    }
+
+    pub fn detail_loading(&self) -> bool {
+        matches!(self.pending_op, Some(PendingOp::LoadDetail { .. }))
+    }
+
+    pub fn close_detail_panel(&mut self) {
+        self.clear_detail();
+    }
+
     fn clear_detail(&mut self) {
         self.detail_yaml.clear();
         self.detail_events.clear();
@@ -1879,6 +1929,10 @@ impl TuiApp {
         self.detail_scroll_x = 0;
         self.detail_selection = None;
         self.clear_detail_search();
+        self.detail_layout = None;
+        if self.focus == FocusPane::Detail {
+            self.focus = FocusPane::Table;
+        }
     }
 
     pub fn detail_search_active(&self) -> bool {
@@ -1890,6 +1944,9 @@ impl TuiApp {
     }
 
     pub fn enter_detail_search(&mut self) {
+        if !self.detail_panel_visible() {
+            return;
+        }
         self.focus = FocusPane::Detail;
         self.detail_search_mode = true;
         self.detail_selection = None;
@@ -1988,7 +2045,7 @@ impl TuiApp {
             .unwrap_or(0);
         let width = self
             .detail_layout
-            .map(|l| (l.area.width as usize).max(1))
+            .map(|l| l.text_width.max(1))
             .unwrap_or(40);
         if col < self.detail_scroll_x {
             self.detail_scroll_x = col;
@@ -2014,7 +2071,17 @@ impl TuiApp {
         let Some(layout) = self.detail_layout else {
             return false;
         };
-        let area = layout.area;
+        let area = layout.panel;
+        column >= area.x
+            && column < area.x.saturating_add(area.width)
+            && row >= area.y
+            && row < area.y.saturating_add(area.height)
+    }
+
+    pub fn detail_hscroll_contains_pos(&self, row: u16, column: u16) -> bool {
+        let Some(area) = self.detail_layout.and_then(|l| l.hscroll_area) else {
+            return false;
+        };
         column >= area.x
             && column < area.x.saturating_add(area.width)
             && row >= area.y
@@ -2039,9 +2106,8 @@ impl TuiApp {
         let tab = self.detail_tab;
         self.status_message = format!("Loading {tab:?}…");
         let work_name = row.name.clone();
-        let handle = tokio::spawn(async move {
-            load_detail_work(manager, kind, &work_name, tab).await
-        });
+        let handle =
+            tokio::spawn(async move { load_detail_work(manager, kind, &work_name, tab).await });
         self.pending_op = Some(PendingOp::LoadDetail { handle });
     }
 
@@ -2069,6 +2135,7 @@ impl TuiApp {
         self.detail_scroll_x = 0;
         self.recompute_detail_matches();
         self.scroll_detail_to_current_match();
+        self.focus = FocusPane::Detail;
         self.status_message.clear();
     }
 
@@ -2156,11 +2223,7 @@ impl TuiApp {
         });
     }
 
-    fn apply_fetch_service_pods(
-        &mut self,
-        service_name: String,
-        outcome: FetchServicePodsOutcome,
-    ) {
+    fn apply_fetch_service_pods(&mut self, service_name: String, outcome: FetchServicePodsOutcome) {
         self.status_message.clear();
         match outcome {
             Ok(pods) if pods.is_empty() => {

@@ -1,10 +1,36 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rl_core::ops::LOG_BUFFER_MAX_LINES;
 use rl_core::{CrdTarget, ResourceKind, ResourceSnapshot};
+use tokio::sync::RwLock;
 
 use crate::log_debug;
 use crate::log_info;
+
+type SharedManager = Arc<RwLock<rl_core::ClusterManager>>;
+
+struct ExclusiveSlot {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+enum ExclusiveOutcome {
+    Connected {
+        /// `Some` replaces the manager (connect/reconnect); `None` keeps the existing Arc.
+        manager: Option<SharedManager>,
+        context: String,
+        namespace: String,
+        contexts: Vec<String>,
+        namespaces: Vec<String>,
+        crd_targets: Vec<CrdTarget>,
+        active_kind: ResourceKind,
+    },
+    RefreshDone {
+        manager: SharedManager,
+        active_kind: ResourceKind,
+    },
+    Failed(String),
+}
 
 /// Commands sent from the UI thread to the background Tokio runtime.
 #[derive(Debug)]
@@ -186,6 +212,10 @@ pub enum BackendEvent {
     },
     #[cfg(feature = "embedded-terminal")]
     EmbeddedExecStopped,
+    /// Exclusive op already running (connect / switch / refresh).
+    Busy,
+    /// Exclusive op finished without a full reconnect (e.g. refresh watch).
+    ExclusiveDone,
     Error(String),
 }
 
@@ -266,9 +296,10 @@ async fn run_backend_loop(
     cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<BackendCommand>,
     event_tx: &std::sync::mpsc::Sender<BackendEvent>,
 ) {
-    use rl_core::ClusterManager;
+    let (outcome_tx, mut outcome_rx) = tokio::sync::mpsc::unbounded_channel::<ExclusiveOutcome>();
 
-    let mut manager: Option<ClusterManager> = None;
+    let mut manager: Option<SharedManager> = None;
+    let mut exclusive: Option<ExclusiveSlot> = None;
     let mut active_kind = ResourceKind::Pod;
     let mut log_polls: HashMap<u64, ActiveLogPoll> = HashMap::new();
     let mut port_forwards: HashMap<u64, PortForwardSession> = HashMap::new();
@@ -280,12 +311,18 @@ async fn run_backend_loop(
     let log_poll_interval = std::time::Duration::from_secs(rl_core::ops::LOG_POLL_INTERVAL_SECS);
 
     loop {
+        if exclusive.as_ref().is_some_and(|e| e.handle.is_finished()) {
+            exclusive = None;
+        }
+
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 if !handle_command(
                     cmd,
                     &mut manager,
+                    &mut exclusive,
+                    &outcome_tx,
                     &mut active_kind,
                     &mut log_polls,
                     &mut port_forwards,
@@ -297,15 +334,24 @@ async fn run_backend_loop(
                     break;
                 }
             }
+            outcome = outcome_rx.recv() => {
+                let Some(outcome) = outcome else { break };
+                exclusive = None;
+                apply_exclusive_outcome(outcome, &mut manager, event_tx).await;
+            }
             _ = tick.tick() => {
                 if let Some(mgr) = manager.as_ref() {
-                    poll_log_tabs(mgr, &mut log_polls, log_poll_interval, event_tx).await;
-                    push_all_snapshots(mgr, event_tx);
+                    if let Ok(guard) = mgr.try_read() {
+                        poll_log_tabs(&guard, &mut log_polls, log_poll_interval, event_tx).await;
+                        push_all_snapshots(&guard, event_tx);
+                    }
                 }
             }
             _ = list_tick.tick() => {
                 if let Some(mgr) = manager.as_ref() {
-                    refresh_on_demand_list(mgr, active_kind, event_tx).await;
+                    if let Ok(guard) = mgr.try_read() {
+                        refresh_on_demand_list(&guard, active_kind, event_tx).await;
+                    }
                 }
             }
         }
@@ -320,10 +366,70 @@ async fn run_backend_loop(
     }
 }
 
+async fn apply_exclusive_outcome(
+    outcome: ExclusiveOutcome,
+    manager: &mut Option<SharedManager>,
+    event_tx: &std::sync::mpsc::Sender<BackendEvent>,
+) {
+    match outcome {
+        ExclusiveOutcome::Connected {
+            manager: new_mgr,
+            context,
+            namespace,
+            contexts,
+            namespaces,
+            crd_targets,
+            active_kind,
+        } => {
+            if let Some(shared) = new_mgr {
+                *manager = Some(shared);
+            }
+            if let Some(shared) = manager.as_ref() {
+                let guard = shared.read().await;
+                push_all_snapshots(&guard, event_tx);
+                refresh_on_demand_list(&guard, active_kind, event_tx).await;
+            }
+            let _ = event_tx.send(BackendEvent::Connected {
+                context,
+                namespace,
+                contexts,
+                namespaces,
+                crd_targets,
+            });
+        }
+        ExclusiveOutcome::RefreshDone {
+            manager: shared,
+            active_kind,
+        } => {
+            let guard = shared.read().await;
+            push_all_snapshots(&guard, event_tx);
+            refresh_on_demand_list(&guard, active_kind, event_tx).await;
+            let _ = event_tx.send(BackendEvent::ExclusiveDone);
+        }
+        ExclusiveOutcome::Failed(msg) => {
+            let _ = event_tx.send(BackendEvent::Error(msg));
+        }
+    }
+}
+
+fn try_begin_exclusive(
+    exclusive: &mut Option<ExclusiveSlot>,
+    event_tx: &std::sync::mpsc::Sender<BackendEvent>,
+) -> bool {
+    if exclusive.as_ref().is_some_and(|e| !e.handle.is_finished()) {
+        let _ = event_tx.send(BackendEvent::Busy);
+        return false;
+    }
+    *exclusive = None;
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     cmd: BackendCommand,
-    manager: &mut Option<rl_core::ClusterManager>,
+    manager: &mut Option<SharedManager>,
+    exclusive: &mut Option<ExclusiveSlot>,
+    outcome_tx: &tokio::sync::mpsc::UnboundedSender<ExclusiveOutcome>,
     active_kind: &mut ResourceKind,
     log_polls: &mut HashMap<u64, ActiveLogPoll>,
     port_forwards: &mut HashMap<u64, PortForwardSession>,
@@ -345,109 +451,165 @@ async fn handle_command(
             return false;
         }
         BackendCommand::ConnectDefault => {
-            let _ = event_tx.send(BackendEvent::Connecting);
-            match ClusterManager::connect_default(*active_kind).await {
-                Ok(mgr) => {
-                    let contexts = ClusterManager::list_contexts().await.unwrap_or_default();
-                    let namespaces = mgr.list_namespaces().await.unwrap_or_default();
-                    let crd_targets = mgr.crd_targets().to_vec();
-                    push_all_snapshots(&mgr, event_tx);
-                    refresh_on_demand_list(&mgr, *active_kind, event_tx).await;
-                    let _ = event_tx.send(BackendEvent::Connected {
-                        context: mgr.context().to_string(),
-                        namespace: mgr.namespace().to_string(),
-                        contexts,
-                        namespaces,
-                        crd_targets,
-                    });
-                    *manager = Some(mgr);
-                }
-                Err(err) => {
-                    let _ = event_tx.send(BackendEvent::Error(err.user_message()));
-                }
+            if !try_begin_exclusive(exclusive, event_tx) {
+                return true;
             }
-        }
-        BackendCommand::SwitchContext(context) => {
-            if let Some(mgr) = manager.as_mut() {
-                let _ = event_tx.send(BackendEvent::Connecting);
-                match mgr.switch_context(&context, *active_kind).await {
-                    Ok(()) => {
+            let _ = event_tx.send(BackendEvent::Connecting);
+            let kind = *active_kind;
+            let outcome_tx = outcome_tx.clone();
+            let handle = tokio::spawn(async move {
+                match ClusterManager::connect_default(kind).await {
+                    Ok(mgr) => {
+                        let contexts = ClusterManager::list_contexts().await.unwrap_or_default();
                         let namespaces = mgr.list_namespaces().await.unwrap_or_default();
                         let crd_targets = mgr.crd_targets().to_vec();
-                        push_all_snapshots(mgr, event_tx);
-                        refresh_on_demand_list(mgr, *active_kind, event_tx).await;
-                        let _ = event_tx.send(BackendEvent::Connected {
-                            context: mgr.context().to_string(),
-                            namespace: mgr.namespace().to_string(),
-                            contexts: ClusterManager::list_contexts().await.unwrap_or_default(),
+                        let context = mgr.context().to_string();
+                        let namespace = mgr.namespace().to_string();
+                        let shared = Arc::new(RwLock::new(mgr));
+                        let _ = outcome_tx.send(ExclusiveOutcome::Connected {
+                            manager: Some(shared),
+                            context,
+                            namespace,
+                            contexts,
                             namespaces,
                             crd_targets,
+                            active_kind: kind,
                         });
                     }
                     Err(err) => {
-                        let _ = event_tx.send(BackendEvent::Error(err.user_message()));
+                        let _ = outcome_tx.send(ExclusiveOutcome::Failed(err.user_message()));
                     }
                 }
+            });
+            *exclusive = Some(ExclusiveSlot { handle });
+        }
+        BackendCommand::SwitchContext(context) => {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            if !try_begin_exclusive(exclusive, event_tx) {
+                return true;
             }
+            let _ = event_tx.send(BackendEvent::Connecting);
+            let kind = *active_kind;
+            let outcome_tx = outcome_tx.clone();
+            let handle = tokio::spawn(async move {
+                let mut guard = shared.write().await;
+                match guard.switch_context(&context, kind).await {
+                    Ok(()) => {
+                        let namespaces = guard.list_namespaces().await.unwrap_or_default();
+                        let crd_targets = guard.crd_targets().to_vec();
+                        let contexts = ClusterManager::list_contexts().await.unwrap_or_default();
+                        let _ = outcome_tx.send(ExclusiveOutcome::Connected {
+                            manager: None,
+                            context: guard.context().to_string(),
+                            namespace: guard.namespace().to_string(),
+                            contexts,
+                            namespaces,
+                            crd_targets,
+                            active_kind: kind,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = outcome_tx.send(ExclusiveOutcome::Failed(err.user_message()));
+                    }
+                }
+            });
+            *exclusive = Some(ExclusiveSlot { handle });
         }
         BackendCommand::SetNamespace(namespace) => {
-            if let Some(mgr) = manager.as_mut() {
-                match mgr.set_namespace(namespace, *active_kind).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            if !try_begin_exclusive(exclusive, event_tx) {
+                return true;
+            }
+            let _ = event_tx.send(BackendEvent::Connecting);
+            let kind = *active_kind;
+            let outcome_tx = outcome_tx.clone();
+            let handle = tokio::spawn(async move {
+                let mut guard = shared.write().await;
+                match guard.set_namespace(namespace, kind).await {
                     Ok(()) => {
-                        push_all_snapshots(mgr, event_tx);
-                        refresh_on_demand_list(mgr, *active_kind, event_tx).await;
-                        let _ = event_tx.send(BackendEvent::Connected {
-                            context: mgr.context().to_string(),
-                            namespace: mgr.namespace().to_string(),
-                            contexts: ClusterManager::list_contexts().await.unwrap_or_default(),
-                            namespaces: mgr.list_namespaces().await.unwrap_or_default(),
-                            crd_targets: mgr.crd_targets().to_vec(),
+                        let namespaces = guard.list_namespaces().await.unwrap_or_default();
+                        let crd_targets = guard.crd_targets().to_vec();
+                        let contexts = ClusterManager::list_contexts().await.unwrap_or_default();
+                        let _ = outcome_tx.send(ExclusiveOutcome::Connected {
+                            manager: None,
+                            context: guard.context().to_string(),
+                            namespace: guard.namespace().to_string(),
+                            contexts,
+                            namespaces,
+                            crd_targets,
+                            active_kind: kind,
                         });
                     }
                     Err(err) => {
-                        let _ = event_tx.send(BackendEvent::Error(err.user_message()));
+                        let _ = outcome_tx.send(ExclusiveOutcome::Failed(err.user_message()));
                     }
                 }
-            }
+            });
+            *exclusive = Some(ExclusiveSlot { handle });
         }
         BackendCommand::SetActiveKind(kind) => {
             *active_kind = kind;
-            if let Some(mgr) = manager.as_mut() {
-                if let Err(err) = mgr.set_active_kind(kind).await {
+            if let Some(shared) = manager.as_ref() {
+                let mut guard = shared.write().await;
+                if let Err(err) = guard.set_active_kind(kind).await {
                     let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                 } else {
-                    push_all_snapshots(mgr, event_tx);
-                    refresh_on_demand_list(mgr, kind, event_tx).await;
+                    push_all_snapshots(&guard, event_tx);
+                    refresh_on_demand_list(&guard, kind, event_tx).await;
                 }
             }
         }
         BackendCommand::SetCrdTarget(target) => {
-            if let Some(mgr) = manager.as_mut() {
-                mgr.set_selected_crd(target);
-                refresh_on_demand_list(mgr, ResourceKind::Crd, event_tx).await;
+            if let Some(shared) = manager.as_ref() {
+                let mut guard = shared.write().await;
+                guard.set_selected_crd(target);
+                refresh_on_demand_list(&guard, ResourceKind::Crd, event_tx).await;
             }
         }
         BackendCommand::RefreshWatch => {
-            if let Some(mgr) = manager.as_mut() {
-                match mgr.refresh_watch(*active_kind).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            if !try_begin_exclusive(exclusive, event_tx) {
+                return true;
+            }
+            let kind = *active_kind;
+            let outcome_tx = outcome_tx.clone();
+            let handle = tokio::spawn(async move {
+                let mut guard = shared.write().await;
+                match guard.refresh_watch(kind).await {
                     Ok(()) => {
-                        push_all_snapshots(mgr, event_tx);
-                        refresh_on_demand_list(mgr, *active_kind, event_tx).await;
+                        drop(guard);
+                        let _ = outcome_tx.send(ExclusiveOutcome::RefreshDone {
+                            manager: shared,
+                            active_kind: kind,
+                        });
                     }
                     Err(err) => {
-                        let _ = event_tx.send(BackendEvent::Error(err.user_message()));
+                        let _ = outcome_tx.send(ExclusiveOutcome::Failed(err.user_message()));
                     }
                 }
-            }
+            });
+            *exclusive = Some(ExclusiveSlot { handle });
         }
         BackendCommand::RefreshList => {
-            if let Some(mgr) = manager.as_ref() {
-                refresh_on_demand_list(mgr, *active_kind, event_tx).await;
+            if let Some(shared) = manager.as_ref() {
+                let guard = shared.read().await;
+                refresh_on_demand_list(&guard, *active_kind, event_tx).await;
             }
         }
         BackendCommand::FetchYaml { kind, name } => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.resource_yaml(kind, &name).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.resource_yaml(kind, &name).await {
                     Ok(yaml) => {
                         let _ = event_tx.send(BackendEvent::YamlLoaded { name, yaml });
                     }
@@ -455,11 +617,16 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::FetchEvents { kind, name } => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.resource_events(kind, &name).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.resource_events(kind, &name).await {
                     Ok(events) => {
                         let _ = event_tx.send(BackendEvent::EventsLoaded {
                             text: format_events_text(&events),
@@ -469,11 +636,16 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::FetchContainers { tab_id, pod_name } => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.pod_containers(&pod_name).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.pod_containers(&pod_name).await {
                     Ok(containers) => {
                         let _ = event_tx.send(BackendEvent::ContainersLoaded {
                             tab_id,
@@ -485,11 +657,16 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::FetchMetrics => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.pod_metrics().await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.pod_metrics().await {
                     Ok(metrics) => {
                         let _ = event_tx.send(BackendEvent::MetricsLoaded {
                             text: format_metrics_text(&metrics),
@@ -499,7 +676,7 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::FetchOlderLogs {
             tab_id,
@@ -508,7 +685,11 @@ async fn handle_command(
             timestamps,
             tail_loaded,
         } => {
-            if let Some(mgr) = manager.as_ref() {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
                 use rl_core::ops::LOG_CHUNK_LINES;
                 let buffered = tail_loaded.min(LOG_BUFFER_MAX_LINES);
                 let request_tail = buffered as i64 + LOG_CHUNK_LINES;
@@ -519,7 +700,8 @@ async fn handle_command(
                     request_tail,
                     "fetching older log chunk from API"
                 );
-                match mgr
+                let guard = shared.read().await;
+                match guard
                     .fetch_pod_logs_tail(&pod_name, container.as_deref(), timestamps, request_tail)
                     .await
                 {
@@ -554,11 +736,16 @@ async fn handle_command(
                         });
                     }
                 }
-            }
+            });
         }
         BackendCommand::DeleteResource { kind, name, force } => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.delete_resource(kind, &name, force).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.delete_resource(kind, &name, force).await {
                     Ok(()) => {
                         let _ = event_tx.send(BackendEvent::ResourceDeleted { kind, name });
                     }
@@ -566,11 +753,16 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::TriggerCronJob { name } => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.trigger_cronjob(&name).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.trigger_cronjob(&name).await {
                     Ok(()) => {
                         let _ = event_tx.send(BackendEvent::CronJobTriggered { name });
                     }
@@ -578,11 +770,16 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::SetCronjobSuspended { name, suspend } => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.set_cronjob_suspended(&name, suspend).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.set_cronjob_suspended(&name, suspend).await {
                     Ok(()) => {
                         let _ = event_tx.send(BackendEvent::CronJobSuspendChanged {
                             name,
@@ -593,11 +790,16 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::RestartDeployment { name } => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.restart_deployment(&name).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.restart_deployment(&name).await {
                     Ok(()) => {
                         let _ = event_tx.send(BackendEvent::DeploymentRestarted { name });
                     }
@@ -605,11 +807,16 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::RestartStatefulSet { name } => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.restart_statefulset(&name).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.restart_statefulset(&name).await {
                     Ok(()) => {
                         let _ = event_tx.send(BackendEvent::StatefulSetRestarted { name });
                     }
@@ -617,11 +824,16 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::ScaleDeployment { name, replicas } => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.scale_deployment(&name, replicas).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.scale_deployment(&name, replicas).await {
                     Ok(()) => {
                         let _ = event_tx.send(BackendEvent::WorkloadScaled {
                             kind: ResourceKind::Deployment,
@@ -633,11 +845,16 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::ScaleStatefulSet { name, replicas } => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.scale_statefulset(&name, replicas).await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.scale_statefulset(&name, replicas).await {
                     Ok(()) => {
                         let _ = event_tx.send(BackendEvent::WorkloadScaled {
                             kind: ResourceKind::StatefulSet,
@@ -649,11 +866,13 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::ApplyYaml { yaml } => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.apply_yaml(&yaml).await {
+            if let Some(shared) = manager.as_ref() {
+                // Inline: serde_yaml deserializer is !Send, so this cannot be spawned.
+                let guard = shared.read().await;
+                match guard.apply_yaml(&yaml).await {
                     Ok(resources) => {
                         let _ = event_tx.send(BackendEvent::YamlApplied { resources });
                     }
@@ -664,40 +883,59 @@ async fn handle_command(
             }
         }
         BackendCommand::Reconnect => {
-            let kind = *active_kind;
-            let context = manager
-                .as_ref()
-                .map(|m| m.context().to_string())
-                .or_else(|| rl_core::config::current_context_name().ok().flatten());
-            let _ = event_tx.send(BackendEvent::Connecting);
-            let result = match context {
-                Some(ctx) => ClusterManager::connect(&ctx, kind).await,
-                None => ClusterManager::connect_default(kind).await,
-            };
-            match result {
-                Ok(mgr) => {
-                    let contexts = ClusterManager::list_contexts().await.unwrap_or_default();
-                    let namespaces = mgr.list_namespaces().await.unwrap_or_default();
-                    let crd_targets = mgr.crd_targets().to_vec();
-                    push_all_snapshots(&mgr, event_tx);
-                    refresh_on_demand_list(&mgr, kind, event_tx).await;
-                    let _ = event_tx.send(BackendEvent::Connected {
-                        context: mgr.context().to_string(),
-                        namespace: mgr.namespace().to_string(),
-                        contexts,
-                        namespaces,
-                        crd_targets,
-                    });
-                    *manager = Some(mgr);
-                }
-                Err(err) => {
-                    let _ = event_tx.send(BackendEvent::Error(err.user_message()));
-                }
+            if !try_begin_exclusive(exclusive, event_tx) {
+                return true;
             }
+            let kind = *active_kind;
+            let context = if let Some(shared) = manager.as_ref() {
+                let guard = shared.try_read();
+                match guard {
+                    Ok(g) => Some(g.context().to_string()),
+                    Err(_) => rl_core::config::current_context_name().ok().flatten(),
+                }
+            } else {
+                rl_core::config::current_context_name().ok().flatten()
+            };
+            let _ = event_tx.send(BackendEvent::Connecting);
+            let outcome_tx = outcome_tx.clone();
+            let handle = tokio::spawn(async move {
+                let result = match context {
+                    Some(ctx) => ClusterManager::connect(&ctx, kind).await,
+                    None => ClusterManager::connect_default(kind).await,
+                };
+                match result {
+                    Ok(mgr) => {
+                        let contexts = ClusterManager::list_contexts().await.unwrap_or_default();
+                        let namespaces = mgr.list_namespaces().await.unwrap_or_default();
+                        let crd_targets = mgr.crd_targets().to_vec();
+                        let context = mgr.context().to_string();
+                        let namespace = mgr.namespace().to_string();
+                        let shared = Arc::new(RwLock::new(mgr));
+                        let _ = outcome_tx.send(ExclusiveOutcome::Connected {
+                            manager: Some(shared),
+                            context,
+                            namespace,
+                            contexts,
+                            namespaces,
+                            crd_targets,
+                            active_kind: kind,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = outcome_tx.send(ExclusiveOutcome::Failed(err.user_message()));
+                    }
+                }
+            });
+            *exclusive = Some(ExclusiveSlot { handle });
         }
         BackendCommand::FetchDashboard => {
-            if let Some(mgr) = manager.as_ref() {
-                match mgr.fetch_dashboard().await {
+            let Some(shared) = manager.clone() else {
+                return true;
+            };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let guard = shared.read().await;
+                match guard.fetch_dashboard().await {
                     Ok(dashboard) => {
                         let _ = event_tx.send(BackendEvent::DashboardLoaded { dashboard });
                     }
@@ -705,16 +943,17 @@ async fn handle_command(
                         let _ = event_tx.send(BackendEvent::Error(err.user_message()));
                     }
                 }
-            }
+            });
         }
         BackendCommand::StartLogs {
             tab_id,
             pod_name,
             container,
         } => {
-            if let Some(mgr) = manager.as_ref() {
+            if let Some(shared) = manager.as_ref() {
                 log_polls.remove(&tab_id);
-                start_log_poll(mgr, tab_id, pod_name, container, log_polls, event_tx).await;
+                let guard = shared.read().await;
+                start_log_poll(&guard, tab_id, pod_name, container, log_polls, event_tx).await;
             }
         }
         BackendCommand::CloseLog { tab_id } => {
@@ -724,8 +963,9 @@ async fn handle_command(
             log_polls.clear();
         }
         BackendCommand::PersistSettings { kind, container } => {
-            if let Some(mgr) = manager.as_ref() {
-                mgr.persist_settings(kind, container.as_deref());
+            if let Some(shared) = manager.as_ref() {
+                let guard = shared.read().await;
+                guard.persist_settings(kind, container.as_deref());
             }
         }
         BackendCommand::StartPortForward {
@@ -735,13 +975,14 @@ async fn handle_command(
             remote_port,
         } => {
             let settings = load_settings();
-            if let Some(mgr) = manager.as_ref() {
+            if let Some(shared) = manager.as_ref() {
                 let id = *next_port_forward_id;
                 *next_port_forward_id += 1;
+                let guard = shared.read().await;
                 if settings.use_native_port_forward && kind != ResourceKind::Service {
                     match rl_core::start_port_forward(
-                        mgr.client().clone(),
-                        mgr.namespace(),
+                        guard.client().clone(),
+                        guard.namespace(),
                         kind,
                         &name,
                         local_port,
@@ -761,7 +1002,7 @@ async fn handle_command(
                                 err.user_message()
                             );
                             try_kubectl_port_forward(
-                                mgr,
+                                &guard,
                                 kind,
                                 &name,
                                 local_port,
@@ -774,7 +1015,7 @@ async fn handle_command(
                     }
                 } else {
                     try_kubectl_port_forward(
-                        mgr,
+                        &guard,
                         kind,
                         &name,
                         local_port,
@@ -797,15 +1038,17 @@ async fn handle_command(
             pod_name,
             container,
         } => {
-            if let Some(mgr) = manager.as_ref() {
+            if let Some(shared) = manager.as_ref() {
                 if let Some(session) = embedded_exec.take() {
                     let _ = session.cancel_tx.send(());
                 }
                 let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                 let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
                 let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-                let client = mgr.client().clone();
-                let namespace = mgr.namespace().to_string();
+                let guard = shared.read().await;
+                let client = guard.client().clone();
+                let namespace = guard.namespace().to_string();
+                drop(guard);
                 let event_tx_out = event_tx.clone();
                 let event_tx_exec = event_tx.clone();
                 tokio::spawn(async move {

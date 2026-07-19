@@ -12,7 +12,9 @@ pub struct ClusterCache {
 
 pub fn cluster_cache_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(dir).join("rusticlens").join("cluster-cache.json");
+        return PathBuf::from(dir)
+            .join("rusticlens")
+            .join("cluster-cache.json");
     }
     dirs_home()
         .join(".cache")

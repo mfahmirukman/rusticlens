@@ -4,7 +4,7 @@ A native Rust Kubernetes IDE — a lightweight Freelens/Lens alternative without
 
 Built with **egui** for the desktop UI, **ratatui** for the terminal UI, and **kube-rs** for cluster communication. Typical GUI memory use is ~100–150 MB RSS (egui + async runtime + cluster watches), vs 300–800+ MB for Electron-based clients.
 
-**Current version: 0.5.8**
+**Current version: 0.5.10**
 
 ## What's implemented
 
@@ -36,9 +36,10 @@ See [Roadmap](docs/ROADMAP.md) for version history (v0.1–v0.5) and future work
 - **Icon rail** for pinned contexts + **multi-cluster tabs** (open/switch/close contexts; tab list persisted)
 - Freelens-inspired layout: collapsible sidebar, workload tabs, resource list + bottom logs panel
 - **50/50 vertical split** between resource list and logs on first launch (until you resize)
-- **Detail panel** (Describe / Events / Metrics) on the right when a resource is selected — close with **✕** or **Esc**
+- **Detail panel** (Describe / Events / Metrics) opens on demand with **`D`** / palette Describe — not on row select alone; close with **✕** or **Esc** (selection stays)
 - Namespace selector; UI state persisted in `~/.config/rusticlens/settings.json`
 - **Cluster settings** — merge extra kubeconfig files and toggle native port-forward (Ctrl+K → Cluster settings)
+- Shared cluster cache with TUI (`~/.cache/rusticlens/cluster-cache.json`); soft-refuse stacked context/namespace/refresh with `Busy — …`
 
 ### Resources (20 built-in kinds)
 - **Workloads:** Pods, Deployments, StatefulSets, Jobs, Cron Jobs
@@ -83,7 +84,7 @@ on_connect = "echo \"connected to $RUSTICLENS_CONTEXT\""
 
 Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `kubectl` where ratatui is a better fit than egui dialogs:
 
-- Sidebar navigation across all resource kinds; resource table; Describe / Events / Metrics
+- Sidebar navigation across all resource kinds; resource table; detail pane opens on `d` (Describe / Events / Metrics) and closes with `Esc`
 - Resource name filter (`/`) on every kind; detail find (`/` when detail focused, or `Ctrl+f`) with `n`/`N` matches
 - Pod / service logs with search, follow (`f`), scroll; **line copy** via click focus + `y` / `Ctrl+C` / right-click / double-click
 - Context (`c`) / namespace (`n`) pickers; multi-cluster tabs (`[` / `]`, `Ctrl+t` add, `Ctrl+w` close)
@@ -95,7 +96,7 @@ Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `ku
 - Shared cluster manager (`Arc<RwLock<ClusterManager>>`) — the UI keeps the connection while background tasks lock briefly; sidebar kind switches stay inline/snappy
 - Context/namespace lists are cached in memory and on disk (`$XDG_CACHE_HOME/rusticlens/cluster-cache.json` or `~/.cache/rusticlens/cluster-cache.json`); namespace picker is instant; press `r` for a full reload (contexts + namespaces + rows + watch restart)
 - While a heavy exclusive op runs (context switch, namespace switch, full refresh), navigation and quit stay live; starting another exclusive op soft-refuses with `Busy — …` (describe/logs/fetch run concurrently via read locks)
-- Mouse is optional: **off by default** (avoids SGR mouse leaks on quit). Enable with `rusticlens-tui --mouse` or `RUSTICLENS_MOUSE=1`
+- Mouse is optional: **on by default** (hardened restore on quit). Disable with `rusticlens-tui --no-mouse` or `RUSTICLENS_NO_MOUSE=1`. Detail horizontal pan: Shift/Alt/Ctrl+wheel, wheel on the bottom ←→ bar, or trackpad side-swipe.
 
 | Key | Action |
 |-----|--------|
@@ -197,7 +198,7 @@ These are current behavioral limits worth knowing before daily use:
 - **Polling, not streaming** — new log lines are fetched on a ~10s interval (Freelens-style `sinceTime` polling), not a live Kubernetes watch stream.
 - **Large logs** — “load older” chunks are capped; very chatty pods may feel sluggish.
 - **Copy needs a clipboard backend** — see [Clipboard (TUI yank / copy)](#clipboard-tui-yank--copy); with `--mouse`, the terminal’s native select→copy is unavailable while the TUI is open.
-- **Mouse leak / phantom typing** — mouse tracking is **off by default**. If you enable it (`--mouse`) and still see `65;37;36M`-style junk after quit, run `printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l'` or `reset`.
+- **Mouse leak / phantom typing** — tracking is **on by default** with multi-pass disable on quit. If you still see `65;37;36M`-style junk, run `printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l'` or `reset`, or start with `--no-mouse`.
 
 ### Multi-cluster
 - **One active connection** — tabs switch contexts quickly and restore cached lists per context/namespace, but watches run for **one cluster at a time** (not parallel multi-cluster dashboards).
@@ -289,10 +290,10 @@ See [Development — Releases](docs/DEVELOPMENT.md#releases-github-actions) for 
 |-----|--------|
 | `Ctrl+K` | Command palette |
 | `R` | Refresh watches |
-| `D` | Describe selected resource |
+| `D` | Open detail panel (Describe) for selected resource |
 | `L` | Open logs for selected pod |
 | `E` | Show events for selected resource |
-| `Esc` | Close detail panel |
+| `Esc` | Close detail panel (keeps row selection) |
 | `Ctrl+F` | Focus search in Describe / Events |
 | `/` | Focus log search (when a log tab is open) |
 

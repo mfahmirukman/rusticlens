@@ -91,19 +91,18 @@ async fn main() -> io::Result<()> {
 }
 
 fn mouse_wanted() -> bool {
-    // Default OFF — leaving mouse tracking on after quit dumps SGR junk into the shell
-    // on several emulators (Ghostty, mobile TERM, etc.). Opt in explicitly.
-    if std::env::args().any(|a| a == "--mouse") {
-        return true;
-    }
+    // Default ON — hardened restore clears tracking on quit. Opt out for flaky TERM.
     if std::env::args().any(|a| a == "--no-mouse") {
         return false;
     }
-    match std::env::var("RUSTICLENS_MOUSE") {
-        Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => true,
-        _ => match std::env::var("RUSTICLENS_NO_MOUSE") {
-            Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => false,
-            _ => false,
+    if std::env::args().any(|a| a == "--mouse") {
+        return true;
+    }
+    match std::env::var("RUSTICLENS_NO_MOUSE") {
+        Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => false,
+        _ => match std::env::var("RUSTICLENS_MOUSE") {
+            Ok(v) if matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "NO") => false,
+            _ => true,
         },
     }
 }
@@ -412,7 +411,12 @@ async fn handle_external(
             let Some(manager) = app.manager.clone() else {
                 return Ok(());
             };
-            let initial = match manager.read().await.resource_yaml(app.active_kind, &name).await {
+            let initial = match manager
+                .read()
+                .await
+                .resource_yaml(app.active_kind, &name)
+                .await
+            {
                 Ok(yaml) => yaml,
                 Err(err) => {
                     app.error_message = Some(err.user_message());
@@ -623,6 +627,12 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         return handle_overlay_key(app, key).await;
     }
 
+    // Esc closes the detail pane when open.
+    if matches!(key.code, KeyCode::Esc) && app.is_connected() && app.detail_panel_visible() {
+        app.close_detail_panel();
+        return false;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('d') if app.is_connected() => {
@@ -673,26 +683,41 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         }
         KeyCode::Char('r') if app.needs_connect() => app.retry_connect().await,
         KeyCode::Char('d') if app.is_connected() => app.load_detail().await,
-        KeyCode::Char('1') if app.is_connected() => app.set_detail_tab(DetailTab::Describe),
-        KeyCode::Char('2') if app.is_connected() => app.set_detail_tab(DetailTab::Events),
-        KeyCode::Char('3') if app.is_connected() => app.set_detail_tab(DetailTab::Metrics),
+        KeyCode::Char('1') if app.is_connected() && app.detail_panel_visible() => {
+            app.set_detail_tab(DetailTab::Describe);
+            app.load_detail().await;
+        }
+        KeyCode::Char('2') if app.is_connected() && app.detail_panel_visible() => {
+            app.set_detail_tab(DetailTab::Events);
+            app.load_detail().await;
+        }
+        KeyCode::Char('3') if app.is_connected() && app.detail_panel_visible() => {
+            app.set_detail_tab(DetailTab::Metrics);
+            app.load_detail().await;
+        }
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
         KeyCode::Char('k') => app.move_selection(-1),
         KeyCode::Char('j') => app.move_selection(1),
-        KeyCode::Left | KeyCode::Char('h')
-            if key.modifiers.contains(KeyModifiers::SHIFT)
-                && app.is_connected()
-                && app.focus == app::FocusPane::Detail =>
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H')
+            if app.is_connected() && app.detail_panel_visible() =>
         {
-            app.scroll_detail_x_by(-1);
+            app.detail_pan_or_focus_left();
         }
-        KeyCode::Right | KeyCode::Char('l')
-            if key.modifiers.contains(KeyModifiers::SHIFT)
-                && app.is_connected()
-                && app.focus == app::FocusPane::Detail =>
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L')
+            if app.is_connected() && app.detail_panel_visible() =>
         {
-            app.scroll_detail_x_by(1);
+            app.detail_pan_right();
+        }
+        // Unambiguous pan keys (useful over SSH when arrows are remapped).
+        // Note: `,` opens settings — do not reuse it here.
+        KeyCode::Char('<') if app.is_connected() && app.detail_panel_visible() => {
+            app.detail_pan_or_focus_left();
+        }
+        KeyCode::Char('>') | KeyCode::Char('.')
+            if app.is_connected() && app.detail_panel_visible() =>
+        {
+            app.detail_pan_right();
         }
         KeyCode::Left | KeyCode::Char('h') => app.focus_left(),
         KeyCode::Right | KeyCode::Char('l') => app.focus_right(),
@@ -820,12 +845,22 @@ fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, last_click: &mut Option<(u1
         if app.is_connected() && !app.log_view_open() && !app.overlay_open() {
             if app.detail_contains_pos(mouse.row, mouse.column) {
                 app.focus = app::FocusPane::Detail;
-                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                let mods = mouse.modifiers;
+                // Most mice only emit vertical wheel. Horizontal pan via:
+                // - ScrollLeft/ScrollRight (trackpad / tilt-wheel)
+                // - Shift/Alt/Ctrl + vertical wheel
+                // - vertical wheel while cursor is on the bottom ←→ scrollbar
+                let want_hpan = matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                ) || mods
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+                    || app.detail_hscroll_contains_pos(mouse.row, mouse.column);
                 match mouse.kind {
-                    MouseEventKind::ScrollUp if shift => app.scroll_detail_x_by(-1),
-                    MouseEventKind::ScrollDown if shift => app.scroll_detail_x_by(1),
                     MouseEventKind::ScrollLeft => app.scroll_detail_x_by(-1),
                     MouseEventKind::ScrollRight => app.scroll_detail_x_by(1),
+                    MouseEventKind::ScrollUp if want_hpan => app.scroll_detail_x_by(-1),
+                    MouseEventKind::ScrollDown if want_hpan => app.scroll_detail_x_by(1),
                     MouseEventKind::ScrollUp => app.scroll_detail_by(-3),
                     MouseEventKind::ScrollDown => app.scroll_detail_by(3),
                     _ => {}

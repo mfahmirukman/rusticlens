@@ -123,7 +123,10 @@ impl TuiApp {
                 "Delete {}/{} in namespace {}?",
                 self.active_kind.api_kind(),
                 name,
-                self.manager.as_ref().map(|_| self.active_namespace.as_str()).unwrap_or("?")
+                self.manager
+                    .as_ref()
+                    .map(|_| self.active_namespace.as_str())
+                    .unwrap_or("?")
             ),
             action: PendingAction::Delete,
         });
@@ -479,10 +482,7 @@ impl TuiApp {
             return;
         };
         let guard = manager.read().await;
-        match guard
-            .delete_resource(self.active_kind, &name, false)
-            .await
-        {
+        match guard.delete_resource(self.active_kind, &name, false).await {
             Ok(()) => {
                 self.status_message = format!("Deleted {name}");
                 self.error_message = None;
@@ -602,8 +602,7 @@ impl TuiApp {
             }
         }
 
-        match spawn_kubectl_port_forward(&namespace, kind, &name, local_port, remote_port)
-        {
+        match spawn_kubectl_port_forward(&namespace, kind, &name, local_port, remote_port) {
             Ok(child) => {
                 let info = PortForwardInfo {
                     id,

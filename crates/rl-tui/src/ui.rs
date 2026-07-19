@@ -241,18 +241,30 @@ fn draw_center_message(
 }
 
 fn draw_main_panels(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(22),
-            Constraint::Percentage(72),
-            Constraint::Percentage(28),
-        ])
-        .split(area);
+    let show_detail = app.detail_panel_visible();
+    let chunks = if show_detail {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(22),
+                Constraint::Percentage(55),
+                Constraint::Percentage(45),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(22), Constraint::Min(1)])
+            .split(area)
+    };
 
     draw_sidebar(frame, chunks[0], app);
     draw_table(frame, chunks[1], app);
-    draw_detail(frame, chunks[2], app);
+    if show_detail && chunks.len() > 2 {
+        draw_detail(frame, chunks[2], app);
+    } else {
+        app.detail_layout = None;
+    }
 }
 
 fn draw_sidebar(frame: &mut Frame, area: Rect, app: &TuiApp) {
@@ -523,11 +535,19 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     );
 
     let content = app.detail_content();
-    let display = if content.is_empty() {
+    let display = if app.detail_loading() && content.is_empty() {
+        "Loading…".to_string()
+    } else if content.is_empty() {
         "Select a resource and press d to load details.".to_string()
     } else {
         content.to_string()
     };
+    let all_lines: Vec<&str> = display.lines().collect();
+    let max_line_chars = all_lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0);
 
     let inner = Layout::default()
         .direction(Direction::Vertical)
@@ -546,9 +566,21 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     frame.render_widget(tabs, inner[0]);
 
     let show_search = app.detail_search_visible();
+    let approx_width = inner[1].width.saturating_sub(2).max(1) as usize;
+    let approx_max_x = max_line_chars.saturating_sub(approx_width);
+    let title = if approx_max_x > 0 {
+        format!(
+            " Detail · pan {}/{} (./← →/.) ",
+            app.detail_scroll_x.min(approx_max_x),
+            approx_max_x
+        )
+    } else {
+        " Detail ".to_string()
+    };
+
     let body_block = Block::default()
         .borders(Borders::ALL)
-        .title(" Detail ")
+        .title(title)
         .border_style(border_style);
     let body_inner = body_block.inner(inner[1]);
     let body_chunks = Layout::default()
@@ -559,12 +591,6 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
         ])
         .split(body_inner);
     let content_area = body_chunks[1];
-    let all_lines: Vec<&str> = display.lines().collect();
-    let max_line_chars = all_lines
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0);
     let show_hscroll = max_line_chars > content_area.width.max(1) as usize;
     let text_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -574,7 +600,6 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
         ])
         .split(content_area);
     let text_area = text_chunks[0];
-    // Leave one column for the vertical scrollbar when present.
     let show_vscroll_hint = all_lines.len() > text_area.height.max(1) as usize;
     let text_width = if show_vscroll_hint {
         text_area.width.saturating_sub(1).max(1)
@@ -588,9 +613,15 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     let max_scroll_x = max_line_chars.saturating_sub(text_width);
     let scroll_x = app.detail_scroll_x.min(max_scroll_x);
     app.detail_scroll_x = scroll_x;
-
     app.detail_layout = Some(crate::app::DetailLayout {
+        panel: area,
         area: text_area,
+        hscroll_area: if show_hscroll {
+            Some(text_chunks[1])
+        } else {
+            None
+        },
+        text_width,
         scroll,
         scroll_x,
     });
@@ -627,26 +658,29 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     let selection = app.detail_selection;
     let query = app.detail_search_query.clone();
     let current_match = app.detail_current_match_row();
-    let visible: Vec<Line> = all_lines
+    // Full lines + Paragraph::scroll(y, x) so ratatui owns the horizontal viewport.
+    let lines: Vec<Line> = all_lines
         .iter()
         .enumerate()
-        .skip(scroll)
-        .take(visible_height)
         .map(|(line_idx, text)| {
+            let width = text.chars().count().max(1);
             highlight_detail_line(
                 text,
                 line_idx,
                 selection,
                 &query,
                 current_match == Some(line_idx),
-                scroll_x,
-                text_width,
+                0,
+                width,
                 c,
             )
         })
         .collect();
 
-    frame.render_widget(Paragraph::new(visible), text_area);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((scroll as u16, scroll_x as u16)),
+        text_area,
+    );
 
     if show_vscroll_hint || scroll > 0 {
         let scrollbar = Scrollbar::default()
@@ -826,9 +860,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &TuiApp) {
         match &app.connection {
             ConnectionState::Connected => {
                 if app.focus == FocusPane::Detail {
-                    "q quit | / or Ctrl+f find | Shift+←/→ pan | n/N matches | 1/2/3 tabs | d reload"
+                    "q quit | Esc close | wheel=vert · Shift/Alt/Ctrl+wheel=pan · ←/→ | / find"
+                } else if app.detail_panel_visible() {
+                    "q quit | / filter | Esc close detail | Shift+wheel pan | d reload | ? help"
                 } else {
-                    "q quit | / filter | Detail: Ctrl+f find · Shift+wheel pan | ? help | m actions"
+                    "q quit | / filter | d describe | ? help | m actions"
                 }
             }
             ConnectionState::Disconnected | ConnectionState::Connecting => {
@@ -1181,7 +1217,7 @@ Navigation: h/l focus · j/k move · Tab kind · c context · n namespace
 Resources: d detail · 1/2/3 Describe/Events/Metrics · drag anywhere to copy · L logs
 Search: / table filter · detail focus+/ or Ctrl+f find · n/N next/prev match · y copy name
 Logs: click focus · y/Ctrl+C copy · right-click/double-click copy line · f follow
-Detail pan: Shift+←/→ or Shift+h/l · Shift+wheel (or trackpad left/right)
+Detail pan: Shift/Alt/Ctrl+wheel or wheel on ←→ bar · ←/→ or </> · title shows col
 Ops: m actions · Ctrl+d delete · s scale · R restart · a apply · E edit
 Shell/PF: e exec (this terminal) · p port-forward · P list PF
 Favorites: f toggle · F jump · o overview

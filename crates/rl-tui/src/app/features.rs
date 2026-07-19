@@ -96,10 +96,11 @@ impl TuiApp {
     }
 
     pub async fn refresh_dashboard(&mut self) {
-        let Some(manager) = self.manager.as_ref() else {
+        let Some(manager) = self.manager.clone() else {
             return;
         };
-        match manager.fetch_dashboard().await {
+        let guard = manager.read().await;
+        match guard.fetch_dashboard().await {
             Ok(dashboard) => {
                 self.dashboard = Some(dashboard);
                 self.error_message = None;
@@ -122,7 +123,7 @@ impl TuiApp {
                 "Delete {}/{} in namespace {}?",
                 self.active_kind.api_kind(),
                 name,
-                self.manager.as_ref().map(|m| m.namespace()).unwrap_or("?")
+                self.manager.as_ref().map(|_| self.active_namespace.as_str()).unwrap_or("?")
             ),
             action: PendingAction::Delete,
         });
@@ -160,12 +161,13 @@ impl TuiApp {
             self.error_message = Some("No resource selected".into());
             return;
         };
-        let Some(manager) = self.manager.as_ref() else {
+        let Some(manager) = self.manager.clone() else {
             return;
         };
+        let guard = manager.read().await;
         let result = match self.active_kind {
-            ResourceKind::Deployment => manager.restart_deployment(&name).await,
-            ResourceKind::StatefulSet => manager.restart_statefulset(&name).await,
+            ResourceKind::Deployment => guard.restart_deployment(&name).await,
+            ResourceKind::StatefulSet => guard.restart_statefulset(&name).await,
             _ => {
                 self.error_message =
                     Some("Restart is only available for Deployments/StatefulSets.".into());
@@ -176,7 +178,7 @@ impl TuiApp {
             Ok(()) => {
                 self.status_message = format!("Restarted {name}");
                 self.error_message = None;
-                self.refresh().await;
+                self.reload_rows().await;
             }
             Err(err) => self.error_message = Some(err.user_message()),
         }
@@ -203,11 +205,12 @@ impl TuiApp {
             self.error_message = Some("No pod selected".into());
             return;
         };
-        let Some(manager) = self.manager.as_ref() else {
+        let Some(manager) = self.manager.clone() else {
             return;
         };
 
-        match manager.pod_containers(&name).await {
+        let guard = manager.read().await;
+        match guard.pod_containers(&name).await {
             Ok(containers) if containers.len() > 1 => {
                 self.overlay = Some(Overlay::Container {
                     pod_name: name,
@@ -279,11 +282,11 @@ impl TuiApp {
             self.error_message = Some("No resource selected".into());
             return;
         };
-        let ns = self
-            .manager
-            .as_ref()
-            .map(|m| m.namespace().to_string())
-            .unwrap_or_else(|| row.namespace.clone());
+        let ns = if self.active_namespace.is_empty() {
+            row.namespace.clone()
+        } else {
+            self.active_namespace.clone()
+        };
         let fav = FavoriteResource {
             kind: self.active_kind.api_kind().to_string(),
             namespace: ns,
@@ -329,7 +332,7 @@ impl TuiApp {
             .find(|k| k.api_kind() == fav.kind)
             .unwrap_or(ResourceKind::Pod);
 
-        if self.manager.as_ref().map(|m| m.namespace()) != Some(fav.namespace.as_str()) {
+        if self.active_namespace != fav.namespace {
             self.switch_to_namespace(fav.namespace.clone()).await;
         }
         self.set_kind(kind).await;
@@ -346,11 +349,7 @@ impl TuiApp {
         if self.cluster_tabs.is_empty() {
             return;
         }
-        let current = self
-            .manager
-            .as_ref()
-            .map(|m| m.context().to_string())
-            .unwrap_or_default();
+        let current = self.active_context.clone();
         let cur = self
             .cluster_tabs
             .iter()
@@ -366,9 +365,10 @@ impl TuiApp {
     }
 
     pub fn add_cluster_tab(&mut self) {
-        let Some(ctx) = self.manager.as_ref().map(|m| m.context().to_string()) else {
+        if self.active_context.is_empty() {
             return;
-        };
+        }
+        let ctx = self.active_context.clone();
         if !self.cluster_tabs.iter().any(|t| t == &ctx) {
             self.cluster_tabs.push(ctx);
             self.persist_ui_settings();
@@ -383,9 +383,7 @@ impl TuiApp {
             self.status_message = "Keep at least one cluster tab.".into();
             return;
         }
-        let Some(current) = self.manager.as_ref().map(|m| m.context().to_string()) else {
-            return;
-        };
+        let current = self.active_context.clone();
         let idx = self
             .cluster_tabs
             .iter()
@@ -477,17 +475,18 @@ impl TuiApp {
         let Some(name) = self.selected_name() else {
             return;
         };
-        let Some(manager) = self.manager.as_ref() else {
+        let Some(manager) = self.manager.clone() else {
             return;
         };
-        match manager
+        let guard = manager.read().await;
+        match guard
             .delete_resource(self.active_kind, &name, false)
             .await
         {
             Ok(()) => {
                 self.status_message = format!("Deleted {name}");
                 self.error_message = None;
-                self.refresh().await;
+                self.reload_rows().await;
             }
             Err(err) => self.error_message = Some(err.user_message()),
         }
@@ -497,19 +496,20 @@ impl TuiApp {
         let Some(name) = self.selected_name() else {
             return;
         };
-        let Some(manager) = self.manager.as_ref() else {
+        let Some(manager) = self.manager.clone() else {
             return;
         };
+        let guard = manager.read().await;
         let result = match self.active_kind {
-            ResourceKind::Deployment => manager.scale_deployment(&name, replicas).await,
-            ResourceKind::StatefulSet => manager.scale_statefulset(&name, replicas).await,
+            ResourceKind::Deployment => guard.scale_deployment(&name, replicas).await,
+            ResourceKind::StatefulSet => guard.scale_statefulset(&name, replicas).await,
             _ => return,
         };
         match result {
             Ok(()) => {
                 self.status_message = format!("Scaled {name} to {replicas}");
                 self.error_message = None;
-                self.refresh().await;
+                self.reload_rows().await;
             }
             Err(err) => self.error_message = Some(err.user_message()),
         }
@@ -519,10 +519,11 @@ impl TuiApp {
         let Some(name) = self.selected_name() else {
             return;
         };
-        let Some(manager) = self.manager.as_ref() else {
+        let Some(manager) = self.manager.clone() else {
             return;
         };
-        match manager.trigger_cronjob(&name).await {
+        let guard = manager.read().await;
+        match guard.trigger_cronjob(&name).await {
             Ok(()) => {
                 self.status_message = format!("Triggered CronJob {name}");
                 self.error_message = None;
@@ -535,17 +536,18 @@ impl TuiApp {
         let Some(name) = self.selected_name() else {
             return;
         };
-        let Some(manager) = self.manager.as_ref() else {
+        let Some(manager) = self.manager.clone() else {
             return;
         };
-        match manager.set_cronjob_suspended(&name, suspend).await {
+        let guard = manager.read().await;
+        match guard.set_cronjob_suspended(&name, suspend).await {
             Ok(()) => {
                 self.status_message = format!(
                     "{} CronJob {name}",
                     if suspend { "Suspended" } else { "Resumed" }
                 );
                 self.error_message = None;
-                self.refresh().await;
+                self.reload_rows().await;
             }
             Err(err) => self.error_message = Some(err.user_message()),
         }
@@ -555,18 +557,20 @@ impl TuiApp {
         let Some(name) = self.selected_name() else {
             return;
         };
-        let Some(manager) = self.manager.as_ref() else {
+        let Some(manager) = self.manager.clone() else {
             return;
         };
+        let guard = manager.read().await;
         let kind = self.active_kind;
         let id = self.next_port_forward_id;
         self.next_port_forward_id += 1;
         let label = format!("{}/{}:{remote_port}→{local_port}", kind.api_kind(), name);
+        let namespace = guard.namespace().to_string();
 
         if self.use_native_port_forward && kind != ResourceKind::Service {
             match start_port_forward(
-                manager.client().clone(),
-                manager.namespace(),
+                guard.client().clone(),
+                guard.namespace(),
                 kind,
                 &name,
                 local_port,
@@ -598,7 +602,7 @@ impl TuiApp {
             }
         }
 
-        match spawn_kubectl_port_forward(manager.namespace(), kind, &name, local_port, remote_port)
+        match spawn_kubectl_port_forward(&namespace, kind, &name, local_port, remote_port)
         {
             Ok(child) => {
                 let info = PortForwardInfo {

@@ -133,7 +133,11 @@ pub fn capture_and_paint_selection(frame: &mut Frame, app: &mut TuiApp) {
 
 fn draw_cluster_tabs(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let c = colors(app);
-    let active = app.manager.as_ref().map(|m| m.context());
+    let active = if app.active_context.is_empty() {
+        None
+    } else {
+        Some(app.active_context.as_str())
+    };
     let mut spans = Vec::new();
     for tab in &app.cluster_tabs {
         let selected = active == Some(tab.as_str());
@@ -156,8 +160,16 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let c = colors(app);
     let (context, namespace, kind_label, count) = match &app.connection {
         ConnectionState::Connected => (
-            app.manager.as_ref().map(|m| m.context().to_string()),
-            app.manager.as_ref().map(|m| m.namespace().to_string()),
+            if app.active_context.is_empty() {
+                None
+            } else {
+                Some(app.active_context.clone())
+            },
+            if app.active_namespace.is_empty() {
+                None
+            } else {
+                Some(app.active_namespace.clone())
+            },
             Some(app.active_kind.label()),
             Some(app.rows.len()),
         ),
@@ -856,9 +868,9 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &TuiApp) {
         )),
         Line::from(""),
     ];
-    if let Some(manager) = app.manager.as_ref() {
-        lines.push(Line::from(format!("Context: {}", manager.context())));
-        lines.push(Line::from(format!("Namespace: {}", manager.namespace())));
+    if !app.active_context.is_empty() {
+        lines.push(Line::from(format!("Context: {}", app.active_context)));
+        lines.push(Line::from(format!("Namespace: {}", app.active_namespace)));
         lines.push(Line::from(""));
     }
     match &app.dashboard {
@@ -1184,7 +1196,11 @@ fn draw_context_picker(
     app: &TuiApp,
     state: &crate::app::ListPickerState,
 ) {
-    let active_context = app.manager.as_ref().map(|m| m.context());
+    let active_context = if app.active_context.is_empty() {
+        None
+    } else {
+        Some(app.active_context.as_str())
+    };
     let indices = app.picker_indices();
     let list_height = centered_rect(70, 70, area).height.saturating_sub(6) as usize;
 
@@ -1236,7 +1252,11 @@ fn draw_namespace_picker(
     app: &TuiApp,
     state: &crate::app::ListPickerState,
 ) {
-    let active_namespace = app.manager.as_ref().map(|m| m.namespace());
+    let active_namespace = if app.active_namespace.is_empty() {
+        None
+    } else {
+        Some(app.active_namespace.as_str())
+    };
     let indices = app.picker_indices();
     let list_height = centered_rect(70, 70, area).height.saturating_sub(6) as usize;
 
@@ -1343,7 +1363,11 @@ fn draw_log_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     };
 
     let container = log.container.as_deref().unwrap_or("default");
-    let namespace = app.manager.as_ref().map(|m| m.namespace()).unwrap_or("?");
+    let namespace = if app.active_namespace.is_empty() {
+        "?"
+    } else {
+        app.active_namespace.as_str()
+    };
     let follow_label = if log.follow { "on" } else { "off" };
     let match_label = if log.search_query.is_empty() {
         String::new()

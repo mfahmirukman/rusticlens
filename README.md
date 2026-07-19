@@ -92,6 +92,10 @@ Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `ku
 - Apply / edit YAML via `$VISUAL`/`$EDITOR` (`a` / `E`); exec shell (`e`) suspends the TUI (Freelens-style `bash || ash || sh`)
 - Port-forward start/list/stop (`p` / `P`); plugins run `on_connect` on connect / context switch
 - Help overlay: `?`
+- Shared cluster manager (`Arc<RwLock<ClusterManager>>`) — the UI keeps the connection while background tasks lock briefly; sidebar kind switches stay inline/snappy
+- Context/namespace lists are cached in memory and on disk (`$XDG_CACHE_HOME/rusticlens/cluster-cache.json` or `~/.cache/rusticlens/cluster-cache.json`); namespace picker is instant; press `r` for a full reload (contexts + namespaces + rows + watch restart)
+- While a heavy exclusive op runs (context switch, namespace switch, full refresh), navigation and quit stay live; starting another exclusive op soft-refuses with `Busy — …` (describe/logs/fetch run concurrently via read locks)
+- Mouse is optional: **off by default** (avoids SGR mouse leaks on quit). Enable with `rusticlens-tui --mouse` or `RUSTICLENS_MOUSE=1`
 
 | Key | Action |
 |-----|--------|
@@ -108,6 +112,7 @@ Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `ku
 | `/` | Filter table names; find in detail or logs when that pane is focused |
 | `[` / `]` | Prev/next cluster tab |
 | `Ctrl+t` / `Ctrl+w` | Add / close cluster tab |
+| `r` | Full refresh (contexts, namespaces, resource rows) |
 | `,` / `?` | Settings / help |
 | **Logs** | |
 | click | Focus a log line |
@@ -191,7 +196,8 @@ These are current behavioral limits worth knowing before daily use:
 ### Logs
 - **Polling, not streaming** — new log lines are fetched on a ~10s interval (Freelens-style `sinceTime` polling), not a live Kubernetes watch stream.
 - **Large logs** — “load older” chunks are capped; very chatty pods may feel sluggish.
-- **Copy needs a clipboard backend** — see [Clipboard (TUI yank / copy)](#clipboard-tui-yank--copy); mouse capture means the terminal’s native select→copy is unavailable while the TUI is open.
+- **Copy needs a clipboard backend** — see [Clipboard (TUI yank / copy)](#clipboard-tui-yank--copy); with `--mouse`, the terminal’s native select→copy is unavailable while the TUI is open.
+- **Mouse leak / phantom typing** — mouse tracking is **off by default**. If you enable it (`--mouse`) and still see `65;37;36M`-style junk after quit, run `printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l'` or `reset`.
 
 ### Multi-cluster
 - **One active connection** — tabs switch contexts quickly and restore cached lists per context/namespace, but watches run for **one cluster at a time** (not parallel multi-cluster dashboards).

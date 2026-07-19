@@ -1,4 +1,5 @@
 pub mod cluster;
+pub mod cluster_cache;
 pub mod config;
 pub mod containers;
 pub mod crd;
@@ -19,6 +20,7 @@ pub mod settings;
 pub mod store;
 
 pub use cluster::ClusterManager;
+pub use cluster_cache::{load_cluster_cache, save_cluster_cache, ClusterCache};
 pub use containers::ContainerInfo;
 pub use crd::{list_crd_instances, list_crds};
 pub use dashboard::{ClusterDashboard, NodeDashboardRow};

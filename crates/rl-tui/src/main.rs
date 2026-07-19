@@ -7,15 +7,15 @@ mod ui;
 use std::io::{self, stdout, Write};
 use std::panic;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor::Show,
     event::{
-        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind, PopKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
     },
     execute,
     style::ResetColor,
@@ -25,6 +25,18 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tracing_subscriber::EnvFilter;
 
 use app::{DetailTab, ExternalRequest, Overlay, SettingsCursor, TuiApp, ViewMode};
+
+/// Set when we enabled mouse tracking — restore always clears modes regardless.
+static MOUSE_ENABLED: AtomicBool = AtomicBool::new(false);
+static RESTORING: AtomicBool = AtomicBool::new(false);
+
+/// CSI for click / drag / wheel only. Intentionally skips `?1003` (any-event / hover
+/// motion): crossterm's EnableMouseCapture turns that on, and if disable fails the
+/// shell gets flooded with SGR reports like `65;37;36M`.
+const MOUSE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+/// Full disable set — include every mode we or crossterm might have enabled.
+const MOUSE_DISABLE: &[u8] =
+    b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1015l\x1b[?1001l\x1b[?1004l\x1b[?2004l";
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -38,6 +50,8 @@ async fn main() -> io::Result<()> {
     rl_core::ensure_plugins_dir();
     rl_core::write_example_manifest_if_missing();
 
+    let mouse = mouse_wanted();
+
     // SIGINT/SIGTERM skip Rust Drop unless we restore explicitly first.
     let _ = ctrlc::set_handler(|| {
         restore_terminal();
@@ -46,7 +60,10 @@ async fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
+    if mouse {
+        enable_mouse_tracking()?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).inspect_err(|_| restore_terminal())?;
 
@@ -68,7 +85,40 @@ async fn main() -> io::Result<()> {
     // Restore before Terminal Drop / runtime teardown.
     drop(_terminal_guard);
     let _ = terminal.show_cursor();
+    // Final belt-and-suspenders after Terminal is about to drop.
+    restore_terminal();
     result
+}
+
+fn mouse_wanted() -> bool {
+    // Default OFF — leaving mouse tracking on after quit dumps SGR junk into the shell
+    // on several emulators (Ghostty, mobile TERM, etc.). Opt in explicitly.
+    if std::env::args().any(|a| a == "--mouse") {
+        return true;
+    }
+    if std::env::args().any(|a| a == "--no-mouse") {
+        return false;
+    }
+    match std::env::var("RUSTICLENS_MOUSE") {
+        Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => true,
+        _ => match std::env::var("RUSTICLENS_NO_MOUSE") {
+            Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => false,
+            _ => false,
+        },
+    }
+}
+
+fn enable_mouse_tracking() -> io::Result<()> {
+    write_all_tty_channels(MOUSE_ENABLE)?;
+    MOUSE_ENABLED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+fn disable_mouse_tracking() {
+    // Always emit disables — even if we never enabled — so a previous crashed TUI
+    // or crossterm 1003 left over from an older build gets cleared.
+    let _ = write_all_tty_channels(MOUSE_DISABLE);
+    MOUSE_ENABLED.store(false, Ordering::SeqCst);
 }
 
 /// Ensures mouse tracking / raw mode / alt-screen are cleared even if cleanup is skipped.
@@ -81,53 +131,106 @@ impl Drop for TerminalRestoreGuard {
 }
 
 fn restore_terminal() {
+    // Avoid re-entrant restore from panic-during-restore.
+    if RESTORING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
     // CRITICAL ORDER: disable mouse *before* leaving raw mode. If raw mode is cleared
     // first, in-flight SGR mouse reports (`\x1b[<…M`) land in the shell as phantom typing.
+    disable_mouse_tracking();
     let _ = execute!(
         io::stdout(),
-        DisableMouseCapture,
         DisableBracketedPaste,
         DisableFocusChange,
         PopKeyboardEnhancementFlags,
     );
-    // Belt-and-suspenders: some terminals keep a private mode if only one disable ran.
-    write_tty_bytes(
-        b"\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l",
-    );
     let _ = io::stdout().flush();
 
-    drain_pending_events();
-    // Terminal emulators can still flush one last report after the disable CSI.
-    std::thread::sleep(Duration::from_millis(30));
-    drain_pending_events();
+    // Keep draining until quiet — terminals can keep flushing reports after disable CSI.
+    drain_until_quiet(Duration::from_millis(40), Duration::from_millis(200));
 
     let _ = execute!(io::stdout(), LeaveAlternateScreen, ResetColor, Show);
     let _ = io::stdout().flush();
-    write_tty_bytes(b"\x1b[?1049l\x1b[0m\x1b[?25h");
+    let _ = write_all_tty_channels(b"\x1b[?1049l\x1b[0m\x1b[?25h");
+
+    disable_mouse_tracking();
     let _ = disable_raw_mode();
 
-    // Drop any bytes still sitting in the kernel tty buffer after cooked mode returns.
+    // Re-assert mouse off after cooked mode + flush kernel input. Some emulators only
+    // drop private modes once the process has released raw mode / alt-screen.
+    disable_mouse_tracking();
+    flush_tty_input();
     drain_os_tty_input();
+    std::thread::sleep(Duration::from_millis(40));
+    disable_mouse_tracking();
+    flush_tty_input();
+    drain_os_tty_input();
+
+    RESTORING.store(false, Ordering::SeqCst);
 }
 
-fn drain_pending_events() {
-    while event::poll(Duration::from_millis(0)).unwrap_or(false) {
-        let _ = event::read();
+fn drain_until_quiet(quiet_for: Duration, max_wait: Duration) {
+    let start = Instant::now();
+    let mut last_event = Instant::now();
+    loop {
+        let mut saw = false;
+        while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+            let _ = event::read();
+            saw = true;
+        }
+        if saw {
+            last_event = Instant::now();
+        }
+        if last_event.elapsed() >= quiet_for || start.elapsed() >= max_wait {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-fn write_tty_bytes(bytes: &[u8]) {
+/// Write CSI to stdout, /dev/tty, and raw STDOUT_FILENO so at least one path reaches
+/// the emulator (stdout may be locked by CrosstermBackend during teardown).
+fn write_all_tty_channels(bytes: &[u8]) -> io::Result<()> {
+    let _ = io::stdout().write_all(bytes);
+    let _ = io::stdout().flush();
+
     #[cfg(unix)]
     {
-        use std::io::Write;
         if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
             let _ = tty.write_all(bytes);
             let _ = tty.flush();
-            return;
+        }
+        // SAFETY: best-effort unbuffered write to the process stdout fd.
+        unsafe {
+            let _ = libc::write(
+                libc::STDOUT_FILENO,
+                bytes.as_ptr() as *const libc::c_void,
+                bytes.len(),
+            );
         }
     }
-    let _ = io::stdout().write_all(bytes);
-    let _ = io::stdout().flush();
+    Ok(())
+}
+
+fn flush_tty_input() {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if let Ok(tty) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        {
+            // SAFETY: TCIFLUSH discards unread input on our controlling tty.
+            unsafe {
+                let _ = libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH);
+            }
+        }
+        unsafe {
+            let _ = libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+        }
+    }
 }
 
 fn drain_os_tty_input() {
@@ -152,7 +255,7 @@ fn drain_os_tty_input() {
             }
         }
         let mut buf = [0u8; 4096];
-        for _ in 0..16 {
+        for _ in 0..64 {
             match tty.read(&mut buf) {
                 Ok(0) => break,
                 Ok(_) => continue,
@@ -264,7 +367,7 @@ async fn run(
         }
 
         if app.is_connected() && !app.log_view_open() {
-            app.poll_snapshots().await;
+            app.poll_snapshots();
         }
 
         app.poll_pending_op().await;
@@ -294,22 +397,22 @@ async fn handle_external(
                 app.status_message = "Apply cancelled.".into();
                 return Ok(());
             }
-            if let Some(manager) = app.manager.as_ref() {
-                match manager.apply_yaml(&yaml).await {
+            if let Some(manager) = app.manager.clone() {
+                match manager.read().await.apply_yaml(&yaml).await {
                     Ok(names) => {
                         app.status_message = format!("Applied: {}", names.join(", "));
                         app.error_message = None;
-                        app.refresh().await;
+                        app.reload_rows().await;
                     }
                     Err(err) => app.error_message = Some(err.user_message()),
                 }
             }
         }
         ExternalRequest::EditYaml { name } => {
-            let Some(manager) = app.manager.as_ref() else {
+            let Some(manager) = app.manager.clone() else {
                 return Ok(());
             };
-            let initial = match manager.resource_yaml(app.active_kind, &name).await {
+            let initial = match manager.read().await.resource_yaml(app.active_kind, &name).await {
                 Ok(yaml) => yaml,
                 Err(err) => {
                     app.error_message = Some(err.user_message());
@@ -321,23 +424,36 @@ async fn handle_external(
                 app.status_message = "Edit cancelled.".into();
                 return Ok(());
             }
-            if let Some(manager) = app.manager.as_ref() {
-                match manager.apply_yaml(&yaml).await {
+            if let Some(manager) = app.manager.clone() {
+                match manager.read().await.apply_yaml(&yaml).await {
                     Ok(names) => {
                         app.status_message = format!("Applied edit: {}", names.join(", "));
                         app.error_message = None;
-                        app.refresh().await;
+                        app.reload_rows().await;
                     }
                     Err(err) => app.error_message = Some(err.user_message()),
                 }
             }
         }
         ExternalRequest::ExecShell { name, container } => {
-            let Some(manager) = app.manager.as_ref() else {
-                return Ok(());
+            let context = if app.active_context.is_empty() {
+                let Some(manager) = app.manager.clone() else {
+                    return Ok(());
+                };
+                let guard = manager.read().await;
+                guard.context().to_string()
+            } else {
+                app.active_context.clone()
             };
-            let context = manager.context().to_string();
-            let namespace = manager.namespace().to_string();
+            let namespace = if app.active_namespace.is_empty() {
+                let Some(manager) = app.manager.clone() else {
+                    return Ok(());
+                };
+                let guard = manager.read().await;
+                guard.namespace().to_string()
+            } else {
+                app.active_namespace.clone()
+            };
             let name = name.clone();
             let container = container.clone();
 
@@ -400,16 +516,15 @@ where
     F: FnOnce(),
 {
     // Same order as restore_terminal: kill mouse tracking before leaving raw mode.
+    let had_mouse = MOUSE_ENABLED.load(Ordering::SeqCst);
+    disable_mouse_tracking();
     execute!(
         terminal.backend_mut(),
-        DisableMouseCapture,
         DisableBracketedPaste,
         DisableFocusChange
     )?;
     let _ = terminal.backend_mut().flush();
-    drain_pending_events();
-    std::thread::sleep(Duration::from_millis(20));
-    drain_pending_events();
+    drain_until_quiet(Duration::from_millis(30), Duration::from_millis(120));
 
     execute!(terminal.backend_mut(), LeaveAlternateScreen, Show)?;
     disable_raw_mode()?;
@@ -417,23 +532,26 @@ where
 
     struct ReenterTui<'a> {
         terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>,
+        had_mouse: bool,
     }
     impl Drop for ReenterTui<'_> {
         fn drop(&mut self) {
             drain_os_tty_input();
             let _ = enable_raw_mode();
-            let _ = execute!(
-                self.terminal.backend_mut(),
-                EnterAlternateScreen,
-                EnableMouseCapture
-            );
+            let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
+            if self.had_mouse {
+                let _ = enable_mouse_tracking();
+            }
             let _ = self.terminal.hide_cursor();
             let _ = self.terminal.clear();
         }
     }
 
     // Always re-enter TUI modes, even if the child panics or leaves termios messy.
-    let _reenter = ReenterTui { terminal };
+    let _reenter = ReenterTui {
+        terminal,
+        had_mouse,
+    };
     f();
     Ok(())
 }
@@ -486,10 +604,8 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         return false;
     }
 
-    // While a background op owns the manager, ignore everything but quit.
-    if app.pending_op_open() {
-        return false;
-    }
+    // Shared manager: do not hard-lock input during background ops.
+    // Navigation / quit / filter keep working; exclusive ops soft-refuse when busy.
 
     if app.log_view_open() {
         return handle_log_key(app, key);

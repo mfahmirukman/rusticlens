@@ -794,8 +794,7 @@ impl TuiApp {
     pub(super) fn busy_soft_refuse(&mut self) -> bool {
         if self.exclusive_op_open() {
             if self.status_message.is_empty() || !self.status_message.starts_with("Busy") {
-                self.status_message =
-                    "Busy — wait for current request (or press q to quit)".into();
+                self.status_message = "Busy — wait for current request (or press q to quit)".into();
             }
             true
         } else {
@@ -968,9 +967,7 @@ impl TuiApp {
         let context = self.active_context.clone();
         self.status_message = "Refreshing…".into();
         self.error_message = None;
-        let handle = tokio::spawn(async move {
-            refresh_work(manager, kind, context).await
-        });
+        let handle = tokio::spawn(async move { refresh_work(manager, kind, context).await });
         self.pending_op = Some(PendingOp::Refresh { handle });
     }
 
@@ -1852,9 +1849,8 @@ impl TuiApp {
         let ns = namespace.clone();
         self.status_message = format!("Switching to {ns}…");
         self.error_message = None;
-        let handle = tokio::spawn(async move {
-            switch_namespace_work(manager, &namespace, kind).await
-        });
+        let handle =
+            tokio::spawn(async move { switch_namespace_work(manager, &namespace, kind).await });
         self.pending_op = Some(PendingOp::SwitchNamespace {
             namespace: ns,
             handle,
@@ -2110,9 +2106,8 @@ impl TuiApp {
         let tab = self.detail_tab;
         self.status_message = format!("Loading {tab:?}…");
         let work_name = row.name.clone();
-        let handle = tokio::spawn(async move {
-            load_detail_work(manager, kind, &work_name, tab).await
-        });
+        let handle =
+            tokio::spawn(async move { load_detail_work(manager, kind, &work_name, tab).await });
         self.pending_op = Some(PendingOp::LoadDetail { handle });
     }
 
@@ -2228,11 +2223,7 @@ impl TuiApp {
         });
     }
 
-    fn apply_fetch_service_pods(
-        &mut self,
-        service_name: String,
-        outcome: FetchServicePodsOutcome,
-    ) {
+    fn apply_fetch_service_pods(&mut self, service_name: String, outcome: FetchServicePodsOutcome) {
         self.status_message.clear();
         match outcome {
             Ok(pods) if pods.is_empty() => {

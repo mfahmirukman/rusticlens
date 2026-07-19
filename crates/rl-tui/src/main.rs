@@ -411,7 +411,12 @@ async fn handle_external(
             let Some(manager) = app.manager.clone() else {
                 return Ok(());
             };
-            let initial = match manager.read().await.resource_yaml(app.active_kind, &name).await {
+            let initial = match manager
+                .read()
+                .await
+                .resource_yaml(app.active_kind, &name)
+                .await
+            {
                 Ok(yaml) => yaml,
                 Err(err) => {
                     app.error_message = Some(err.user_message());
@@ -706,9 +711,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         }
         // Unambiguous pan keys (useful over SSH when arrows are remapped).
         // Note: `,` opens settings — do not reuse it here.
-        KeyCode::Char('<')
-            if app.is_connected() && app.detail_panel_visible() =>
-        {
+        KeyCode::Char('<') if app.is_connected() && app.detail_panel_visible() => {
             app.detail_pan_or_focus_left();
         }
         KeyCode::Char('>') | KeyCode::Char('.')
@@ -850,9 +853,9 @@ fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, last_click: &mut Option<(u1
                 let want_hpan = matches!(
                     mouse.kind,
                     MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
-                ) || mods.intersects(
-                    KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
-                ) || app.detail_hscroll_contains_pos(mouse.row, mouse.column);
+                ) || mods
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+                    || app.detail_hscroll_contains_pos(mouse.row, mouse.column);
                 match mouse.kind {
                     MouseEventKind::ScrollLeft => app.scroll_detail_x_by(-1),
                     MouseEventKind::ScrollRight => app.scroll_detail_x_by(1),

@@ -1,7 +1,7 @@
 class Rusticlens < Formula
   desc "Native Rust Kubernetes IDE"
   homepage "https://github.com/mfahmirukman/rusticlens"
-  url "https://github.com/mfahmirukman/rusticlens/archive/refs/tags/v0.5.8.tar.gz"
+  url "https://github.com/mfahmirukman/rusticlens/archive/refs/tags/v0.5.9.tar.gz"
   sha256 "" # fill when tagging release
   license "MIT"
   head "https://github.com/mfahmirukman/rusticlens.git", branch: "develop"

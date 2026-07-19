@@ -4,7 +4,7 @@ A native Rust Kubernetes IDE — a lightweight Freelens/Lens alternative without
 
 Built with **egui** for the desktop UI, **ratatui** for the terminal UI, and **kube-rs** for cluster communication. Typical GUI memory use is ~100–150 MB RSS (egui + async runtime + cluster watches), vs 300–800+ MB for Electron-based clients.
 
-**Current version: 0.5.8**
+**Current version: 0.5.9**
 
 ## What's implemented
 

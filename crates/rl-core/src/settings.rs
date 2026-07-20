@@ -41,6 +41,10 @@ pub struct AppSettings {
     /// Prefer kube-rs port-forward over spawning kubectl (default true).
     #[serde(default = "default_true")]
     pub use_native_port_forward: bool,
+    /// Editor command for apply/edit YAML (e.g. `zed --wait`). Overrides `$VISUAL`/
+    /// `$EDITOR`; `None` = use env vars / `vi` fallback.
+    #[serde(default)]
+    pub editor: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -63,6 +67,7 @@ impl Default for AppSettings {
             favorites: Vec::new(),
             open_cluster_tabs: Vec::new(),
             use_native_port_forward: true,
+            editor: None,
         }
     }
 }

@@ -987,6 +987,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, app: &TuiApp, overlay: &Overlay) 
             filter,
         } => draw_action_menu(frame, area, app, items, *selected, filter),
         Overlay::Favorites(state) => draw_favorites_picker(frame, area, app, state),
+        Overlay::EditorPicker(state) => draw_editor_picker(frame, area, app, state),
         Overlay::PortForwardList { selected } => {
             draw_port_forward_list(frame, area, app, *selected)
         }
@@ -1101,6 +1102,53 @@ fn draw_favorites_picker(
     );
 }
 
+fn draw_editor_picker(
+    frame: &mut Frame,
+    area: Rect,
+    app: &TuiApp,
+    state: &crate::app::ListPickerState,
+) {
+    let c = colors(app);
+    let indices = app.picker_indices();
+    let list_height = centered_rect(70, 70, area).height.saturating_sub(6) as usize;
+    let lines = build_picker_lines_from_strings(
+        &indices,
+        state.selected,
+        list_height,
+        |idx| {
+            let cand = &app.editor_candidates[idx];
+            let status = if crate::app::editor_installed(cand.binary) {
+                "installed"
+            } else {
+                "not installed"
+            };
+            format!("{} — {}", cand.label, status)
+        },
+        |name| {
+            let installed = !name.contains("not installed");
+            let style = if installed {
+                Style::default().fg(c.text)
+            } else {
+                Style::default().fg(c.muted).add_modifier(Modifier::DIM)
+            };
+            (name.to_string(), style)
+        },
+    );
+    draw_searchable_popup(
+        frame,
+        area,
+        " Choose editor ",
+        &state.search,
+        &lines,
+        "First run — pick an editor for apply/edit YAML. Installed ones shown brighter.",
+        if indices.is_empty() {
+            "No matching editors"
+        } else {
+            ""
+        },
+    );
+}
+
 fn draw_port_forward_list(frame: &mut Frame, area: Rect, app: &TuiApp, selected: usize) {
     let c = colors(app);
     let lines: Vec<Line> = if app.port_forward_entries.is_empty() {
@@ -1190,6 +1238,13 @@ fn draw_settings(
                         .unwrap_or_default()
                 )
             },
+        ),
+        (
+            SettingsCursor::Editor,
+            format!(
+                "Editor: {}",
+                app.editor.as_deref().unwrap_or("$VISUAL/$EDITOR/vi")
+            ),
         ),
     ];
     let body = rows

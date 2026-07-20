@@ -17,6 +17,80 @@ use tokio::task::JoinHandle;
 
 pub type SharedManager = Arc<RwLock<ClusterManager>>;
 
+/// One candidate editor offered in the first-run picker.
+#[derive(Debug, Clone)]
+pub struct EditorCandidate {
+    pub label: &'static str,
+    /// Binary name looked up on `PATH`.
+    pub binary: &'static str,
+    /// Value persisted to `settings.json` (includes `--wait` for GUI editors).
+    pub command: &'static str,
+}
+
+/// Editors offered when `settings.editor` is unset. GUI editors get `--wait` so the
+/// TUI reads back the file only after the editor closes.
+pub fn editor_candidates() -> &'static [EditorCandidate] {
+    static CANDIDATES: &[EditorCandidate] = &[
+        EditorCandidate {
+            label: "Zed",
+            binary: "zed",
+            command: "zed --wait",
+        },
+        EditorCandidate {
+            label: "VS Code",
+            binary: "code",
+            command: "code --wait",
+        },
+        EditorCandidate {
+            label: "Neovim",
+            binary: "nvim",
+            command: "nvim",
+        },
+        EditorCandidate {
+            label: "Vim",
+            binary: "vim",
+            command: "vim",
+        },
+        EditorCandidate {
+            label: "Helix",
+            binary: "hx",
+            command: "hx",
+        },
+        EditorCandidate {
+            label: "micro",
+            binary: "micro",
+            command: "micro",
+        },
+        EditorCandidate {
+            label: "Emacs",
+            binary: "emacs",
+            command: "emacs",
+        },
+        EditorCandidate {
+            label: "nano",
+            binary: "nano",
+            command: "nano",
+        },
+        EditorCandidate {
+            label: "Sublime Text",
+            binary: "subl",
+            command: "subl --wait",
+        },
+    ];
+    CANDIDATES
+}
+
+/// True if `binary` exists on `PATH`. No process spawn — scans `PATH` dirs.
+pub fn editor_installed(binary: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(binary);
+        candidate.is_file()
+    })
+}
+
 use crate::theme::ThemeMode;
 
 pub enum ConnectionState {
@@ -75,6 +149,7 @@ pub enum InputPurpose {
     PortForwardLocal,
     PortForwardRemote,
     AddKubeconfigPath,
+    SetEditor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +158,7 @@ pub enum SettingsCursor {
     Theme,
     AddKubeconfigPath,
     ExtraKubeconfigList,
+    Editor,
 }
 
 pub enum PortForwardSession {
@@ -148,6 +224,8 @@ pub enum Overlay {
     PortForwardList {
         selected: usize,
     },
+    /// First-run editor picker shown when `settings.editor` is unset.
+    EditorPicker(ListPickerState),
     Settings {
         cursor: SettingsCursor,
         path_selected: usize,
@@ -296,6 +374,9 @@ pub struct TuiApp {
     pub favorites: Vec<FavoriteResource>,
     pub use_native_port_forward: bool,
     pub extra_kubeconfig_paths: Vec<String>,
+    pub editor: Option<String>,
+    /// Detected editors for the first-run picker. Order matches `editor_candidates()`.
+    pub editor_candidates: Vec<EditorCandidate>,
     pub port_forwards: HashMap<u64, PortForwardSession>,
     pub port_forward_entries: Vec<PortForwardEntry>,
     pub next_port_forward_id: u64,
@@ -463,7 +544,9 @@ impl TuiApp {
             cluster_tabs,
             favorites: settings.favorites,
             use_native_port_forward: settings.use_native_port_forward,
-            extra_kubeconfig_paths: settings.extra_kubeconfig_paths,
+            extra_kubeconfig_paths: settings.extra_kubeconfig_paths.clone(),
+            editor: settings.editor.clone(),
+            editor_candidates: editor_candidates().to_vec(),
             port_forwards: HashMap::new(),
             port_forward_entries: Vec::new(),
             next_port_forward_id: 1,
@@ -541,6 +624,7 @@ impl TuiApp {
         settings.favorites = self.favorites.clone();
         settings.use_native_port_forward = self.use_native_port_forward;
         settings.extra_kubeconfig_paths = self.extra_kubeconfig_paths.clone();
+        settings.editor = self.editor.clone();
         let _ = save_settings(&settings);
     }
 
@@ -1452,6 +1536,7 @@ impl TuiApp {
                 state, containers, ..
             }) => filter_indices(containers, &state.search),
             Some(Overlay::Favorites(state)) => self.filtered_favorite_indices(&state.search),
+            Some(Overlay::EditorPicker(state)) => self.filtered_editor_indices(&state.search),
             _ => Vec::new(),
         }
     }
@@ -1473,6 +1558,28 @@ impl TuiApp {
             .collect()
     }
 
+    pub fn filtered_editor_indices(&self, search: &str) -> Vec<usize> {
+        let query = search.to_lowercase();
+        self.editor_candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                query.is_empty()
+                    || c.label.to_lowercase().contains(&query)
+                    || c.binary.to_lowercase().contains(&query)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Open the first-run editor picker. Caller decides whether to show it.
+    pub fn show_editor_picker(&mut self) {
+        self.overlay = Some(Overlay::EditorPicker(ListPickerState {
+            search: String::new(),
+            selected: 0,
+        }));
+    }
+
     fn filtered_context_indices(&self, search: &str) -> Vec<usize> {
         filter_indices(&self.contexts, search)
     }
@@ -1487,6 +1594,7 @@ impl TuiApp {
             Some(Overlay::Namespace(_)) => self.filtered_namespace_indices(search),
             Some(Overlay::Container { containers, .. }) => filter_indices(containers, search),
             Some(Overlay::Favorites(_)) => self.filtered_favorite_indices(search),
+            Some(Overlay::EditorPicker(_)) => self.filtered_editor_indices(search),
             _ => Vec::new(),
         }
     }
@@ -1494,7 +1602,10 @@ impl TuiApp {
     fn overlay_list_state_mut(&mut self) -> Option<&mut ListPickerState> {
         match &mut self.overlay {
             Some(
-                Overlay::Context(state) | Overlay::Namespace(state) | Overlay::Favorites(state),
+                Overlay::Context(state)
+                | Overlay::Namespace(state)
+                | Overlay::Favorites(state)
+                | Overlay::EditorPicker(state),
             ) => Some(state),
             Some(Overlay::Container { state, .. }) => Some(state),
             _ => None,
@@ -1504,7 +1615,10 @@ impl TuiApp {
     fn overlay_search(&self) -> Option<String> {
         match &self.overlay {
             Some(
-                Overlay::Context(state) | Overlay::Namespace(state) | Overlay::Favorites(state),
+                Overlay::Context(state)
+                | Overlay::Namespace(state)
+                | Overlay::Favorites(state)
+                | Overlay::EditorPicker(state),
             ) => Some(state.search.clone()),
             Some(Overlay::Container { state, .. }) => Some(state.search.clone()),
             Some(Overlay::ActionMenu { filter, .. }) => Some(filter.clone()),
@@ -1551,19 +1665,21 @@ impl TuiApp {
             path_selected,
         }) = &mut self.overlay
         {
-            let max = 3i32;
+            let max = 4i32;
             let cur = match cursor {
                 SettingsCursor::NativePortForward => 0,
                 SettingsCursor::Theme => 1,
                 SettingsCursor::AddKubeconfigPath => 2,
                 SettingsCursor::ExtraKubeconfigList => 3,
+                SettingsCursor::Editor => 4,
             };
             let next = (cur + delta).clamp(0, max);
             *cursor = match next {
                 0 => SettingsCursor::NativePortForward,
                 1 => SettingsCursor::Theme,
                 2 => SettingsCursor::AddKubeconfigPath,
-                _ => SettingsCursor::ExtraKubeconfigList,
+                3 => SettingsCursor::ExtraKubeconfigList,
+                _ => SettingsCursor::Editor,
             };
             if *cursor == SettingsCursor::ExtraKubeconfigList
                 && !self.extra_kubeconfig_paths.is_empty()
@@ -1715,6 +1831,7 @@ impl TuiApp {
                 }
             }
             Overlay::Favorites(state) => self.confirm_favorite_picker(state).await,
+            Overlay::EditorPicker(state) => self.confirm_editor_picker(state).await,
             Overlay::PortForwardList { selected } => {
                 self.stop_port_forward_at(selected);
             }

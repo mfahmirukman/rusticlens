@@ -8,7 +8,7 @@ use std::io::{self, stdout, Write};
 use std::panic;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -29,6 +29,9 @@ use app::{DetailTab, ExternalRequest, Overlay, SettingsCursor, TuiApp, ViewMode}
 /// Set when we enabled mouse tracking — restore always clears modes regardless.
 static MOUSE_ENABLED: AtomicBool = AtomicBool::new(false);
 static RESTORING: AtomicBool = AtomicBool::new(false);
+/// `--editor` override (e.g. `zed --wait`). Set once at startup; `None` = use
+/// `$VISUAL` / `$EDITOR` / `vi`.
+static EDITOR_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 
 /// CSI for click / drag / wheel only. Intentionally skips `?1003` (any-event / hover
 /// motion): crossterm's EnableMouseCapture turns that on, and if disable fails the
@@ -44,6 +47,17 @@ async fn main() -> io::Result<()> {
         println!("rusticlens-tui {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+
+    // `--editor CMD` overrides `$VISUAL`/`$EDITOR` for apply/edit YAML. Supports
+    // both `--editor "zed --wait"` and `--editor=zed`. When set, also persist to
+    // `settings.json` so future launches read it without the flag.
+    let editor_override = parse_editor_arg(std::env::args().collect());
+    if let Some(cmd) = &editor_override {
+        let mut settings = rl_core::load_settings();
+        settings.editor = Some(cmd.clone());
+        let _ = rl_core::save_settings(&settings);
+    }
+    let _ = EDITOR_OVERRIDE.set(editor_override);
 
     init_tui_tracing();
 
@@ -76,6 +90,11 @@ async fn main() -> io::Result<()> {
     let _terminal_guard = TerminalRestoreGuard;
 
     let mut app = TuiApp::new();
+    // First-run editor picker: only when no flag persisted one and settings has none.
+    let flag_set = EDITOR_OVERRIDE.get().and_then(|o| o.clone()).is_some();
+    if app.editor.is_none() && !flag_set {
+        app.show_editor_picker();
+    }
     let result = run(&mut terminal, &mut app).await;
 
     for (_, session) in app.port_forwards.drain() {
@@ -483,6 +502,43 @@ async fn handle_external(
     Ok(())
 }
 
+/// Parse `--editor` / `--editor=` from the argv list, returning the editor command
+/// string (e.g. `"zed --wait"`) if present. Missing or empty value → `None`.
+fn parse_editor_arg(args: Vec<String>) -> Option<String> {
+    let mut iter = args.into_iter();
+    while let Some(a) = iter.next() {
+        if a == "--editor" {
+            return iter.next().filter(|s| !s.is_empty());
+        }
+        if let Some(rest) = a.strip_prefix("--editor=") {
+            return if rest.is_empty() {
+                None
+            } else {
+                Some(rest.into())
+            };
+        }
+    }
+    None
+}
+
+#[test]
+fn editor_arg_parsing() {
+    let args: Vec<String> = ["rusticlens-tui", "--editor", "zed --wait"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(parse_editor_arg(args), Some("zed --wait".into()));
+
+    let args: Vec<String> = ["rusticlens-tui", "--editor=code"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(parse_editor_arg(args), Some("code".into()));
+
+    let args: Vec<String> = ["rusticlens-tui"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(parse_editor_arg(args), None);
+}
+
 fn suspend_for_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     initial: &str,
@@ -490,9 +546,13 @@ fn suspend_for_editor(
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".into());
+    let editor = EDITOR_OVERRIDE
+        .get()
+        .and_then(|o| o.clone())
+        .or_else(|| rl_core::load_settings().editor)
+        .or_else(|| std::env::var("VISUAL").ok())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| "vi".into());
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -500,8 +560,14 @@ fn suspend_for_editor(
     let path = std::env::temp_dir().join(format!("rusticlens-edit-{stamp}.yaml"));
     fs::write(&path, initial)?;
 
+    // Split `editor` into program + args so values like `zed --wait` spawn correctly.
+    // Simple whitespace split: editor commands don't need shell quoting here.
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    let editor_args: Vec<&str> = parts.collect();
+
     suspend_for_command(terminal, || {
-        let status = Command::new(&editor).arg(&path).status();
+        let status = Command::new(program).args(&editor_args).arg(&path).status();
         if let Err(err) = status {
             let _ = writeln!(io::stderr(), "editor failed: {err}");
         }

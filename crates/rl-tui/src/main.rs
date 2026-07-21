@@ -416,6 +416,10 @@ async fn handle_external(
                 app.status_message = "Apply cancelled.".into();
                 return Ok(());
             }
+            // Re-show the TUI immediately so the screen isn't black during the
+            // server-side apply (a network call that can take 100ms+).
+            app.status_message = "Applying…".into();
+            terminal.draw(|frame| ui::draw(frame, app))?;
             if let Some(manager) = app.manager.clone() {
                 match manager.read().await.apply_yaml(&yaml).await {
                     Ok(names) => {
@@ -448,6 +452,9 @@ async fn handle_external(
                 app.status_message = "Edit cancelled.".into();
                 return Ok(());
             }
+            // Re-show the TUI immediately so the screen isn't black during the apply.
+            app.status_message = "Applying edit…".into();
+            terminal.draw(|frame| ui::draw(frame, app))?;
             if let Some(manager) = app.manager.clone() {
                 match manager.read().await.apply_yaml(&yaml).await {
                     Ok(names) => {

@@ -377,6 +377,12 @@ pub struct TuiApp {
     pub editor: Option<String>,
     /// Detected editors for the first-run picker. Order matches `editor_candidates()`.
     pub editor_candidates: Vec<EditorCandidate>,
+    /// In-memory cache of non-watch kind rows (Helm, CRD instances) so switching
+    /// back to a previously loaded kind renders instantly while a refresh runs.
+    /// Key: (kind, namespace, selected CRD display name).
+    pub kind_row_cache: HashMap<(ResourceKind, String, Option<String>), Vec<ResourceRow>>,
+    /// Background kind-row load in flight (Helm/CRD). Polled each frame.
+    pub kind_load: Option<KindLoad>,
     pub port_forwards: HashMap<u64, PortForwardSession>,
     pub port_forward_entries: Vec<PortForwardEntry>,
     pub next_port_forward_id: u64,
@@ -430,6 +436,16 @@ pub enum PendingOp {
     Refresh {
         handle: tokio::task::JoinHandle<RefreshOutcome>,
     },
+}
+
+/// Background load of non-watch kind rows (Helm releases, CRD instances).
+/// Separate from `PendingOp` so multiple kind switches don't clobber exclusive ops
+/// and so cached rows render instantly while the refresh runs.
+pub struct KindLoad {
+    pub kind: ResourceKind,
+    /// Cache key suffix: selected CRD target's display name for CRD, else None.
+    pub crd_name: Option<String>,
+    pub handle: tokio::task::JoinHandle<Result<Vec<ResourceRow>, rl_core::Error>>,
 }
 
 pub type SwitchContextOutcome = Result<SwitchContextResult, rl_core::Error>;
@@ -547,6 +563,8 @@ impl TuiApp {
             extra_kubeconfig_paths: settings.extra_kubeconfig_paths.clone(),
             editor: settings.editor.clone(),
             editor_candidates: editor_candidates().to_vec(),
+            kind_row_cache: HashMap::new(),
+            kind_load: None,
             port_forwards: HashMap::new(),
             port_forward_entries: Vec::new(),
             next_port_forward_id: 1,
@@ -922,20 +940,145 @@ impl TuiApp {
             if let Ok(guard) = manager.try_read() {
                 self.rows = guard.snapshot(kind).rows;
             }
+            if self.selected >= self.rows.len() {
+                self.selected = self.rows.len().saturating_sub(1);
+            }
+            self.clamp_table_selection();
+            self.update_status_from_rows();
         } else {
-            match manager.read().await.list_rows(kind).await {
-                Ok(rows) => self.rows = rows,
-                Err(err) => {
-                    self.rows.clear();
+            // Non-watch kinds (Helm, CRD): don't block the input loop. Render cached
+            // rows instantly if present, then refresh in the background.
+            self.load_kind_rows_async().await;
+        }
+    }
+
+    /// Cache key for non-watch kind rows: (kind, namespace, CRD display name?).
+    fn kind_cache_key(&self, kind: ResourceKind) -> (ResourceKind, String, Option<String>) {
+        let crd_name = if kind == ResourceKind::Crd {
+            self.crd_targets
+                .get(
+                    self.selected_crd_index
+                        .min(self.crd_targets.len().saturating_sub(1)),
+                )
+                .map(|t| t.display_name.clone())
+        } else {
+            None
+        };
+        (kind, self.active_namespace.clone(), crd_name)
+    }
+
+    /// Non-blocking load for non-watch kinds (Helm releases, CRD instances). Renders
+    /// cached rows instantly if available, then spawns a background `list_rows` and
+    /// fills in fresh rows when it lands. Watched kinds stay on the snapshot path.
+    pub async fn load_kind_rows_async(&mut self) {
+        let Some(manager) = self.manager.clone() else {
+            return;
+        };
+        let kind = self.active_kind;
+        if kind.uses_watch() {
+            return;
+        }
+        if kind == ResourceKind::Crd {
+            if self.crd_targets.is_empty() {
+                self.rows.clear();
+                self.status_message = "No CRDs in cluster".into();
+                return;
+            }
+            let idx = self
+                .selected_crd_index
+                .min(self.crd_targets.len().saturating_sub(1));
+            let target = self.crd_targets[idx].clone();
+            let mut guard = manager.write().await;
+            guard.set_selected_crd(Some(target));
+            drop(guard);
+        }
+        let key = self.kind_cache_key(kind);
+        let cached = self.kind_row_cache.get(&key).cloned();
+        match &cached {
+            Some(rows) => {
+                self.rows = rows.clone();
+                if self.selected >= self.rows.len() {
+                    self.selected = self.rows.len().saturating_sub(1);
+                }
+                self.clamp_table_selection();
+            }
+            None => {
+                // No cache yet: clear stale rows from the previous kind so we don't
+                // render Pods under a "CRD instances" header while loading.
+                self.rows.clear();
+                self.selected = 0;
+            }
+        }
+        let label = kind.label();
+        self.status_message = if cached.is_some() {
+            format!("{label} — refreshing…")
+        } else {
+            format!("Loading {label}…")
+        };
+        // Abort any prior in-flight kind load so we don't apply stale results.
+        if let Some(prev) = self.kind_load.take() {
+            prev.handle.abort();
+        }
+        let work_kind = kind;
+        let handle = tokio::spawn(async move {
+            let guard = manager.read().await;
+            guard.list_rows(work_kind).await
+        });
+        self.kind_load = Some(KindLoad {
+            kind,
+            crd_name: key.2.clone(),
+            handle,
+        });
+        self.update_status_from_rows();
+    }
+
+    /// Poll the in-flight non-watch kind load. On completion: update the cache and,
+    /// if still viewing that kind, render fresh rows.
+    pub async fn poll_kind_load(&mut self) {
+        let finished = self
+            .kind_load
+            .as_ref()
+            .map(|l| l.handle.is_finished())
+            .unwrap_or(false);
+        if !finished {
+            return;
+        }
+        let Some(load) = self.kind_load.take() else {
+            return;
+        };
+        let KindLoad {
+            kind,
+            crd_name,
+            handle,
+        } = load;
+        match handle.await {
+            Ok(Ok(rows)) => {
+                let key = (kind, self.active_namespace.clone(), crd_name.clone());
+                self.kind_row_cache.insert(key, rows.clone());
+                if self.active_kind == kind {
+                    self.rows = rows;
+                    if self.selected >= self.rows.len() {
+                        self.selected = self.rows.len().saturating_sub(1);
+                    }
+                    self.clamp_table_selection();
+                    self.status_message.clear();
+                    self.error_message = None;
+                    self.update_status_from_rows();
+                }
+            }
+            Ok(Err(err)) => {
+                if self.active_kind == kind {
                     self.error_message = Some(err.user_message());
+                    self.status_message.clear();
+                }
+            }
+            Err(err) => {
+                if self.active_kind == kind {
+                    self.error_message = Some(format!("Kind load task failed: {err}"));
+                    self.status_message.clear();
                 }
             }
         }
-        if self.selected >= self.rows.len() {
-            self.selected = self.rows.len().saturating_sub(1);
-        }
-        self.clamp_table_selection();
-        self.update_status_from_rows();
     }
 
     /// Non-blocking poll: if the in-flight op finished, apply its result.
@@ -1099,21 +1242,28 @@ impl TuiApp {
             guard.set_selected_crd(Some(target));
             drop(guard);
         }
-        match manager.read().await.list_rows(kind).await {
-            Ok(rows) => {
-                self.rows = rows;
-                self.error_message = None;
-                self.update_status_from_rows();
+        if kind.uses_watch() {
+            match manager.read().await.list_rows(kind).await {
+                Ok(rows) => {
+                    self.rows = rows;
+                    self.error_message = None;
+                    self.update_status_from_rows();
+                }
+                Err(err) => {
+                    self.rows.clear();
+                    self.error_message = Some(err.user_message());
+                }
             }
-            Err(err) => {
-                self.rows.clear();
-                self.error_message = Some(err.user_message());
+            if self.selected >= self.rows.len() {
+                self.selected = self.rows.len().saturating_sub(1);
             }
+            self.clamp_table_selection();
+        } else {
+            // Non-watch: invalidate cache so the background fetch is authoritative.
+            let key = self.kind_cache_key(kind);
+            self.kind_row_cache.remove(&key);
+            self.load_kind_rows_async().await;
         }
-        if self.selected >= self.rows.len() {
-            self.selected = self.rows.len().saturating_sub(1);
-        }
-        self.clamp_table_selection();
     }
 
     pub fn poll_snapshots(&mut self) {
@@ -1354,7 +1504,7 @@ impl TuiApp {
     }
 
     fn move_sidebar(&mut self, delta: i32) {
-        let kinds: Vec<ResourceKind> = ResourceKind::ALL.to_vec();
+        let kinds: &[ResourceKind] = crate::ui::sidebar_kinds();
         let current = self.sidebar_index.min(kinds.len().saturating_sub(1));
         let next = (current as i32 + delta).clamp(0, kinds.len() as i32 - 1) as usize;
         self.sidebar_index = next;
@@ -1435,14 +1585,14 @@ impl TuiApp {
     }
 
     pub async fn activate_sidebar_selection(&mut self) {
-        let kinds: Vec<ResourceKind> = ResourceKind::ALL.to_vec();
+        let kinds: &[ResourceKind] = crate::ui::sidebar_kinds();
         if let Some(kind) = kinds.get(self.sidebar_index) {
             self.set_kind(*kind).await;
         }
     }
 
     pub async fn next_kind(&mut self) {
-        let kinds: Vec<ResourceKind> = ResourceKind::ALL.to_vec();
+        let kinds: &[ResourceKind] = crate::ui::sidebar_kinds();
         let idx = kinds
             .iter()
             .position(|k| *k == self.active_kind)
@@ -1452,7 +1602,7 @@ impl TuiApp {
     }
 
     pub async fn prev_kind(&mut self) {
-        let kinds: Vec<ResourceKind> = ResourceKind::ALL.to_vec();
+        let kinds: &[ResourceKind] = crate::ui::sidebar_kinds();
         let idx = kinds
             .iter()
             .position(|k| *k == self.active_kind)

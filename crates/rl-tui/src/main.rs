@@ -388,6 +388,7 @@ async fn run(
             app.poll_snapshots();
         }
 
+        app.poll_kind_load().await;
         app.poll_pending_op().await;
     }
     Ok(())

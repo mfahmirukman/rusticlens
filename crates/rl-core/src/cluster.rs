@@ -17,7 +17,7 @@ use crate::resources::{CrdTarget, ResourceKind};
 use crate::settings::{
     load_settings, pick_namespace_for_context, remember_namespace_for_context, save_settings,
 };
-use crate::store::{list_initial_rows, ResourceSnapshot, WatchController};
+use crate::store::{ResourceSnapshot, WatchController};
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct ScopeKey {
@@ -165,10 +165,10 @@ impl ClusterManager {
         self.watch
             .ensure_only_kind(self.client.clone(), self.namespace.clone(), kind)
             .await?;
-        if kind == ResourceKind::HelmRelease {
-            let _ =
-                list_initial_rows(&self.client, &self.namespace, ResourceKind::HelmRelease).await;
-        }
+        // Helm releases are fetched on demand by `list_rows` (non-watch kind). We
+        // deliberately do NOT call `list_initial_rows` here — that blocked the input
+        // loop on a network call whose result was discarded. The TUI loads Helm rows
+        // in a background task via `load_kind_rows_async`.
         Ok(())
     }
 

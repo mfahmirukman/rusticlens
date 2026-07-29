@@ -6,7 +6,7 @@ mod ui;
 
 use std::io::{self, stdout, Write};
 use std::panic;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -66,17 +66,17 @@ async fn main() -> io::Result<()> {
 
     let mouse = mouse_wanted();
 
-    // SIGINT/SIGTERM skip Rust Drop unless we restore explicitly first.
-    let _ = ctrlc::set_handler(|| {
-        restore_terminal();
-        std::process::exit(130);
-    });
+    // Signals skip Rust Drop — restore modes before exit. `ctrlc` only catches SIGINT;
+    // `kill <pid>` is SIGTERM and was leaving mouse tracking on (SGR junk in the shell).
+    install_fatal_signal_handlers();
 
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
     if mouse {
         enable_mouse_tracking()?;
+        // Survives SIGKILL / hard kills where this process cannot run restore_terminal.
+        spawn_mouse_cleanup_watchdog();
     }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).inspect_err(|_| restore_terminal())?;
@@ -110,19 +110,77 @@ async fn main() -> io::Result<()> {
 }
 
 fn mouse_wanted() -> bool {
-    // Default ON — hardened restore clears tracking on quit. Opt out for flaky TERM.
+    // Default ON — restore + kill-watchdog clear tracking on quit/kill. Opt out for flaky TERM.
     if std::env::args().any(|a| a == "--no-mouse") {
         return false;
     }
     if std::env::args().any(|a| a == "--mouse") {
         return true;
     }
-    match std::env::var("RUSTICLENS_NO_MOUSE") {
-        Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => false,
-        _ => match std::env::var("RUSTICLENS_MOUSE") {
-            Ok(v) if matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "NO") => false,
-            _ => true,
-        },
+    if matches!(
+        std::env::var("RUSTICLENS_NO_MOUSE").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES")
+    ) {
+        return false;
+    }
+    !matches!(
+        std::env::var("RUSTICLENS_MOUSE").as_deref(),
+        Ok("0" | "false" | "FALSE" | "no" | "NO")
+    )
+}
+
+/// Restore the tty on SIGINT / SIGTERM / SIGHUP. Runs on a dedicated thread so cleanup
+/// need not be async-signal-safe (unlike a raw `signal()` handler).
+fn install_fatal_signal_handlers() {
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+        use signal_hook::iterator::Signals;
+
+        let Ok(mut signals) = Signals::new([SIGINT, SIGTERM, SIGHUP]) else {
+            return;
+        };
+        std::thread::Builder::new()
+            .name("rl-tui-signals".into())
+            .spawn(move || {
+                if let Some(sig) = signals.forever().next() {
+                    restore_terminal();
+                    let code = if sig == SIGINT { 130 } else { 143 };
+                    // exit skips remaining destructors — restore_terminal already ran.
+                    std::process::exit(code);
+                }
+            })
+            .ok();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrlc::set_handler(|| {
+            restore_terminal();
+            std::process::exit(130);
+        });
+    }
+}
+
+/// Separate process that waits for this PID to disappear, then disables mouse tracking
+/// on `/dev/tty`. Covers `kill -9` and any path where we never get to run Rust cleanup.
+fn spawn_mouse_cleanup_watchdog() {
+    #[cfg(unix)]
+    {
+        let parent = std::process::id();
+        // POSIX sh: poll until parent is gone, then emit disable CSI twice (some emulators
+        // ignore the first burst if the dying process still held the tty).
+        let script = format!(
+            "while kill -0 {parent} 2>/dev/null; do sleep 0.05; done; \
+             printf '\\033[?1006l\\033[?1003l\\033[?1002l\\033[?1000l\\033[?1015l\\033[?1001l' >/dev/tty 2>/dev/null; \
+             sleep 0.05; \
+             printf '\\033[?1006l\\033[?1003l\\033[?1002l\\033[?1000l\\033[?1015l\\033[?1001l' >/dev/tty 2>/dev/null"
+        );
+        let _ = Command::new("sh")
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
     }
 }
 

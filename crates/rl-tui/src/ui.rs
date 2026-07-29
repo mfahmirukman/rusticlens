@@ -1873,57 +1873,6 @@ pub fn kind_sidebar_index(kind: ResourceKind) -> usize {
     sidebar_kinds().iter().position(|k| *k == kind).unwrap_or(0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Navigation order must match render order, or arrow keys jump on screen
-    /// (the Nodes↓→Helm(bottom)→↓→Custom(up) bug).
-    #[test]
-    fn sidebar_order_matches_render_order() {
-        let mut rendered: Vec<ResourceKind> = Vec::new();
-        for category in [
-            ResourceCategory::Workloads,
-            ResourceCategory::Network,
-            ResourceCategory::Storage,
-            ResourceCategory::Access,
-            ResourceCategory::Config,
-            ResourceCategory::Cluster,
-            ResourceCategory::Custom,
-        ] {
-            rendered.extend(kinds_in_category(category));
-        }
-        rendered.push(ResourceKind::HelmRelease);
-        let nav = sidebar_kinds();
-        assert_eq!(nav.len(), rendered.len());
-        for (i, k) in nav.iter().enumerate() {
-            assert_eq!(*k, rendered[i], "mismatch at index {i}");
-        }
-    }
-
-    #[test]
-    fn kind_sidebar_indices_are_contiguous() {
-        let kinds = sidebar_kinds();
-        let indices: Vec<usize> = kinds.iter().map(|k| kind_sidebar_index(*k)).collect();
-        let expected: Vec<usize> = (0..kinds.len()).collect();
-        assert_eq!(indices, expected);
-    }
-
-    /// In `ALL`, HelmRelease(18) precedes Crd(19). In the sidebar, Crd renders above
-    /// Helm, so navigation must use `sidebar_kinds` where Crd precedes HelmRelease.
-    #[test]
-    fn crd_precedes_helm_in_sidebar() {
-        let kinds = sidebar_kinds();
-        let crd = kinds.iter().position(|k| *k == ResourceKind::Crd).unwrap();
-        let helm = kinds
-            .iter()
-            .position(|k| *k == ResourceKind::HelmRelease)
-            .unwrap();
-        assert!(crd < helm, "Crd must render above HelmRelease");
-        assert_eq!(helm, kinds.len() - 1, "HelmRelease must be last");
-    }
-}
-
 fn table_header_line(kind: ResourceKind, name_width: usize) -> String {
     match kind {
         ResourceKind::Pod => format!(
@@ -2024,5 +1973,56 @@ fn fit(s: &str, width: usize) -> String {
         let mut out: String = chars.into_iter().take(width - 1).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Navigation order must match render order, or arrow keys jump on screen
+    /// (the Nodes↓→Helm(bottom)→↓→Custom(up) bug).
+    #[test]
+    fn sidebar_order_matches_render_order() {
+        let mut rendered: Vec<ResourceKind> = Vec::new();
+        for category in [
+            ResourceCategory::Workloads,
+            ResourceCategory::Network,
+            ResourceCategory::Storage,
+            ResourceCategory::Access,
+            ResourceCategory::Config,
+            ResourceCategory::Cluster,
+            ResourceCategory::Custom,
+        ] {
+            rendered.extend(kinds_in_category(category));
+        }
+        rendered.push(ResourceKind::HelmRelease);
+        let nav = sidebar_kinds();
+        assert_eq!(nav.len(), rendered.len());
+        for (i, k) in nav.iter().enumerate() {
+            assert_eq!(*k, rendered[i], "mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn kind_sidebar_indices_are_contiguous() {
+        let kinds = sidebar_kinds();
+        let indices: Vec<usize> = kinds.iter().map(|k| kind_sidebar_index(*k)).collect();
+        let expected: Vec<usize> = (0..kinds.len()).collect();
+        assert_eq!(indices, expected);
+    }
+
+    /// In `ALL`, HelmRelease(18) precedes Crd(19). In the sidebar, Crd renders above
+    /// Helm, so navigation must use `sidebar_kinds` where Crd precedes HelmRelease.
+    #[test]
+    fn crd_precedes_helm_in_sidebar() {
+        let kinds = sidebar_kinds();
+        let crd = kinds.iter().position(|k| *k == ResourceKind::Crd).unwrap();
+        let helm = kinds
+            .iter()
+            .position(|k| *k == ResourceKind::HelmRelease)
+            .unwrap();
+        assert!(crd < helm, "Crd must render above HelmRelease");
+        assert_eq!(helm, kinds.len() - 1, "HelmRelease must be last");
     }
 }

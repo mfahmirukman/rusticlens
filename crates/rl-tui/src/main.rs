@@ -1038,14 +1038,115 @@ async fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         return false;
     }
 
+    // Overlays with a filter/value field own all typed letters (including j/k);
+    // vim-style j/k navigation only applies to list-only overlays — arrows
+    // move the selection everywhere.
+    let text_overlay = app.overlay_accepts_text();
     match key.code {
         KeyCode::Esc => app.close_overlay(),
         KeyCode::Enter => app.picker_confirm().await,
-        KeyCode::Up | KeyCode::Char('k') => app.picker_move(-1),
-        KeyCode::Down | KeyCode::Char('j') => app.picker_move(1),
+        KeyCode::Up => app.picker_move(-1),
+        KeyCode::Down => app.picker_move(1),
+        KeyCode::Char('k') if !text_overlay => app.picker_move(-1),
+        KeyCode::Char('j') if !text_overlay => app.picker_move(1),
         KeyCode::Backspace => app.picker_backspace(),
         KeyCode::Char(ch) if !ch.is_control() => app.picker_push_char(ch),
         _ => {}
     }
     false
+}
+
+#[cfg(test)]
+mod overlay_key_tests {
+    use super::*;
+    use app::{ListPickerState, PortForwardEntry};
+
+    fn app_with(overlay: Overlay) -> TuiApp {
+        let mut app = TuiApp::new();
+        app.overlay = Some(overlay);
+        app
+    }
+
+    fn picker_state() -> ListPickerState {
+        ListPickerState {
+            search: String::new(),
+            selected: 0,
+        }
+    }
+
+    fn char_key(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn picker_filter_receives_j_and_k() {
+        let mut app = app_with(Overlay::Namespace(picker_state()));
+        handle_overlay_key(&mut app, char_key('k')).await;
+        handle_overlay_key(&mut app, char_key('j')).await;
+        handle_overlay_key(&mut app, char_key('s')).await;
+        match &app.overlay {
+            Some(Overlay::Namespace(state)) => assert_eq!(state.search, "kjs"),
+            other => panic!("expected namespace picker, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn action_menu_filter_receives_j_and_k() {
+        let mut app = app_with(Overlay::ActionMenu {
+            items: Vec::new(),
+            selected: 0,
+            filter: String::new(),
+        });
+        handle_overlay_key(&mut app, char_key('k')).await;
+        handle_overlay_key(&mut app, char_key('j')).await;
+        match &app.overlay {
+            Some(Overlay::ActionMenu { filter, .. }) => assert_eq!(filter, "kj"),
+            other => panic!("expected action menu, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn input_prompt_receives_j_and_k() {
+        let mut app = app_with(Overlay::Input {
+            prompt: "Path".into(),
+            value: String::new(),
+            purpose: app::InputPurpose::AddKubeconfigPath,
+            extra: None,
+        });
+        handle_overlay_key(&mut app, char_key('k')).await;
+        handle_overlay_key(&mut app, char_key('j')).await;
+        match &app.overlay {
+            Some(Overlay::Input { value, .. }) => assert_eq!(value, "kj"),
+            other => panic!("expected input overlay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_only_overlays_keep_vim_navigation() {
+        let mut app = app_with(Overlay::PortForwardList { selected: 0 });
+        app.port_forward_entries = vec![
+            PortForwardEntry {
+                id: 1,
+                label: "a".into(),
+                local_port: 8080,
+                remote_port: 80,
+            },
+            PortForwardEntry {
+                id: 2,
+                label: "b".into(),
+                local_port: 8081,
+                remote_port: 81,
+            },
+        ];
+        handle_overlay_key(&mut app, char_key('j')).await;
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::PortForwardList { selected: 1 })
+        ));
+        handle_overlay_key(&mut app, char_key('k')).await;
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::PortForwardList { selected: 0 })
+        ));
+    }
 }

@@ -646,6 +646,22 @@ impl TuiApp {
         self.overlay.is_some()
     }
 
+    /// True when the open overlay takes typed input (picker filter / prompt value),
+    /// so plain letters must reach the field instead of being used as shortcuts.
+    pub fn overlay_accepts_text(&self) -> bool {
+        matches!(
+            self.overlay,
+            Some(
+                Overlay::Context(_)
+                    | Overlay::Namespace(_)
+                    | Overlay::Container { .. }
+                    | Overlay::Favorites(_)
+                    | Overlay::ActionMenu { .. }
+                    | Overlay::Input { .. }
+            )
+        )
+    }
+
     pub fn close_overlay(&mut self) {
         self.overlay = None;
     }

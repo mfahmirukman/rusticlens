@@ -16,7 +16,7 @@ Built with **egui** for the desktop UI, **ratatui** for the terminal UI, and **k
 | Resource browsers (20 kinds + CRD + Helm) | Yes | Yes |
 | Live watches + virtual scroll | Yes | Yes |
 | Describe / Events / Metrics | Yes | Yes |
-| Pod logs | Yes (polling) | Yes |
+| Pod logs | Yes (polling) | Yes (polling; new-terminal pop-out) |
 | Scale / restart workloads | Yes | Yes |
 | Apply YAML | Yes | Yes (`$EDITOR`) |
 | Favorites | Yes | Yes |
@@ -62,7 +62,7 @@ See [Roadmap](docs/ROADMAP.md) for version history (v0.1–v0.5) and future work
 - Deployment & StatefulSet **scale** and **rollout restart** (context menu)
 - **Apply YAML** (server-side apply) via command palette (**Ctrl+K**)
 - **Dark / light theme** toggle (persisted)
-- Copy `kubectl edit` / `kubectl exec`; open **external terminal** (`kubectl exec -it`)
+- Copy `kubectl edit` / `kubectl exec`; open **external terminal** (`kubectl exec -it`), preferring the emulator hosting the session when detected
 - **Embedded shell** — in-app Freelens-style `sh -c "clear; (bash || ash || sh)"` via kube API (see [known limitations](#known-limitations--bugs))
 - **Port-forward** — native kube-rs for pods (default); kubectl fallback for services or when native fails
 - **TOML plugins** — `~/.config/rusticlens/plugins/*.toml` with optional `on_connect` shell hook
@@ -107,6 +107,7 @@ Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `ku
 | `a` / `E` | Apply / edit YAML in `$EDITOR` |
 | `p` / `P` | Start / list port-forwards |
 | `e` | Exec shell (current terminal; TUI suspends) |
+| `L` | Pod/service logs — new terminal window when enabled, built-in view otherwise |
 | `f` / `F` | Toggle favorite / jump |
 | `o` | Overview dashboard |
 | `t` | Theme toggle |
@@ -196,7 +197,7 @@ These are current behavioral limits worth knowing before daily use:
 - **One session** — only one embedded exec at a time.
 
 ### Logs
-- **Polling, not streaming** — new log lines are fetched on a ~10s interval (Freelens-style `sinceTime` polling), not a live Kubernetes watch stream.
+- **Polling, not streaming** — new log lines are fetched on a ~10s interval (Freelens-style `sinceTime` polling), not a live Kubernetes watch stream. The TUI new-terminal pop-out is the exception: it runs real `kubectl logs -f`, so it needs `kubectl` on PATH and `pods/log` RBAC.
 - **Large logs** — “load older” chunks are capped; very chatty pods may feel sluggish.
 - **Copy needs a clipboard backend** — see [Clipboard (TUI yank / copy)](#clipboard-tui-yank--copy); with `--mouse`, the terminal’s native select→copy is unavailable while the TUI is open.
 - **Mouse leak / phantom typing** — tracking is **on by default** with multi-pass disable on quit. If you still see `65;37;36M`-style junk, run `printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l'` or `reset`, or start with `--no-mouse`.
@@ -214,7 +215,7 @@ These are current behavioral limits worth knowing before daily use:
 - **Fire-and-forget** — `on_connect` spawns `sh -c` with no output capture or error surfacing in the app.
 
 ### External terminal
-- Requires a supported emulator on `PATH` (`gnome-terminal`, `konsole`, `kitty`, `alacritty`, `xterm`, etc.). If none is found, use **Copy kubectl exec** or the embedded shell.
+- Requires a supported emulator on `PATH`. The emulator hosting the session is preferred when detected (Tilix, GNOME Terminal / KGX / Ptyxis, Konsole, kitty, Alacritty, WezTerm, Ghostty, foot, xfce4-terminal, Terminator, st, urxvt, LXTerminal, xterm); otherwise common emulators are tried. If none is found, use **Copy kubectl exec** or the embedded shell.
 - **TUI log pop-out** (`L` with `Logs in external terminal` on) spawns in the emulator hosting the TUI when detected (`RUSTICLENS_TERMINAL=<binary>` overrides); over SSH or without a display it falls back to the built-in log view.
 
 ### Packaging
@@ -233,6 +234,7 @@ Please [open an issue](https://github.com/mfahmirukman/rusticlens/issues) if you
 - `kubectl` on PATH — optional for most GUI flows if native port-forward stays enabled; still needed for service port-forward, external terminal, and kubectl fallback
 - Access to a Kubernetes cluster
 - Optional clipboard tools for TUI copy (see above)
+- Optional terminal emulator on `PATH` (Tilix, GNOME Terminal, Konsole, kitty, …) for TUI log pop-out and external-terminal actions; built-in views are used as fallback
 
 ### Teleport
 

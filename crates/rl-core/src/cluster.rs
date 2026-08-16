@@ -305,7 +305,7 @@ impl ClusterManager {
         list_pod_containers(&self.client, &self.namespace, pod_name).await
     }
 
-    pub async fn pods_for_service(&self, service_name: &str) -> Result<Vec<String>> {
+    pub async fn pods_for_service(&self, service_name: &str) -> Result<ops::ServicePods> {
         ops::list_pods_for_service(&self.client, &self.namespace, service_name).await
     }
 

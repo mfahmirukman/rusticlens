@@ -446,19 +446,27 @@ pub async fn stream_pod_logs(
     Ok(())
 }
 
+/// Pods matched by a Service's selector, plus the selector itself.
+#[derive(Debug, Clone, Default)]
+pub struct ServicePods {
+    pub names: Vec<String>,
+    /// `k=v,k2=v2` label selector from the Service spec; `None` when missing/empty.
+    pub selector: Option<String>,
+}
+
 /// Pods selected by a Service's `spec.selector` labels (empty if headless / no selector).
 pub async fn list_pods_for_service(
     client: &Client,
     namespace: &str,
     service_name: &str,
-) -> Result<Vec<String>> {
+) -> Result<ServicePods> {
     let api: Api<Service> = Api::namespaced(client.clone(), namespace);
     let svc = api.get(service_name).await?;
     let Some(selector) = svc.spec.as_ref().and_then(|s| s.selector.as_ref()) else {
-        return Ok(Vec::new());
+        return Ok(ServicePods::default());
     };
     if selector.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ServicePods::default());
     }
     let label_sel = selector
         .iter()
@@ -473,7 +481,10 @@ pub async fn list_pods_for_service(
         .filter_map(|p| p.metadata.name)
         .collect();
     names.sort();
-    Ok(names)
+    Ok(ServicePods {
+        names,
+        selector: Some(label_sel),
+    })
 }
 
 /// Poll logs from multiple pods (initial tail + periodic `sinceTime` fetches).

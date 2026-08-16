@@ -958,6 +958,9 @@ fn draw_overlay(frame: &mut Frame, area: Rect, app: &TuiApp, overlay: &Overlay) 
         } => {
             let title = match purpose {
                 crate::app::ContainerPickerPurpose::Logs => " Select container (logs) ",
+                crate::app::ContainerPickerPurpose::ExternalLogs => {
+                    " Select container (logs → new terminal) "
+                }
                 crate::app::ContainerPickerPurpose::Exec => " Select container (exec) ",
             };
             draw_container_picker(frame, area, pod_name, containers, state, title)
@@ -1167,6 +1170,13 @@ fn draw_settings(
                 } else {
                     "off"
                 }
+            ),
+        ),
+        (
+            SettingsCursor::ExternalLogs,
+            format!(
+                "Logs in external terminal: {}",
+                if app.external_logs { "on" } else { "off" }
             ),
         ),
         (

@@ -87,6 +87,7 @@ Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `ku
 - Sidebar navigation across all resource kinds; resource table; detail pane opens on `d` (Describe / Events / Metrics) and closes with `Esc`
 - Resource name filter (`/`) on every kind; detail find (`/` when detail focused, or `Ctrl+f`) with `n`/`N` matches
 - Pod / service logs with search, follow (`f`), scroll; **line copy** via click focus + `y` / `Ctrl+C` / right-click / double-click
+- **Logs in a new terminal** — `L` pops pod/service logs out to a new terminal window running `kubectl logs -f` via your `$SHELL`, in the same emulator rusticlens-tui runs in (e.g. Tilix; detected from the process tree, so shells/tmux are fine, with env fingerprints on macOS; override with `RUSTICLENS_TERMINAL=<binary>`). Falls back to common emulators, then to the built-in view. Toggle: settings `,` → `Logs in external terminal` (on by default)
 - Context (`c`) / namespace (`n`) pickers; multi-cluster tabs (`[` / `]`, `Ctrl+t` add, `Ctrl+w` close)
 - Overview dashboard (`o`); favorites (`f` / `F`); theme toggle (`t`); settings (`,`)
 - Action menu (`m`): delete, scale, restart, CronJob trigger/suspend, port-forward, favorites
@@ -214,6 +215,7 @@ These are current behavioral limits worth knowing before daily use:
 
 ### External terminal
 - Requires a supported emulator on `PATH` (`gnome-terminal`, `konsole`, `kitty`, `alacritty`, `xterm`, etc.). If none is found, use **Copy kubectl exec** or the embedded shell.
+- **TUI log pop-out** (`L` with `Logs in external terminal` on) spawns in the emulator hosting the TUI when detected (`RUSTICLENS_TERMINAL=<binary>` overrides); over SSH or without a display it falls back to the built-in log view.
 
 ### Packaging
 - Flatpak / Debian / Homebrew files under `packaging/` are **scaffolds** — not published to Flathub, apt repos, or Homebrew core yet.

@@ -80,6 +80,7 @@ pub enum InputPurpose {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsCursor {
     NativePortForward,
+    ExternalLogs,
     Theme,
     AddKubeconfigPath,
     ExtraKubeconfigList,
@@ -105,6 +106,7 @@ impl PortForwardSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerPickerPurpose {
     Logs,
+    ExternalLogs,
     Exec,
 }
 
@@ -295,6 +297,7 @@ pub struct TuiApp {
     pub cluster_tabs: Vec<String>,
     pub favorites: Vec<FavoriteResource>,
     pub use_native_port_forward: bool,
+    pub external_logs: bool,
     pub extra_kubeconfig_paths: Vec<String>,
     pub port_forwards: HashMap<u64, PortForwardSession>,
     pub port_forward_entries: Vec<PortForwardEntry>,
@@ -340,10 +343,12 @@ pub enum PendingOp {
     },
     FetchContainers {
         pod_name: String,
+        external: bool,
         handle: tokio::task::JoinHandle<FetchContainersOutcome>,
     },
     FetchServicePods {
         service_name: String,
+        external: bool,
         handle: tokio::task::JoinHandle<FetchServicePodsOutcome>,
     },
     Refresh {
@@ -388,7 +393,7 @@ pub struct RefreshResult {
     pub rows: Vec<ResourceRow>,
 }
 
-pub type FetchServicePodsOutcome = Result<Vec<String>, rl_core::Error>;
+pub type FetchServicePodsOutcome = Result<rl_core::ServicePods, rl_core::Error>;
 
 #[derive(Debug, Clone)]
 pub enum ExternalRequest {
@@ -463,6 +468,7 @@ impl TuiApp {
             cluster_tabs,
             favorites: settings.favorites,
             use_native_port_forward: settings.use_native_port_forward,
+            external_logs: settings.external_logs,
             extra_kubeconfig_paths: settings.extra_kubeconfig_paths,
             port_forwards: HashMap::new(),
             port_forward_entries: Vec::new(),
@@ -540,6 +546,7 @@ impl TuiApp {
         settings.open_cluster_tabs = self.cluster_tabs.clone();
         settings.favorites = self.favorites.clone();
         settings.use_native_port_forward = self.use_native_port_forward;
+        settings.external_logs = self.external_logs;
         settings.extra_kubeconfig_paths = self.extra_kubeconfig_paths.clone();
         let _ = save_settings(&settings);
     }
@@ -917,9 +924,13 @@ impl TuiApp {
                     self.status_message.clear();
                 }
             },
-            PendingOp::FetchContainers { pod_name, handle } => match handle.await {
+            PendingOp::FetchContainers {
+                pod_name,
+                external,
+                handle,
+            } => match handle.await {
                 Ok(outcome) => {
-                    self.apply_fetch_containers(pod_name, outcome);
+                    self.apply_fetch_containers(pod_name, external, outcome);
                 }
                 Err(err) => {
                     self.error_message = Some(format!("Container list task failed: {err}"));
@@ -928,10 +939,11 @@ impl TuiApp {
             },
             PendingOp::FetchServicePods {
                 service_name,
+                external,
                 handle,
             } => match handle.await {
                 Ok(outcome) => {
-                    self.apply_fetch_service_pods(service_name, outcome);
+                    self.apply_fetch_service_pods(service_name, external, outcome);
                 }
                 Err(err) => {
                     self.error_message = Some(format!("Service pod list task failed: {err}"));
@@ -1567,18 +1579,20 @@ impl TuiApp {
             path_selected,
         }) = &mut self.overlay
         {
-            let max = 3i32;
+            let max = 4i32;
             let cur = match cursor {
                 SettingsCursor::NativePortForward => 0,
-                SettingsCursor::Theme => 1,
-                SettingsCursor::AddKubeconfigPath => 2,
-                SettingsCursor::ExtraKubeconfigList => 3,
+                SettingsCursor::ExternalLogs => 1,
+                SettingsCursor::Theme => 2,
+                SettingsCursor::AddKubeconfigPath => 3,
+                SettingsCursor::ExtraKubeconfigList => 4,
             };
             let next = (cur + delta).clamp(0, max);
             *cursor = match next {
                 0 => SettingsCursor::NativePortForward,
-                1 => SettingsCursor::Theme,
-                2 => SettingsCursor::AddKubeconfigPath,
+                1 => SettingsCursor::ExternalLogs,
+                2 => SettingsCursor::Theme,
+                3 => SettingsCursor::AddKubeconfigPath,
                 _ => SettingsCursor::ExtraKubeconfigList,
             };
             if *cursor == SettingsCursor::ExtraKubeconfigList
@@ -1757,6 +1771,9 @@ impl TuiApp {
         match purpose {
             ContainerPickerPurpose::Logs => {
                 self.open_log_view(pod_name, Some(container)).await;
+            }
+            ContainerPickerPurpose::ExternalLogs => {
+                self.spawn_external_pod_logs(&pod_name, Some(container.as_str()));
             }
             ContainerPickerPurpose::Exec => {
                 self.pending_external = Some(ExternalRequest::ExecShell {
@@ -2180,13 +2197,27 @@ impl TuiApp {
             let guard = manager.read().await;
             guard.pod_containers(&work_pod).await
         });
-        self.pending_op = Some(PendingOp::FetchContainers { pod_name, handle });
+        self.pending_op = Some(PendingOp::FetchContainers {
+            pod_name,
+            external: self.external_logs,
+            handle,
+        });
     }
 
-    fn apply_fetch_containers(&mut self, pod_name: String, outcome: FetchContainersOutcome) {
+    fn apply_fetch_containers(
+        &mut self,
+        pod_name: String,
+        external: bool,
+        outcome: FetchContainersOutcome,
+    ) {
         self.status_message.clear();
         match outcome {
             Ok(containers) if containers.len() > 1 => {
+                let purpose = if external {
+                    ContainerPickerPurpose::ExternalLogs
+                } else {
+                    ContainerPickerPurpose::Logs
+                };
                 self.overlay = Some(Overlay::Container {
                     pod_name,
                     containers: containers.into_iter().map(|c| c.name).collect(),
@@ -2194,8 +2225,12 @@ impl TuiApp {
                         search: String::new(),
                         selected: 0,
                     },
-                    purpose: ContainerPickerPurpose::Logs,
+                    purpose,
                 });
+            }
+            Ok(containers) if external => {
+                let container = containers.first().map(|c| c.name.clone());
+                self.spawn_external_pod_logs(&pod_name, container.as_deref());
             }
             Ok(containers) => {
                 let container = containers.first().map(|c| c.name.clone());
@@ -2205,6 +2240,28 @@ impl TuiApp {
                 });
             }
             Err(err) => self.error_message = Some(err.user_message()),
+        }
+    }
+
+    /// Spawn `kubectl logs -f` in a new terminal emulator; fall back to the
+    /// built-in log view when no emulator can be launched (e.g. over SSH).
+    fn spawn_external_pod_logs(&mut self, pod_name: &str, container: Option<&str>) {
+        match rl_core::spawn_kubectl_logs_terminal(
+            &self.active_context,
+            &self.active_namespace,
+            pod_name,
+            container,
+        ) {
+            Ok(_child) => {
+                self.status_message = format!("Opened logs for {pod_name} in a new terminal");
+            }
+            Err(_) => {
+                self.status_message = "No terminal emulator found — using built-in log view".into();
+                self.pending_open_log = Some(PendingLogOpen::Pod {
+                    pod_name: pod_name.to_string(),
+                    container: container.map(str::to_string),
+                });
+            }
         }
     }
 
@@ -2235,19 +2292,29 @@ impl TuiApp {
         });
         self.pending_op = Some(PendingOp::FetchServicePods {
             service_name,
+            external: self.external_logs,
             handle,
         });
     }
 
-    fn apply_fetch_service_pods(&mut self, service_name: String, outcome: FetchServicePodsOutcome) {
+    fn apply_fetch_service_pods(
+        &mut self,
+        service_name: String,
+        external: bool,
+        outcome: FetchServicePodsOutcome,
+    ) {
         self.status_message.clear();
         match outcome {
-            Ok(pods) if pods.is_empty() => {
+            Ok(info) if info.names.is_empty() => {
                 self.error_message = Some(format!(
                     "No pods match service `{service_name}` (missing or empty selector?)."
                 ));
             }
-            Ok(mut pods) => {
+            Ok(info) => {
+                let selector = info.selector;
+                let mut pods = info.names;
+                // `-l` matches every pod, so kubectl needs headroom for all of them.
+                let total_pods = pods.len();
                 const MAX_SERVICE_LOG_PODS: usize = 40;
                 if pods.len() > MAX_SERVICE_LOG_PODS {
                     let dropped = pods.len() - MAX_SERVICE_LOG_PODS;
@@ -2255,6 +2322,27 @@ impl TuiApp {
                     self.status_message = format!(
                         "Service has many pods; streaming first {MAX_SERVICE_LOG_PODS} (+{dropped} skipped)."
                     );
+                }
+                if external {
+                    if let Some(selector) = selector.as_deref() {
+                        match rl_core::spawn_kubectl_selector_logs_terminal(
+                            &self.active_context,
+                            &self.active_namespace,
+                            selector,
+                            total_pods,
+                        ) {
+                            Ok(_child) => {
+                                self.status_message = format!(
+                                    "Opened logs for svc/{service_name} ({total_pods} pods) in a new terminal"
+                                );
+                                return;
+                            }
+                            Err(_) => {
+                                self.status_message =
+                                    "No terminal emulator found — using built-in log view".into();
+                            }
+                        }
+                    }
                 }
                 let title = format!("svc/{service_name} ({} pods)", pods.len());
                 self.pending_open_log = Some(PendingLogOpen::MultiPod {

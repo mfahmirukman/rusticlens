@@ -33,7 +33,7 @@ pub use native_portforward::{
 };
 pub use ops::{
     kubectl_attach_command, kubectl_edit_command, kubectl_exec_command,
-    kubectl_rollout_restart_command, LOG_BUFFER_MAX_LINES,
+    kubectl_rollout_restart_command, ServicePods, LOG_BUFFER_MAX_LINES,
 };
 pub use plugin_loader::{
     ensure_plugins_dir, example_manifest_path, list_installed_plugins, plugins_dir,
@@ -41,7 +41,7 @@ pub use plugin_loader::{
 };
 pub use portforward::{
     kubectl_port_forward_command, spawn_kubectl_attach_terminal, spawn_kubectl_exec_terminal,
-    spawn_kubectl_port_forward,
+    spawn_kubectl_logs_terminal, spawn_kubectl_port_forward, spawn_kubectl_selector_logs_terminal,
 };
 pub use resources::CrdTarget;
 pub use resources::{ResourceCategory, ResourceKind, ResourceRow};

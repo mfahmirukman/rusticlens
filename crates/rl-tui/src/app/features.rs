@@ -58,6 +58,14 @@ impl TuiApp {
                     }
                 );
             }
+            SettingsCursor::ExternalLogs => {
+                self.external_logs = !self.external_logs;
+                self.persist_ui_settings();
+                self.status_message = format!(
+                    "Logs in external terminal: {}",
+                    if self.external_logs { "on" } else { "off" }
+                );
+            }
             SettingsCursor::Theme => {
                 self.toggle_theme();
             }

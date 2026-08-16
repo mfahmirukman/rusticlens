@@ -41,6 +41,10 @@ pub struct AppSettings {
     /// Prefer kube-rs port-forward over spawning kubectl (default true).
     #[serde(default = "default_true")]
     pub use_native_port_forward: bool,
+    /// Open logs in a new terminal emulator running `kubectl logs -f` (default true).
+    /// Falls back to the built-in log view when no emulator can be launched.
+    #[serde(default = "default_true")]
+    pub external_logs: bool,
 }
 
 fn default_true() -> bool {
@@ -63,6 +67,7 @@ impl Default for AppSettings {
             favorites: Vec::new(),
             open_cluster_tabs: Vec::new(),
             use_native_port_forward: true,
+            external_logs: true,
         }
     }
 }

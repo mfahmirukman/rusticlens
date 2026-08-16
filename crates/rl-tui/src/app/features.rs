@@ -87,6 +87,14 @@ impl TuiApp {
                     }
                 }
             }
+            SettingsCursor::Editor => {
+                self.overlay = Some(Overlay::Input {
+                    prompt: "Editor command (e.g. zed --wait)".into(),
+                    value: self.editor.clone().unwrap_or_default(),
+                    purpose: InputPurpose::SetEditor,
+                    extra: None,
+                });
+            }
         }
     }
 
@@ -336,6 +344,20 @@ impl TuiApp {
         self.jump_to_favorite(&fav).await;
     }
 
+    pub async fn confirm_editor_picker(&mut self, state: ListPickerState) {
+        let indices = self.filtered_editor_indices(&state.search);
+        let Some(&cand_idx) = indices.get(state.selected) else {
+            return;
+        };
+        let Some(candidate) = self.editor_candidates.get(cand_idx).cloned() else {
+            return;
+        };
+        self.editor = Some(candidate.command.to_string());
+        self.persist_ui_settings();
+        self.close_overlay();
+        self.status_message = format!("Editor: {} ({})", candidate.label, candidate.command);
+    }
+
     async fn jump_to_favorite(&mut self, fav: &FavoriteResource) {
         let kind = ResourceKind::ALL
             .iter()
@@ -478,6 +500,19 @@ impl TuiApp {
                     self.persist_ui_settings();
                     self.status_message = format!("Added kubeconfig: {path}");
                 }
+            }
+            InputPurpose::SetEditor => {
+                let trimmed = value.trim().to_string();
+                self.editor = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.clone())
+                };
+                self.persist_ui_settings();
+                self.status_message = match &self.editor {
+                    Some(e) => format!("Editor: {e}"),
+                    None => "Editor cleared (use $VISUAL/$EDITOR)".into(),
+                };
             }
         }
     }

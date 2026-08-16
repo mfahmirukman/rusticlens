@@ -990,6 +990,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, app: &TuiApp, overlay: &Overlay) 
             filter,
         } => draw_action_menu(frame, area, app, items, *selected, filter),
         Overlay::Favorites(state) => draw_favorites_picker(frame, area, app, state),
+        Overlay::EditorPicker(state) => draw_editor_picker(frame, area, app, state),
         Overlay::PortForwardList { selected } => {
             draw_port_forward_list(frame, area, app, *selected)
         }
@@ -1104,6 +1105,53 @@ fn draw_favorites_picker(
     );
 }
 
+fn draw_editor_picker(
+    frame: &mut Frame,
+    area: Rect,
+    app: &TuiApp,
+    state: &crate::app::ListPickerState,
+) {
+    let c = colors(app);
+    let indices = app.picker_indices();
+    let list_height = centered_rect(70, 70, area).height.saturating_sub(6) as usize;
+    let lines = build_picker_lines_from_strings(
+        &indices,
+        state.selected,
+        list_height,
+        |idx| {
+            let cand = &app.editor_candidates[idx];
+            let status = if crate::app::editor_installed(cand.binary) {
+                "installed"
+            } else {
+                "not installed"
+            };
+            format!("{} — {}", cand.label, status)
+        },
+        |name| {
+            let installed = !name.contains("not installed");
+            let style = if installed {
+                Style::default().fg(c.text)
+            } else {
+                Style::default().fg(c.muted).add_modifier(Modifier::DIM)
+            };
+            (name.to_string(), style)
+        },
+    );
+    draw_searchable_popup(
+        frame,
+        area,
+        " Choose editor ",
+        &state.search,
+        &lines,
+        "First run — pick an editor for apply/edit YAML. Installed ones shown brighter.",
+        if indices.is_empty() {
+            "No matching editors"
+        } else {
+            ""
+        },
+    );
+}
+
 fn draw_port_forward_list(frame: &mut Frame, area: Rect, app: &TuiApp, selected: usize) {
     let c = colors(app);
     let lines: Vec<Line> = if app.port_forward_entries.is_empty() {
@@ -1200,6 +1248,13 @@ fn draw_settings(
                         .unwrap_or_default()
                 )
             },
+        ),
+        (
+            SettingsCursor::Editor,
+            format!(
+                "Editor: {}",
+                app.editor.as_deref().unwrap_or("$VISUAL/$EDITOR/vi")
+            ),
         ),
     ];
     let body = rows
@@ -1793,11 +1848,39 @@ fn kinds_in_category(category: ResourceCategory) -> Vec<ResourceKind> {
         .collect()
 }
 
+/// Kinds in the exact order they render in the sidebar (categories top→bottom, then
+/// Helm appended last). Navigation (`move_sidebar`/`next_kind`/`prev_kind`/
+/// `kind_sidebar_index`) MUST use this — not `ResourceKind::ALL` — so arrow keys
+/// match what's on screen. `ALL` differs (Helm before Crd) and causes the
+/// Nodes↓→Helm(jumps to bottom)→↓→Custom(jumps up) bug.
+pub fn sidebar_kinds() -> &'static [ResourceKind] {
+    static SIDEBAR: &[ResourceKind] = &[
+        ResourceKind::Pod,
+        ResourceKind::Deployment,
+        ResourceKind::StatefulSet,
+        ResourceKind::Job,
+        ResourceKind::CronJob,
+        ResourceKind::Service,
+        ResourceKind::Ingress,
+        ResourceKind::NetworkPolicy,
+        ResourceKind::PersistentVolumeClaim,
+        ResourceKind::StorageClass,
+        ResourceKind::Role,
+        ResourceKind::RoleBinding,
+        ResourceKind::ClusterRole,
+        ResourceKind::ClusterRoleBinding,
+        ResourceKind::ConfigMap,
+        ResourceKind::Secret,
+        ResourceKind::Namespace,
+        ResourceKind::Node,
+        ResourceKind::Crd,
+        ResourceKind::HelmRelease,
+    ];
+    SIDEBAR
+}
+
 pub fn kind_sidebar_index(kind: ResourceKind) -> usize {
-    ResourceKind::ALL
-        .iter()
-        .position(|k| *k == kind)
-        .unwrap_or(0)
+    sidebar_kinds().iter().position(|k| *k == kind).unwrap_or(0)
 }
 
 fn table_header_line(kind: ResourceKind, name_width: usize) -> String {
@@ -1900,5 +1983,56 @@ fn fit(s: &str, width: usize) -> String {
         let mut out: String = chars.into_iter().take(width - 1).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Navigation order must match render order, or arrow keys jump on screen
+    /// (the Nodes↓→Helm(bottom)→↓→Custom(up) bug).
+    #[test]
+    fn sidebar_order_matches_render_order() {
+        let mut rendered: Vec<ResourceKind> = Vec::new();
+        for category in [
+            ResourceCategory::Workloads,
+            ResourceCategory::Network,
+            ResourceCategory::Storage,
+            ResourceCategory::Access,
+            ResourceCategory::Config,
+            ResourceCategory::Cluster,
+            ResourceCategory::Custom,
+        ] {
+            rendered.extend(kinds_in_category(category));
+        }
+        rendered.push(ResourceKind::HelmRelease);
+        let nav = sidebar_kinds();
+        assert_eq!(nav.len(), rendered.len());
+        for (i, k) in nav.iter().enumerate() {
+            assert_eq!(*k, rendered[i], "mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn kind_sidebar_indices_are_contiguous() {
+        let kinds = sidebar_kinds();
+        let indices: Vec<usize> = kinds.iter().map(|k| kind_sidebar_index(*k)).collect();
+        let expected: Vec<usize> = (0..kinds.len()).collect();
+        assert_eq!(indices, expected);
+    }
+
+    /// In `ALL`, HelmRelease(18) precedes Crd(19). In the sidebar, Crd renders above
+    /// Helm, so navigation must use `sidebar_kinds` where Crd precedes HelmRelease.
+    #[test]
+    fn crd_precedes_helm_in_sidebar() {
+        let kinds = sidebar_kinds();
+        let crd = kinds.iter().position(|k| *k == ResourceKind::Crd).unwrap();
+        let helm = kinds
+            .iter()
+            .position(|k| *k == ResourceKind::HelmRelease)
+            .unwrap();
+        assert!(crd < helm, "Crd must render above HelmRelease");
+        assert_eq!(helm, kinds.len() - 1, "HelmRelease must be last");
     }
 }

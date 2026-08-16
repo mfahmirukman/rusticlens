@@ -45,6 +45,10 @@ pub struct AppSettings {
     /// Falls back to the built-in log view when no emulator can be launched.
     #[serde(default = "default_true")]
     pub external_logs: bool,
+    /// Editor command for apply/edit YAML (e.g. `zed --wait`). Overrides `$VISUAL`/
+    /// `$EDITOR`; `None` = use env vars / `vi` fallback.
+    #[serde(default)]
+    pub editor: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -68,6 +72,7 @@ impl Default for AppSettings {
             open_cluster_tabs: Vec::new(),
             use_native_port_forward: true,
             external_logs: true,
+            editor: None,
         }
     }
 }

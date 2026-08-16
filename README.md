@@ -4,7 +4,7 @@ A native Rust Kubernetes IDE — a lightweight Freelens/Lens alternative without
 
 Built with **egui** for the desktop UI, **ratatui** for the terminal UI, and **kube-rs** for cluster communication. Typical GUI memory use is ~100–150 MB RSS (egui + async runtime + cluster watches), vs 300–800+ MB for Electron-based clients.
 
-**Current version: 0.5.10**
+**Current version: 0.6.3**
 
 ## What's implemented
 
@@ -18,7 +18,7 @@ Built with **egui** for the desktop UI, **ratatui** for the terminal UI, and **k
 | Describe / Events / Metrics | Yes | Yes |
 | Pod logs | Yes (polling) | Yes (polling; new-terminal pop-out) |
 | Scale / restart workloads | Yes | Yes |
-| Apply YAML | Yes | Yes (`$EDITOR`) |
+| Apply YAML | Yes | Yes (`--editor` / `$EDITOR`) |
 | Favorites | Yes | Yes |
 | Cluster overview dashboard | Yes | Yes |
 | Port-forward | Yes (native + kubectl) | Yes (native + kubectl) |
@@ -91,20 +91,23 @@ Parity with the GUI for cluster ops, using overlays and `$EDITOR` / in-place `ku
 - Context (`c`) / namespace (`n`) pickers; multi-cluster tabs (`[` / `]`, `Ctrl+t` add, `Ctrl+w` close)
 - Overview dashboard (`o`); favorites (`f` / `F`); theme toggle (`t`); settings (`,`)
 - Action menu (`m`): delete, scale, restart, CronJob trigger/suspend, port-forward, favorites
-- Apply / edit YAML via `$VISUAL`/`$EDITOR` (`a` / `E`); exec shell (`e`) suspends the TUI (Freelens-style `bash || ash || sh`)
+- Apply / edit YAML via `--editor`, `$VISUAL`/`$EDITOR`, or `vi` fallback (`a` / `E`); exec shell (`e`) suspends the TUI (Freelens-style `bash || ash || sh`)
 - Port-forward start/list/stop (`p` / `P`); plugins run `on_connect` on connect / context switch
 - Help overlay: `?`
 - Shared cluster manager (`Arc<RwLock<ClusterManager>>`) — the UI keeps the connection while background tasks lock briefly; sidebar kind switches stay inline/snappy
 - Context/namespace lists are cached in memory and on disk (`$XDG_CACHE_HOME/rusticlens/cluster-cache.json` or `~/.cache/rusticlens/cluster-cache.json`); namespace picker is instant; press `r` for a full reload (contexts + namespaces + rows + watch restart)
 - While a heavy exclusive op runs (context switch, namespace switch, full refresh), navigation and quit stay live; starting another exclusive op soft-refuses with `Busy — …` (describe/logs/fetch run concurrently via read locks)
-- Mouse is optional: **on by default** (hardened restore on quit). Disable with `rusticlens-tui --no-mouse` or `RUSTICLENS_NO_MOUSE=1`. Detail horizontal pan: Shift/Alt/Ctrl+wheel, wheel on the bottom ←→ bar, or trackpad side-swipe.
+- **Non-blocking kind loads:** 18/20 resource kinds use live watches, so switching to them reads an in-memory snapshot instantly (no network). The two non-watch kinds — **Helm releases** and **CRD instances** — load in a background task instead of blocking the input loop: cached rows (if any) render immediately, then a fresh fetch fills them in. Switching away and back is instant on cache hit; `r` invalidates the cache and re-fetches. The input loop (keys, mouse, quit) never blocks on a kind switch.
+- Mouse is optional: **on by default** (restored on quit/`kill`; watchdog covers hard kills). Disable with `rusticlens-tui --no-mouse` or `RUSTICLENS_NO_MOUSE=1`. Detail horizontal pan: Shift/Alt/Ctrl+wheel, wheel on the bottom ←→ bar, or trackpad side-swipe.
+- **CLI flags:** `--version` / `-V`, `--no-mouse`, and `--editor CMD` to set the YAML editor (e.g. `rusticlens-tui --editor "zed --wait"`). Passing `--editor` persists the value to `settings.json`, so subsequent launches read it without the flag. Editor precedence: `--editor` flag → `editor` field in `settings.json` → `$VISUAL` → `$EDITOR` → `vi`. GUI editors like Zed / VS Code must pass `--wait` or the TUI reads back the file before you finish editing.
+- **First-run editor picker:** when `editor` in `settings.json` is unset, the TUI opens a *Choose editor* overlay listing common editors (Zed, VS Code, Neovim, Vim, Helix, micro, Emacs, nano, Sublime Text) with live `installed` / `not installed` status (binary probed on `PATH`). Pick one and it writes the right value to `settings.json` (GUI editors automatically get `--wait`). Press `Esc` to skip and fall back to `$VISUAL`/`$EDITOR`/`vi` for that session. You can also change it later via the settings overlay (`,`) → *Editor* row.
 
 | Key | Action |
 |-----|--------|
 | `m` | Action menu |
 | `Ctrl+d` | Delete (confirm) |
 | `s` / `R` | Scale / rollout restart |
-| `a` / `E` | Apply / edit YAML in `$EDITOR` |
+| `a` / `E` | Apply / edit YAML in `--editor` / `$EDITOR` |
 | `p` / `P` | Start / list port-forwards |
 | `e` | Exec shell (current terminal; TUI suspends) |
 | `L` | Pod/service logs — new terminal window when enabled, built-in view otherwise |
@@ -164,7 +167,7 @@ The script:
 4. Atomically installs the new binaries and removes the previous ones
 5. On macOS, clears quarantine (`xattr -cr`) so Gatekeeper is less likely to block first launch
 
-Ensure `~/.local/bin` is on your `PATH`, then run `rusticlens` (GUI) or `rusticlens-tui` (TUI).
+Ensure `~/.local/bin` is on your `PATH`, then run `rusticlens` (GUI) or `rusticlens-tui` (TUI). To edit YAML in Zed: `rusticlens-tui --editor "zed --wait"`.
 
 ### Manual download
 
@@ -200,7 +203,7 @@ These are current behavioral limits worth knowing before daily use:
 - **Polling, not streaming** — new log lines are fetched on a ~10s interval (Freelens-style `sinceTime` polling), not a live Kubernetes watch stream. The TUI new-terminal pop-out is the exception: it runs real `kubectl logs -f`, so it needs `kubectl` on PATH and `pods/log` RBAC.
 - **Large logs** — “load older” chunks are capped; very chatty pods may feel sluggish.
 - **Copy needs a clipboard backend** — see [Clipboard (TUI yank / copy)](#clipboard-tui-yank--copy); with `--mouse`, the terminal’s native select→copy is unavailable while the TUI is open.
-- **Mouse leak / phantom typing** — tracking is **on by default** with multi-pass disable on quit. If you still see `65;37;36M`-style junk, run `printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l'` or `reset`, or start with `--no-mouse`.
+- **Mouse leak / phantom typing** — tracking is **on by default**. Quit/`kill` (SIGTERM) restore mouse modes; a tiny watchdog also clears them after hard kills (`kill -9`). If you still see `65;37;36M`-style junk, run `printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l'` or `reset`, or start with `--no-mouse`.
 
 ### Multi-cluster
 - **One active connection** — tabs switch contexts quickly and restore cached lists per context/namespace, but watches run for **one cluster at a time** (not parallel multi-cluster dashboards).

@@ -17,6 +17,80 @@ use tokio::task::JoinHandle;
 
 pub type SharedManager = Arc<RwLock<ClusterManager>>;
 
+/// One candidate editor offered in the first-run picker.
+#[derive(Debug, Clone)]
+pub struct EditorCandidate {
+    pub label: &'static str,
+    /// Binary name looked up on `PATH`.
+    pub binary: &'static str,
+    /// Value persisted to `settings.json` (includes `--wait` for GUI editors).
+    pub command: &'static str,
+}
+
+/// Editors offered when `settings.editor` is unset. GUI editors get `--wait` so the
+/// TUI reads back the file only after the editor closes.
+pub fn editor_candidates() -> &'static [EditorCandidate] {
+    static CANDIDATES: &[EditorCandidate] = &[
+        EditorCandidate {
+            label: "Zed",
+            binary: "zed",
+            command: "zed --wait",
+        },
+        EditorCandidate {
+            label: "VS Code",
+            binary: "code",
+            command: "code --wait",
+        },
+        EditorCandidate {
+            label: "Neovim",
+            binary: "nvim",
+            command: "nvim",
+        },
+        EditorCandidate {
+            label: "Vim",
+            binary: "vim",
+            command: "vim",
+        },
+        EditorCandidate {
+            label: "Helix",
+            binary: "hx",
+            command: "hx",
+        },
+        EditorCandidate {
+            label: "micro",
+            binary: "micro",
+            command: "micro",
+        },
+        EditorCandidate {
+            label: "Emacs",
+            binary: "emacs",
+            command: "emacs",
+        },
+        EditorCandidate {
+            label: "nano",
+            binary: "nano",
+            command: "nano",
+        },
+        EditorCandidate {
+            label: "Sublime Text",
+            binary: "subl",
+            command: "subl --wait",
+        },
+    ];
+    CANDIDATES
+}
+
+/// True if `binary` exists on `PATH`. No process spawn — scans `PATH` dirs.
+pub fn editor_installed(binary: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(binary);
+        candidate.is_file()
+    })
+}
+
 use crate::theme::ThemeMode;
 
 pub enum ConnectionState {
@@ -75,6 +149,7 @@ pub enum InputPurpose {
     PortForwardLocal,
     PortForwardRemote,
     AddKubeconfigPath,
+    SetEditor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +159,7 @@ pub enum SettingsCursor {
     Theme,
     AddKubeconfigPath,
     ExtraKubeconfigList,
+    Editor,
 }
 
 pub enum PortForwardSession {
@@ -150,6 +226,8 @@ pub enum Overlay {
     PortForwardList {
         selected: usize,
     },
+    /// First-run editor picker shown when `settings.editor` is unset.
+    EditorPicker(ListPickerState),
     Settings {
         cursor: SettingsCursor,
         path_selected: usize,
@@ -299,6 +377,15 @@ pub struct TuiApp {
     pub use_native_port_forward: bool,
     pub external_logs: bool,
     pub extra_kubeconfig_paths: Vec<String>,
+    pub editor: Option<String>,
+    /// Detected editors for the first-run picker. Order matches `editor_candidates()`.
+    pub editor_candidates: Vec<EditorCandidate>,
+    /// In-memory cache of non-watch kind rows (Helm, CRD instances) so switching
+    /// back to a previously loaded kind renders instantly while a refresh runs.
+    /// Key: (kind, namespace, selected CRD display name).
+    pub kind_row_cache: HashMap<(ResourceKind, String, Option<String>), Vec<ResourceRow>>,
+    /// Background kind-row load in flight (Helm/CRD). Polled each frame.
+    pub kind_load: Option<KindLoad>,
     pub port_forwards: HashMap<u64, PortForwardSession>,
     pub port_forward_entries: Vec<PortForwardEntry>,
     pub next_port_forward_id: u64,
@@ -354,6 +441,16 @@ pub enum PendingOp {
     Refresh {
         handle: tokio::task::JoinHandle<RefreshOutcome>,
     },
+}
+
+/// Background load of non-watch kind rows (Helm releases, CRD instances).
+/// Separate from `PendingOp` so multiple kind switches don't clobber exclusive ops
+/// and so cached rows render instantly while the refresh runs.
+pub struct KindLoad {
+    pub kind: ResourceKind,
+    /// Cache key suffix: selected CRD target's display name for CRD, else None.
+    pub crd_name: Option<String>,
+    pub handle: tokio::task::JoinHandle<Result<Vec<ResourceRow>, rl_core::Error>>,
 }
 
 pub type SwitchContextOutcome = Result<SwitchContextResult, rl_core::Error>;
@@ -469,7 +566,11 @@ impl TuiApp {
             favorites: settings.favorites,
             use_native_port_forward: settings.use_native_port_forward,
             external_logs: settings.external_logs,
-            extra_kubeconfig_paths: settings.extra_kubeconfig_paths,
+            extra_kubeconfig_paths: settings.extra_kubeconfig_paths.clone(),
+            editor: settings.editor.clone(),
+            editor_candidates: editor_candidates().to_vec(),
+            kind_row_cache: HashMap::new(),
+            kind_load: None,
             port_forwards: HashMap::new(),
             port_forward_entries: Vec::new(),
             next_port_forward_id: 1,
@@ -548,6 +649,7 @@ impl TuiApp {
         settings.use_native_port_forward = self.use_native_port_forward;
         settings.external_logs = self.external_logs;
         settings.extra_kubeconfig_paths = self.extra_kubeconfig_paths.clone();
+        settings.editor = self.editor.clone();
         let _ = save_settings(&settings);
     }
 
@@ -861,20 +963,145 @@ impl TuiApp {
             if let Ok(guard) = manager.try_read() {
                 self.rows = guard.snapshot(kind).rows;
             }
+            if self.selected >= self.rows.len() {
+                self.selected = self.rows.len().saturating_sub(1);
+            }
+            self.clamp_table_selection();
+            self.update_status_from_rows();
         } else {
-            match manager.read().await.list_rows(kind).await {
-                Ok(rows) => self.rows = rows,
-                Err(err) => {
-                    self.rows.clear();
+            // Non-watch kinds (Helm, CRD): don't block the input loop. Render cached
+            // rows instantly if present, then refresh in the background.
+            self.load_kind_rows_async().await;
+        }
+    }
+
+    /// Cache key for non-watch kind rows: (kind, namespace, CRD display name?).
+    fn kind_cache_key(&self, kind: ResourceKind) -> (ResourceKind, String, Option<String>) {
+        let crd_name = if kind == ResourceKind::Crd {
+            self.crd_targets
+                .get(
+                    self.selected_crd_index
+                        .min(self.crd_targets.len().saturating_sub(1)),
+                )
+                .map(|t| t.display_name.clone())
+        } else {
+            None
+        };
+        (kind, self.active_namespace.clone(), crd_name)
+    }
+
+    /// Non-blocking load for non-watch kinds (Helm releases, CRD instances). Renders
+    /// cached rows instantly if available, then spawns a background `list_rows` and
+    /// fills in fresh rows when it lands. Watched kinds stay on the snapshot path.
+    pub async fn load_kind_rows_async(&mut self) {
+        let Some(manager) = self.manager.clone() else {
+            return;
+        };
+        let kind = self.active_kind;
+        if kind.uses_watch() {
+            return;
+        }
+        if kind == ResourceKind::Crd {
+            if self.crd_targets.is_empty() {
+                self.rows.clear();
+                self.status_message = "No CRDs in cluster".into();
+                return;
+            }
+            let idx = self
+                .selected_crd_index
+                .min(self.crd_targets.len().saturating_sub(1));
+            let target = self.crd_targets[idx].clone();
+            let mut guard = manager.write().await;
+            guard.set_selected_crd(Some(target));
+            drop(guard);
+        }
+        let key = self.kind_cache_key(kind);
+        let cached = self.kind_row_cache.get(&key).cloned();
+        match &cached {
+            Some(rows) => {
+                self.rows = rows.clone();
+                if self.selected >= self.rows.len() {
+                    self.selected = self.rows.len().saturating_sub(1);
+                }
+                self.clamp_table_selection();
+            }
+            None => {
+                // No cache yet: clear stale rows from the previous kind so we don't
+                // render Pods under a "CRD instances" header while loading.
+                self.rows.clear();
+                self.selected = 0;
+            }
+        }
+        let label = kind.label();
+        self.status_message = if cached.is_some() {
+            format!("{label} — refreshing…")
+        } else {
+            format!("Loading {label}…")
+        };
+        // Abort any prior in-flight kind load so we don't apply stale results.
+        if let Some(prev) = self.kind_load.take() {
+            prev.handle.abort();
+        }
+        let work_kind = kind;
+        let handle = tokio::spawn(async move {
+            let guard = manager.read().await;
+            guard.list_rows(work_kind).await
+        });
+        self.kind_load = Some(KindLoad {
+            kind,
+            crd_name: key.2.clone(),
+            handle,
+        });
+        self.update_status_from_rows();
+    }
+
+    /// Poll the in-flight non-watch kind load. On completion: update the cache and,
+    /// if still viewing that kind, render fresh rows.
+    pub async fn poll_kind_load(&mut self) {
+        let finished = self
+            .kind_load
+            .as_ref()
+            .map(|l| l.handle.is_finished())
+            .unwrap_or(false);
+        if !finished {
+            return;
+        }
+        let Some(load) = self.kind_load.take() else {
+            return;
+        };
+        let KindLoad {
+            kind,
+            crd_name,
+            handle,
+        } = load;
+        match handle.await {
+            Ok(Ok(rows)) => {
+                let key = (kind, self.active_namespace.clone(), crd_name.clone());
+                self.kind_row_cache.insert(key, rows.clone());
+                if self.active_kind == kind {
+                    self.rows = rows;
+                    if self.selected >= self.rows.len() {
+                        self.selected = self.rows.len().saturating_sub(1);
+                    }
+                    self.clamp_table_selection();
+                    self.status_message.clear();
+                    self.error_message = None;
+                    self.update_status_from_rows();
+                }
+            }
+            Ok(Err(err)) => {
+                if self.active_kind == kind {
                     self.error_message = Some(err.user_message());
+                    self.status_message.clear();
+                }
+            }
+            Err(err) => {
+                if self.active_kind == kind {
+                    self.error_message = Some(format!("Kind load task failed: {err}"));
+                    self.status_message.clear();
                 }
             }
         }
-        if self.selected >= self.rows.len() {
-            self.selected = self.rows.len().saturating_sub(1);
-        }
-        self.clamp_table_selection();
-        self.update_status_from_rows();
     }
 
     /// Non-blocking poll: if the in-flight op finished, apply its result.
@@ -1043,21 +1270,28 @@ impl TuiApp {
             guard.set_selected_crd(Some(target));
             drop(guard);
         }
-        match manager.read().await.list_rows(kind).await {
-            Ok(rows) => {
-                self.rows = rows;
-                self.error_message = None;
-                self.update_status_from_rows();
+        if kind.uses_watch() {
+            match manager.read().await.list_rows(kind).await {
+                Ok(rows) => {
+                    self.rows = rows;
+                    self.error_message = None;
+                    self.update_status_from_rows();
+                }
+                Err(err) => {
+                    self.rows.clear();
+                    self.error_message = Some(err.user_message());
+                }
             }
-            Err(err) => {
-                self.rows.clear();
-                self.error_message = Some(err.user_message());
+            if self.selected >= self.rows.len() {
+                self.selected = self.rows.len().saturating_sub(1);
             }
+            self.clamp_table_selection();
+        } else {
+            // Non-watch: invalidate cache so the background fetch is authoritative.
+            let key = self.kind_cache_key(kind);
+            self.kind_row_cache.remove(&key);
+            self.load_kind_rows_async().await;
         }
-        if self.selected >= self.rows.len() {
-            self.selected = self.rows.len().saturating_sub(1);
-        }
-        self.clamp_table_selection();
     }
 
     pub fn poll_snapshots(&mut self) {
@@ -1298,7 +1532,7 @@ impl TuiApp {
     }
 
     fn move_sidebar(&mut self, delta: i32) {
-        let kinds: Vec<ResourceKind> = ResourceKind::ALL.to_vec();
+        let kinds: &[ResourceKind] = crate::ui::sidebar_kinds();
         let current = self.sidebar_index.min(kinds.len().saturating_sub(1));
         let next = (current as i32 + delta).clamp(0, kinds.len() as i32 - 1) as usize;
         self.sidebar_index = next;
@@ -1379,14 +1613,14 @@ impl TuiApp {
     }
 
     pub async fn activate_sidebar_selection(&mut self) {
-        let kinds: Vec<ResourceKind> = ResourceKind::ALL.to_vec();
+        let kinds: &[ResourceKind] = crate::ui::sidebar_kinds();
         if let Some(kind) = kinds.get(self.sidebar_index) {
             self.set_kind(*kind).await;
         }
     }
 
     pub async fn next_kind(&mut self) {
-        let kinds: Vec<ResourceKind> = ResourceKind::ALL.to_vec();
+        let kinds: &[ResourceKind] = crate::ui::sidebar_kinds();
         let idx = kinds
             .iter()
             .position(|k| *k == self.active_kind)
@@ -1396,7 +1630,7 @@ impl TuiApp {
     }
 
     pub async fn prev_kind(&mut self) {
-        let kinds: Vec<ResourceKind> = ResourceKind::ALL.to_vec();
+        let kinds: &[ResourceKind] = crate::ui::sidebar_kinds();
         let idx = kinds
             .iter()
             .position(|k| *k == self.active_kind)
@@ -1480,6 +1714,7 @@ impl TuiApp {
                 state, containers, ..
             }) => filter_indices(containers, &state.search),
             Some(Overlay::Favorites(state)) => self.filtered_favorite_indices(&state.search),
+            Some(Overlay::EditorPicker(state)) => self.filtered_editor_indices(&state.search),
             _ => Vec::new(),
         }
     }
@@ -1501,6 +1736,28 @@ impl TuiApp {
             .collect()
     }
 
+    pub fn filtered_editor_indices(&self, search: &str) -> Vec<usize> {
+        let query = search.to_lowercase();
+        self.editor_candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                query.is_empty()
+                    || c.label.to_lowercase().contains(&query)
+                    || c.binary.to_lowercase().contains(&query)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Open the first-run editor picker. Caller decides whether to show it.
+    pub fn show_editor_picker(&mut self) {
+        self.overlay = Some(Overlay::EditorPicker(ListPickerState {
+            search: String::new(),
+            selected: 0,
+        }));
+    }
+
     fn filtered_context_indices(&self, search: &str) -> Vec<usize> {
         filter_indices(&self.contexts, search)
     }
@@ -1515,6 +1772,7 @@ impl TuiApp {
             Some(Overlay::Namespace(_)) => self.filtered_namespace_indices(search),
             Some(Overlay::Container { containers, .. }) => filter_indices(containers, search),
             Some(Overlay::Favorites(_)) => self.filtered_favorite_indices(search),
+            Some(Overlay::EditorPicker(_)) => self.filtered_editor_indices(search),
             _ => Vec::new(),
         }
     }
@@ -1522,7 +1780,10 @@ impl TuiApp {
     fn overlay_list_state_mut(&mut self) -> Option<&mut ListPickerState> {
         match &mut self.overlay {
             Some(
-                Overlay::Context(state) | Overlay::Namespace(state) | Overlay::Favorites(state),
+                Overlay::Context(state)
+                | Overlay::Namespace(state)
+                | Overlay::Favorites(state)
+                | Overlay::EditorPicker(state),
             ) => Some(state),
             Some(Overlay::Container { state, .. }) => Some(state),
             _ => None,
@@ -1532,7 +1793,10 @@ impl TuiApp {
     fn overlay_search(&self) -> Option<String> {
         match &self.overlay {
             Some(
-                Overlay::Context(state) | Overlay::Namespace(state) | Overlay::Favorites(state),
+                Overlay::Context(state)
+                | Overlay::Namespace(state)
+                | Overlay::Favorites(state)
+                | Overlay::EditorPicker(state),
             ) => Some(state.search.clone()),
             Some(Overlay::Container { state, .. }) => Some(state.search.clone()),
             Some(Overlay::ActionMenu { filter, .. }) => Some(filter.clone()),
@@ -1579,13 +1843,14 @@ impl TuiApp {
             path_selected,
         }) = &mut self.overlay
         {
-            let max = 4i32;
+            let max = 5i32;
             let cur = match cursor {
                 SettingsCursor::NativePortForward => 0,
                 SettingsCursor::ExternalLogs => 1,
                 SettingsCursor::Theme => 2,
                 SettingsCursor::AddKubeconfigPath => 3,
                 SettingsCursor::ExtraKubeconfigList => 4,
+                SettingsCursor::Editor => 5,
             };
             let next = (cur + delta).clamp(0, max);
             *cursor = match next {
@@ -1593,7 +1858,8 @@ impl TuiApp {
                 1 => SettingsCursor::ExternalLogs,
                 2 => SettingsCursor::Theme,
                 3 => SettingsCursor::AddKubeconfigPath,
-                _ => SettingsCursor::ExtraKubeconfigList,
+                4 => SettingsCursor::ExtraKubeconfigList,
+                _ => SettingsCursor::Editor,
             };
             if *cursor == SettingsCursor::ExtraKubeconfigList
                 && !self.extra_kubeconfig_paths.is_empty()
@@ -1745,6 +2011,7 @@ impl TuiApp {
                 }
             }
             Overlay::Favorites(state) => self.confirm_favorite_picker(state).await,
+            Overlay::EditorPicker(state) => self.confirm_editor_picker(state).await,
             Overlay::PortForwardList { selected } => {
                 self.stop_port_forward_at(selected);
             }

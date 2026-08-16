@@ -6,9 +6,9 @@ mod ui;
 
 use std::io::{self, stdout, Write};
 use std::panic;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -29,6 +29,9 @@ use app::{DetailTab, ExternalRequest, Overlay, SettingsCursor, TuiApp, ViewMode}
 /// Set when we enabled mouse tracking — restore always clears modes regardless.
 static MOUSE_ENABLED: AtomicBool = AtomicBool::new(false);
 static RESTORING: AtomicBool = AtomicBool::new(false);
+/// `--editor` override (e.g. `zed --wait`). Set once at startup; `None` = use
+/// `$VISUAL` / `$EDITOR` / `vi`.
+static EDITOR_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 
 /// CSI for click / drag / wheel only. Intentionally skips `?1003` (any-event / hover
 /// motion): crossterm's EnableMouseCapture turns that on, and if disable fails the
@@ -45,6 +48,17 @@ async fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    // `--editor CMD` overrides `$VISUAL`/`$EDITOR` for apply/edit YAML. Supports
+    // both `--editor "zed --wait"` and `--editor=zed`. When set, also persist to
+    // `settings.json` so future launches read it without the flag.
+    let editor_override = parse_editor_arg(std::env::args().collect());
+    if let Some(cmd) = &editor_override {
+        let mut settings = rl_core::load_settings();
+        settings.editor = Some(cmd.clone());
+        let _ = rl_core::save_settings(&settings);
+    }
+    let _ = EDITOR_OVERRIDE.set(editor_override);
+
     init_tui_tracing();
 
     rl_core::ensure_plugins_dir();
@@ -52,17 +66,17 @@ async fn main() -> io::Result<()> {
 
     let mouse = mouse_wanted();
 
-    // SIGINT/SIGTERM skip Rust Drop unless we restore explicitly first.
-    let _ = ctrlc::set_handler(|| {
-        restore_terminal();
-        std::process::exit(130);
-    });
+    // Signals skip Rust Drop — restore modes before exit. `ctrlc` only catches SIGINT;
+    // `kill <pid>` is SIGTERM and was leaving mouse tracking on (SGR junk in the shell).
+    install_fatal_signal_handlers();
 
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
     if mouse {
         enable_mouse_tracking()?;
+        // Survives SIGKILL / hard kills where this process cannot run restore_terminal.
+        spawn_mouse_cleanup_watchdog();
     }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).inspect_err(|_| restore_terminal())?;
@@ -76,6 +90,11 @@ async fn main() -> io::Result<()> {
     let _terminal_guard = TerminalRestoreGuard;
 
     let mut app = TuiApp::new();
+    // First-run editor picker: only when no flag persisted one and settings has none.
+    let flag_set = EDITOR_OVERRIDE.get().and_then(|o| o.clone()).is_some();
+    if app.editor.is_none() && !flag_set {
+        app.show_editor_picker();
+    }
     let result = run(&mut terminal, &mut app).await;
 
     for (_, session) in app.port_forwards.drain() {
@@ -91,7 +110,7 @@ async fn main() -> io::Result<()> {
 }
 
 fn mouse_wanted() -> bool {
-    // Default ON — hardened restore clears tracking on quit. Opt out for flaky TERM.
+    // Default ON — restore + kill-watchdog clear tracking on quit/kill. Opt out for flaky TERM.
     if std::env::args().any(|a| a == "--no-mouse") {
         return false;
     }
@@ -108,6 +127,68 @@ fn mouse_wanted() -> bool {
         std::env::var("RUSTICLENS_MOUSE").as_deref(),
         Ok("0" | "false" | "FALSE" | "no" | "NO")
     )
+}
+
+/// Restore the tty on SIGINT / SIGTERM / SIGHUP. Runs on a dedicated thread so cleanup
+/// need not be async-signal-safe (unlike a raw `signal()` handler).
+fn install_fatal_signal_handlers() {
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+        use signal_hook::iterator::Signals;
+
+        let Ok(mut signals) = Signals::new([SIGINT, SIGTERM, SIGHUP]) else {
+            return;
+        };
+        std::thread::Builder::new()
+            .name("rl-tui-signals".into())
+            .spawn(move || {
+                if let Some(sig) = signals.forever().next() {
+                    restore_terminal();
+                    let code = if sig == SIGINT { 130 } else { 143 };
+                    // exit skips remaining destructors — restore_terminal already ran.
+                    std::process::exit(code);
+                }
+            })
+            .ok();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrlc::set_handler(|| {
+            restore_terminal();
+            std::process::exit(130);
+        });
+    }
+}
+
+/// Separate process that waits for this PID to disappear, then disables mouse tracking
+/// on `/dev/tty`. Covers `kill -9` and any path where we never get to run Rust cleanup.
+fn spawn_mouse_cleanup_watchdog() {
+    #[cfg(unix)]
+    {
+        let parent = std::process::id();
+        // POSIX sh: poll until parent is gone, then emit disable CSI twice (some emulators
+        // ignore the first burst if the dying process still held the tty).
+        let script = format!(
+            "while kill -0 {parent} 2>/dev/null; do sleep 0.05; done; \
+             printf '\\033[?1006l\\033[?1003l\\033[?1002l\\033[?1000l\\033[?1015l\\033[?1001l' >/dev/tty 2>/dev/null; \
+             sleep 0.05; \
+             printf '\\033[?1006l\\033[?1003l\\033[?1002l\\033[?1000l\\033[?1015l\\033[?1001l' >/dev/tty 2>/dev/null"
+        );
+        let _ = Command::new("sh")
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrlc::set_handler(|| {
+            restore_terminal();
+            std::process::exit(130);
+        });
+    }
 }
 
 fn enable_mouse_tracking() -> io::Result<()> {
@@ -372,6 +453,7 @@ async fn run(
             app.poll_snapshots();
         }
 
+        app.poll_kind_load().await;
         app.poll_pending_op().await;
     }
     Ok(())
@@ -399,6 +481,10 @@ async fn handle_external(
                 app.status_message = "Apply cancelled.".into();
                 return Ok(());
             }
+            // Re-show the TUI immediately so the screen isn't black during the
+            // server-side apply (a network call that can take 100ms+).
+            app.status_message = "Applying…".into();
+            terminal.draw(|frame| ui::draw(frame, app))?;
             if let Some(manager) = app.manager.clone() {
                 match manager.read().await.apply_yaml(&yaml).await {
                     Ok(names) => {
@@ -431,6 +517,9 @@ async fn handle_external(
                 app.status_message = "Edit cancelled.".into();
                 return Ok(());
             }
+            // Re-show the TUI immediately so the screen isn't black during the apply.
+            app.status_message = "Applying edit…".into();
+            terminal.draw(|frame| ui::draw(frame, app))?;
             if let Some(manager) = app.manager.clone() {
                 match manager.read().await.apply_yaml(&yaml).await {
                     Ok(names) => {
@@ -486,6 +575,43 @@ async fn handle_external(
     Ok(())
 }
 
+/// Parse `--editor` / `--editor=` from the argv list, returning the editor command
+/// string (e.g. `"zed --wait"`) if present. Missing or empty value → `None`.
+fn parse_editor_arg(args: Vec<String>) -> Option<String> {
+    let mut iter = args.into_iter();
+    while let Some(a) = iter.next() {
+        if a == "--editor" {
+            return iter.next().filter(|s| !s.is_empty());
+        }
+        if let Some(rest) = a.strip_prefix("--editor=") {
+            return if rest.is_empty() {
+                None
+            } else {
+                Some(rest.into())
+            };
+        }
+    }
+    None
+}
+
+#[test]
+fn editor_arg_parsing() {
+    let args: Vec<String> = ["rusticlens-tui", "--editor", "zed --wait"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(parse_editor_arg(args), Some("zed --wait".into()));
+
+    let args: Vec<String> = ["rusticlens-tui", "--editor=code"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(parse_editor_arg(args), Some("code".into()));
+
+    let args: Vec<String> = ["rusticlens-tui"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(parse_editor_arg(args), None);
+}
+
 fn suspend_for_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     initial: &str,
@@ -493,9 +619,13 @@ fn suspend_for_editor(
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".into());
+    let editor = EDITOR_OVERRIDE
+        .get()
+        .and_then(|o| o.clone())
+        .or_else(|| rl_core::load_settings().editor)
+        .or_else(|| std::env::var("VISUAL").ok())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| "vi".into());
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -503,8 +633,14 @@ fn suspend_for_editor(
     let path = std::env::temp_dir().join(format!("rusticlens-edit-{stamp}.yaml"));
     fs::write(&path, initial)?;
 
+    // Split `editor` into program + args so values like `zed --wait` spawn correctly.
+    // Simple whitespace split: editor commands don't need shell quoting here.
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    let editor_args: Vec<&str> = parts.collect();
+
     suspend_for_command(terminal, || {
-        let status = Command::new(&editor).arg(&path).status();
+        let status = Command::new(program).args(&editor_args).arg(&path).status();
         if let Err(err) = status {
             let _ = writeln!(io::stderr(), "editor failed: {err}");
         }

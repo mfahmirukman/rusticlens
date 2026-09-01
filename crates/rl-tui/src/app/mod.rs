@@ -150,6 +150,7 @@ pub enum InputPurpose {
     PortForwardRemote,
     AddKubeconfigPath,
     SetEditor,
+    TriggerCronJob,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,7 +215,7 @@ pub enum Overlay {
         prompt: String,
         value: String,
         purpose: InputPurpose,
-        /// Secondary value for two-step PF (remote port).
+        /// Secondary value (remote port for two-step PF, cronjob name for trigger).
         extra: Option<String>,
     },
     ActionMenu {

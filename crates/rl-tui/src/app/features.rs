@@ -435,7 +435,7 @@ impl TuiApp {
             PendingAction::Delete => self.delete_selection().await,
             PendingAction::Scale => self.prompt_scale(),
             PendingAction::Restart => self.restart_selection().await,
-            PendingAction::TriggerCronJob => self.trigger_cronjob().await,
+            PendingAction::TriggerCronJob => self.prompt_trigger_cronjob(),
             PendingAction::SuspendCronJob => self.set_cronjob_suspended(true).await,
             PendingAction::ResumeCronJob => self.set_cronjob_suspended(false).await,
             PendingAction::StartPortForward => self.prompt_port_forward(),
@@ -514,6 +514,17 @@ impl TuiApp {
                     None => "Editor cleared (use $VISUAL/$EDITOR)".into(),
                 };
             }
+            InputPurpose::TriggerCronJob => {
+                let job_name = value.trim().to_string();
+                if job_name.is_empty() {
+                    self.error_message = Some("Job name is empty".into());
+                    return;
+                }
+                let Some(cronjob) = extra else {
+                    return;
+                };
+                self.trigger_cronjob_named(cronjob, job_name).await;
+            }
         }
     }
 
@@ -558,17 +569,27 @@ impl TuiApp {
         }
     }
 
-    async fn trigger_cronjob(&mut self) {
+    pub fn prompt_trigger_cronjob(&mut self) {
         let Some(name) = self.selected_name() else {
+            self.error_message = Some("No resource selected".into());
             return;
         };
+        self.overlay = Some(Overlay::Input {
+            prompt: format!("Job name for CronJob {name}"),
+            value: rl_core::ops::manual_job_name(&name),
+            purpose: InputPurpose::TriggerCronJob,
+            extra: Some(name.to_string()),
+        });
+    }
+
+    async fn trigger_cronjob_named(&mut self, name: String, job_name: String) {
         let Some(manager) = self.manager.clone() else {
             return;
         };
         let guard = manager.read().await;
-        match guard.trigger_cronjob(&name).await {
+        match guard.trigger_cronjob(&name, Some(&job_name)).await {
             Ok(()) => {
-                self.status_message = format!("Triggered CronJob {name}");
+                self.status_message = format!("Triggered CronJob {name} as Job {job_name}");
                 self.error_message = None;
             }
             Err(err) => self.error_message = Some(err.user_message()),

@@ -650,7 +650,18 @@ pub fn kubectl_rollout_restart_command(namespace: &str, name: &str) -> String {
     format!("kubectl rollout restart deployment/{name} -n {namespace}")
 }
 
-pub async fn trigger_cronjob(client: &Client, namespace: &str, name: &str) -> Result<()> {
+/// Default Job name for a manual CronJob trigger (`<cronjob>-manual-<UTC stamp>`).
+pub fn manual_job_name(name: &str) -> String {
+    let suffix = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    format!("{name}-manual-{suffix}")
+}
+
+pub async fn trigger_cronjob(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    job_name: Option<&str>,
+) -> Result<()> {
     let api: Api<CronJob> = Api::namespaced(client.clone(), namespace);
     let cj = api.get(name).await?;
     let template = cj
@@ -659,8 +670,10 @@ pub async fn trigger_cronjob(client: &Client, namespace: &str, name: &str) -> Re
         .map(|s| s.job_template.clone())
         .ok_or_else(|| crate::error::Error::Message("cronjob has no job template".into()))?;
 
-    let suffix = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
-    let job_name = format!("{name}-manual-{suffix}");
+    let job_name = match job_name {
+        Some(job_name) if !job_name.trim().is_empty() => job_name.trim().to_string(),
+        _ => manual_job_name(name),
+    };
     let owner_refs = cj.metadata.uid.as_ref().map(|uid| {
         vec![OwnerReference {
             api_version: "batch/v1".into(),

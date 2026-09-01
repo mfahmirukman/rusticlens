@@ -748,6 +748,13 @@ impl TuiApp {
         }
     }
 
+    /// External `kubectl logs -f` exits immediately for terminated pods
+    /// (e.g. finished CronJob runs), closing the terminal window before the
+    /// logs can be read — those open in the built-in view instead.
+    pub fn logs_external_for(&self, pod_status: &str) -> bool {
+        self.external_logs && !matches!(pod_status, "Succeeded" | "Failed")
+    }
+
     pub fn poll_log_lines(&mut self) {
         let Some(log) = self.log_view.as_mut() else {
             return;
@@ -2534,7 +2541,7 @@ impl TuiApp {
         });
         self.pending_op = Some(PendingOp::FetchContainers {
             pod_name,
-            external: self.external_logs,
+            external: self.logs_external_for(&row.status),
             handle,
         });
     }
@@ -3277,4 +3284,21 @@ async fn refresh_work(
         namespace_index,
         rows,
     })
+}
+
+#[cfg(test)]
+mod log_target_tests {
+    use super::TuiApp;
+
+    #[test]
+    fn terminated_pods_skip_external_log_terminal() {
+        let mut app = TuiApp::new();
+        app.external_logs = true;
+        assert!(!app.logs_external_for("Succeeded"));
+        assert!(!app.logs_external_for("Failed"));
+        assert!(app.logs_external_for("Running"));
+        assert!(app.logs_external_for("Pending"));
+        app.external_logs = false;
+        assert!(!app.logs_external_for("Running"));
+    }
 }

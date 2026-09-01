@@ -1186,6 +1186,11 @@ async fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Char('k') if !text_overlay => app.picker_move(-1),
         KeyCode::Char('j') if !text_overlay => app.picker_move(1),
         KeyCode::Backspace => app.picker_backspace(),
+        KeyCode::Delete => app.input_delete_at_cursor(),
+        KeyCode::Left => app.input_cursor_left(),
+        KeyCode::Right => app.input_cursor_right(),
+        KeyCode::Home => app.input_cursor_home(),
+        KeyCode::End => app.input_cursor_end(),
         KeyCode::Char(ch) if !ch.is_control() => app.picker_push_char(ch),
         _ => {}
     }
@@ -1243,12 +1248,12 @@ mod overlay_key_tests {
 
     #[tokio::test]
     async fn input_prompt_receives_j_and_k() {
-        let mut app = app_with(Overlay::Input {
-            prompt: "Path".into(),
-            value: String::new(),
-            purpose: app::InputPurpose::AddKubeconfigPath,
-            extra: None,
-        });
+        let mut app = app_with(Overlay::input(
+            "Path".into(),
+            String::new(),
+            app::InputPurpose::AddKubeconfigPath,
+            None,
+        ));
         handle_overlay_key(&mut app, char_key('k')).await;
         handle_overlay_key(&mut app, char_key('j')).await;
         match &app.overlay {
@@ -1284,5 +1289,50 @@ mod overlay_key_tests {
             app.overlay,
             Some(Overlay::PortForwardList { selected: 0 })
         ));
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn input_cursor_moves_and_edits_mid_text() {
+        let mut app = app_with(Overlay::input(
+            "Name".into(),
+            "ac".into(),
+            app::InputPurpose::TriggerCronJob,
+            None,
+        ));
+        // Cursor starts at the end; move left and insert mid-text.
+        handle_overlay_key(&mut app, key(KeyCode::Left)).await;
+        handle_overlay_key(&mut app, char_key('b')).await;
+        match &app.overlay {
+            Some(Overlay::Input { value, cursor, .. }) => {
+                assert_eq!(value, "abc");
+                assert_eq!(*cursor, 2);
+            }
+            other => panic!("expected input overlay, got {other:?}"),
+        }
+        // Backspace deletes before the cursor, Delete removes the char under it.
+        handle_overlay_key(&mut app, key(KeyCode::Backspace)).await;
+        handle_overlay_key(&mut app, key(KeyCode::Delete)).await;
+        match &app.overlay {
+            Some(Overlay::Input { value, cursor, .. }) => {
+                assert_eq!(value, "a");
+                assert_eq!(*cursor, 1);
+            }
+            other => panic!("expected input overlay, got {other:?}"),
+        }
+        handle_overlay_key(&mut app, key(KeyCode::Home)).await;
+        handle_overlay_key(&mut app, char_key('z')).await;
+        handle_overlay_key(&mut app, key(KeyCode::End)).await;
+        handle_overlay_key(&mut app, char_key('!')).await;
+        match &app.overlay {
+            Some(Overlay::Input { value, cursor, .. }) => {
+                assert_eq!(value, "za!");
+                assert_eq!(*cursor, 3);
+            }
+            other => panic!("expected input overlay, got {other:?}"),
+        }
     }
 }

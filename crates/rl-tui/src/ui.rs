@@ -842,7 +842,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let help = if app.overlay_open() {
         match &app.overlay {
             Some(Overlay::Confirm { .. }) => "Enter confirm | Esc cancel",
-            Some(Overlay::Input { .. }) => "type value | Enter confirm | Esc cancel",
+            Some(Overlay::Input { .. }) => {
+                "type value | ←/→ cursor | Home/End | Enter confirm | Esc cancel"
+            }
             Some(Overlay::Help) => "Esc/Enter close | ? open anytime",
             Some(Overlay::Settings { .. }) => {
                 "↑/↓ move | Enter toggle/add | d delete path | Esc close"
@@ -973,8 +975,19 @@ fn draw_overlay(frame: &mut Frame, area: Rect, app: &TuiApp, overlay: &Overlay) 
             "Enter confirm · Esc cancel",
             app,
         ),
-        Overlay::Input { prompt, value, .. } => {
-            let body = format!("{prompt}\n\n> {value}_");
+        Overlay::Input {
+            prompt,
+            value,
+            cursor,
+            ..
+        } => {
+            let split = value
+                .char_indices()
+                .nth(*cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(value.len());
+            let (left, right) = value.split_at(split);
+            let body = format!("{prompt}\n\n> {left}_{right}");
             draw_simple_popup(
                 frame,
                 area,

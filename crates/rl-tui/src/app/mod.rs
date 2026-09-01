@@ -217,6 +217,8 @@ pub enum Overlay {
         purpose: InputPurpose,
         /// Secondary value (remote port for two-step PF, cronjob name for trigger).
         extra: Option<String>,
+        /// Edit cursor as a char index into `value` (0..=char count).
+        cursor: usize,
     },
     ActionMenu {
         items: Vec<crate::actions::ActionItem>,
@@ -234,6 +236,25 @@ pub enum Overlay {
         path_selected: usize,
     },
     Help,
+}
+
+impl Overlay {
+    /// Input overlay with the edit cursor placed at the end of the initial value.
+    pub fn input(
+        prompt: String,
+        value: String,
+        purpose: InputPurpose,
+        extra: Option<String>,
+    ) -> Self {
+        let cursor = value.chars().count();
+        Overlay::Input {
+            prompt,
+            value,
+            purpose,
+            extra,
+            cursor,
+        }
+    }
 }
 
 pub struct LogView {
@@ -1910,9 +1931,15 @@ impl TuiApp {
             *selected = filtered.first().copied().unwrap_or(0);
             return;
         }
-        if let Some(Overlay::Input { value, .. }) = &mut self.overlay {
+        if let Some(Overlay::Input { value, cursor, .. }) = &mut self.overlay {
             if !ch.is_control() {
-                value.push(ch);
+                let idx = value
+                    .char_indices()
+                    .nth(*cursor)
+                    .map(|(i, _)| i)
+                    .unwrap_or(value.len());
+                value.insert(idx, ch);
+                *cursor += 1;
             }
             return;
         }
@@ -1945,8 +1972,16 @@ impl TuiApp {
             *selected = filtered.first().copied().unwrap_or(0);
             return;
         }
-        if let Some(Overlay::Input { value, .. }) = &mut self.overlay {
-            value.pop();
+        if let Some(Overlay::Input { value, cursor, .. }) = &mut self.overlay {
+            if *cursor > 0 {
+                let idx = value
+                    .char_indices()
+                    .nth(*cursor - 1)
+                    .map(|(i, _)| i)
+                    .unwrap_or(value.len());
+                value.remove(idx);
+                *cursor -= 1;
+            }
             return;
         }
         let search = {
@@ -1957,6 +1992,38 @@ impl TuiApp {
             state.search.clone()
         };
         self.clamp_picker_selection(&search);
+    }
+
+    pub fn input_cursor_left(&mut self) {
+        if let Some(Overlay::Input { cursor, .. }) = &mut self.overlay {
+            *cursor = cursor.saturating_sub(1);
+        }
+    }
+
+    pub fn input_cursor_right(&mut self) {
+        if let Some(Overlay::Input { value, cursor, .. }) = &mut self.overlay {
+            *cursor = (*cursor + 1).min(value.chars().count());
+        }
+    }
+
+    pub fn input_cursor_home(&mut self) {
+        if let Some(Overlay::Input { cursor, .. }) = &mut self.overlay {
+            *cursor = 0;
+        }
+    }
+
+    pub fn input_cursor_end(&mut self) {
+        if let Some(Overlay::Input { value, cursor, .. }) = &mut self.overlay {
+            *cursor = value.chars().count();
+        }
+    }
+
+    pub fn input_delete_at_cursor(&mut self) {
+        if let Some(Overlay::Input { value, cursor, .. }) = &mut self.overlay {
+            if let Some((idx, _)) = value.char_indices().nth(*cursor) {
+                value.remove(idx);
+            }
+        }
     }
 
     fn clamp_picker_selection(&mut self, search: &str) {

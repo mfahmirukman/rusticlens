@@ -762,7 +762,7 @@ async fn handle_command(
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
                 let guard = shared.read().await;
-                match guard.trigger_cronjob(&name).await {
+                match guard.trigger_cronjob(&name, None).await {
                     Ok(()) => {
                         let _ = event_tx.send(BackendEvent::CronJobTriggered { name });
                     }

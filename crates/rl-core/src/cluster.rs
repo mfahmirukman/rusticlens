@@ -231,8 +231,8 @@ impl ClusterManager {
         .await
     }
 
-    pub async fn trigger_cronjob(&self, name: &str) -> Result<()> {
-        ops::trigger_cronjob(&self.client, &self.namespace, name).await
+    pub async fn trigger_cronjob(&self, name: &str, job_name: Option<&str>) -> Result<()> {
+        ops::trigger_cronjob(&self.client, &self.namespace, name, job_name).await
     }
 
     pub async fn set_cronjob_suspended(&self, name: &str, suspend: bool) -> Result<()> {

@@ -70,12 +70,12 @@ impl TuiApp {
                 self.toggle_theme();
             }
             SettingsCursor::AddKubeconfigPath => {
-                self.overlay = Some(Overlay::Input {
-                    prompt: "Extra kubeconfig path".into(),
-                    value: String::new(),
-                    purpose: InputPurpose::AddKubeconfigPath,
-                    extra: None,
-                });
+                self.overlay = Some(Overlay::input(
+                    "Extra kubeconfig path".into(),
+                    String::new(),
+                    InputPurpose::AddKubeconfigPath,
+                    None,
+                ));
             }
             SettingsCursor::ExtraKubeconfigList => {
                 if let Some(Overlay::Settings { path_selected, .. }) = &self.overlay {
@@ -88,12 +88,12 @@ impl TuiApp {
                 }
             }
             SettingsCursor::Editor => {
-                self.overlay = Some(Overlay::Input {
-                    prompt: "Editor command (e.g. zed --wait)".into(),
-                    value: self.editor.clone().unwrap_or_default(),
-                    purpose: InputPurpose::SetEditor,
-                    extra: None,
-                });
+                self.overlay = Some(Overlay::input(
+                    "Editor command (e.g. zed --wait)".into(),
+                    self.editor.clone().unwrap_or_default(),
+                    InputPurpose::SetEditor,
+                    None,
+                ));
             }
         }
     }
@@ -167,12 +167,12 @@ impl TuiApp {
             .next()
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(1);
-        self.overlay = Some(Overlay::Input {
-            prompt: format!("Replicas for {} (current {current})", row.name),
-            value: current.to_string(),
-            purpose: InputPurpose::ScaleReplicas,
-            extra: None,
-        });
+        self.overlay = Some(Overlay::input(
+            format!("Replicas for {} (current {current})", row.name),
+            current.to_string(),
+            InputPurpose::ScaleReplicas,
+            None,
+        ));
     }
 
     pub async fn restart_selection(&mut self) {
@@ -265,16 +265,16 @@ impl TuiApp {
             return;
         };
         let remote = row.service_ports.first().copied().unwrap_or(8080);
-        self.overlay = Some(Overlay::Input {
-            prompt: format!(
+        self.overlay = Some(Overlay::input(
+            format!(
                 "Local port for {}/{} (remote default {remote})",
                 self.active_kind.api_kind(),
                 row.name
             ),
-            value: remote.to_string(),
-            purpose: InputPurpose::PortForwardLocal,
-            extra: Some(remote.to_string()),
-        });
+            remote.to_string(),
+            InputPurpose::PortForwardLocal,
+            Some(remote.to_string()),
+        ));
     }
 
     pub fn open_port_forward_list(&mut self) {
@@ -472,12 +472,12 @@ impl TuiApp {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(local_port);
                 // Ask for remote if they only entered local differently
-                self.overlay = Some(Overlay::Input {
-                    prompt: format!("Remote port (local {local_port})"),
-                    value: remote_port.to_string(),
-                    purpose: InputPurpose::PortForwardRemote,
-                    extra: Some(local_port.to_string()),
-                });
+                self.overlay = Some(Overlay::input(
+                    format!("Remote port (local {local_port})"),
+                    remote_port.to_string(),
+                    InputPurpose::PortForwardRemote,
+                    Some(local_port.to_string()),
+                ));
             }
             InputPurpose::PortForwardRemote => {
                 let Ok(remote_port) = value.trim().parse::<u16>() else {
@@ -574,12 +574,12 @@ impl TuiApp {
             self.error_message = Some("No resource selected".into());
             return;
         };
-        self.overlay = Some(Overlay::Input {
-            prompt: format!("Job name for CronJob {name}"),
-            value: rl_core::ops::manual_job_name(&name),
-            purpose: InputPurpose::TriggerCronJob,
-            extra: Some(name.to_string()),
-        });
+        self.overlay = Some(Overlay::input(
+            format!("Job name for CronJob {name}"),
+            rl_core::ops::manual_job_name(&name),
+            InputPurpose::TriggerCronJob,
+            Some(name.to_string()),
+        ));
     }
 
     async fn trigger_cronjob_named(&mut self, name: String, job_name: String) {
